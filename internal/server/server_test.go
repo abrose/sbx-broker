@@ -379,6 +379,8 @@ func TestServeSecondInstance(t *testing.T) {
 	}
 }
 
+// A socket file left without the lock is stale; Run replaces it (no probe,
+// so no dial races the forking tests).
 func TestServeRemovesStaleSocket(t *testing.T) {
 	t.Parallel()
 	cfg, state := dirs(t)

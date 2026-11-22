@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -220,6 +222,93 @@ func TestListenRefusesLiveSocket(t *testing.T) {
 	if _, err := Listen(state); !errors.Is(err, ErrRunning) {
 		t.Fatalf("got %v", err)
 	}
+}
+
+func shortDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "sbxb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+// The lock decides, not a dial: a broker that holds admin.lock runs even
+// when no socket answers (such as a full backlog).
+func TestListenRefusesWhileLockHeld(t *testing.T) {
+	state := shortDir(t)
+	f, err := os.OpenFile(filepath.Join(state, LockName), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	if ln, err := Listen(state); !errors.Is(err, ErrRunning) {
+		if ln != nil {
+			_ = ln.Close()
+		}
+		t.Fatalf("got %v", err)
+	}
+}
+
+// With the lock held, any socket file is stale, even one that accepts: it
+// is replaced without a probe.
+func TestListenReplacesSocketWithoutLock(t *testing.T) {
+	state := shortDir(t)
+	old, err := net.Listen("unix", SocketPath(state))
+	if err != nil {
+		t.Fatal(err)
+	}
+	old.(*net.UnixListener).SetUnlinkOnClose(false)
+	defer old.Close()
+	ln, err := Listen(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if c, err := ln.Accept(); err == nil {
+			_ = c.Close()
+		}
+	}()
+	c, err := net.Dial("unix", SocketPath(state))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the new listener did not get the connection")
+	}
+}
+
+func TestCloseReleasesLock(t *testing.T) {
+	state := shortDir(t)
+	ln, err := Listen(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(filepath.Join(state, LockName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("lock mode %04o", fi.Mode().Perm())
+	}
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ln2, err := Listen(state)
+	if err != nil {
+		t.Fatalf("after Close: %v", err)
+	}
+	_ = ln2.Close()
 }
 
 func TestDialNoBroker(t *testing.T) {

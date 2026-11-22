@@ -28,11 +28,13 @@ import (
 const (
 	// SocketName is the file name of the socket in the state dir.
 	SocketName = "admin.sock"
+	// LockName is the file name of the single-instance lock in the state dir.
+	LockName   = "admin.lock"
 	socketMode = 0o600
+	lockMode   = 0o600
 	logBacklog = 100 // the events a "log" request gets first
 	maxRequest = 64 << 10
 	reqTimeout = 10 * time.Second // to send the request line
-	probeWait  = time.Second      // to tell a live socket from a stale one
 	acceptWait = 100 * time.Millisecond
 )
 
@@ -81,20 +83,54 @@ type Backend interface {
 // SocketPath returns the path of the socket in stateDir.
 func SocketPath(stateDir string) string { return filepath.Join(stateDir, SocketName) }
 
-// Listen listens on the socket in stateDir with mode 0600. A socket file
-// that accepts a connection gives ErrRunning; one that refuses is stale and
-// removed first.
+// Listen takes the single-instance lock (an flock on admin.lock, mode 0600,
+// in stateDir) and listens on the socket with mode 0600. The lock, not a
+// dial, decides whether a broker runs: a lock held by another process gives
+// ErrRunning; with the lock held, a socket file at the path is stale and is
+// replaced. Close releases the lock after it closed the socket.
 func Listen(stateDir string) (net.Listener, error) {
-	path := SocketPath(stateDir)
+	lock, err := takeLock(filepath.Join(stateDir, LockName))
+	if err != nil {
+		return nil, err
+	}
+	ln, err := listenSocket(SocketPath(stateDir))
+	if err != nil {
+		_ = lock.Close()
+		return nil, err
+	}
+	return &lockedListener{Listener: ln, lock: lock}, nil
+}
+
+// takeLock opens path (close-on-exec, so no fetch command inherits the
+// lock) and locks it without waiting.
+func takeLock(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, lockMode)
+	if err != nil {
+		return nil, err
+	}
+	// The mode argument applies on creation only.
+	if err := f.Chmod(lockMode); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, ErrRunning
+		}
+		return nil, fmt.Errorf("lock %s: %w", path, err)
+	}
+	return f, nil
+}
+
+// listenSocket listens on path; the caller holds the lock, so a socket
+// file there is stale.
+func listenSocket(path string) (net.Listener, error) {
 	fi, err := os.Lstat(path)
 	switch {
 	case err == nil:
 		if fi.Mode()&os.ModeSocket == 0 {
 			return nil, fmt.Errorf("%s exists and is not a socket", path)
-		}
-		if c, err := net.DialTimeout("unix", path, probeWait); err == nil {
-			_ = c.Close()
-			return nil, ErrRunning
 		}
 		if err := os.Remove(path); err != nil {
 			return nil, err
@@ -104,9 +140,6 @@ func Listen(stateDir string) (net.Listener, error) {
 	}
 	raw, err := net.Listen("unix", path)
 	if err != nil {
-		if errors.Is(err, syscall.EADDRINUSE) {
-			return nil, ErrRunning // another broker won the race
-		}
 		return nil, err
 	}
 	// A fetch command must not inherit an admin connection: the client
@@ -122,6 +155,21 @@ func Listen(stateDir string) (net.Listener, error) {
 		return nil, err
 	}
 	return ln, nil
+}
+
+// lockedListener holds the lock for the life of the listener. The lock
+// file stays: removing it would let a second broker lock a new file while
+// a first still holds the old one.
+type lockedListener struct {
+	net.Listener
+	lock *os.File
+	once sync.Once
+}
+
+func (l *lockedListener) Close() error {
+	err := l.Listener.Close()
+	l.once.Do(func() { err = errors.Join(err, l.lock.Close()) })
+	return err
 }
 
 // Server answers the requests on one listener.
