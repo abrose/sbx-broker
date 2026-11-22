@@ -23,10 +23,12 @@ const (
 	sseGap    = 200 * time.Millisecond
 )
 
-// Record is one request as the recorder got it. Path is the decoded path.
+// Record is one request as the recorder got it. Path is the decoded path,
+// RawPath the escaped one.
 type Record struct {
 	Method   string              `json:"method"`
 	Path     string              `json:"path"`
+	RawPath  string              `json:"rawPath"`
 	RawQuery string              `json:"rawQuery"`
 	Headers  map[string][]string `json:"headers"`
 	Body     string              `json:"body"`
@@ -77,7 +79,7 @@ func (rec *recorder) cases(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	got := Record{Method: r.Method, Path: r.URL.Path, RawQuery: r.URL.RawQuery, Headers: r.Header, Body: string(body)}
+	got := Record{Method: r.Method, Path: r.URL.Path, RawPath: r.URL.EscapedPath(), RawQuery: r.URL.RawQuery, Headers: r.Header, Body: string(body)}
 	rec.mu.Lock()
 	rec.records = append(rec.records, got)
 	rec.mu.Unlock()
@@ -109,6 +111,8 @@ func (rec *recorder) cases(w http.ResponseWriter, r *http.Request) {
 func gzipEcho(w http.ResponseWriter, r *http.Request, got Record) {
 	data, _ := json.Marshal(got) // a Record always encodes
 	if !allowsGzip(r.Header.Values("Accept-Encoding")) {
+		// Never hit through the broker: it strips Accept-Encoding, and no
+		// Accept-Encoding allows any coding, so the proof gets gzip.
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(data)
 		return

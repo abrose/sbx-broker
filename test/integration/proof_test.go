@@ -53,7 +53,7 @@ var expects = map[string]expect{
 	"base64-header": {200, eventlog.KindSwap, "api", "GET", "/echo", []string{"api-key"}, base64HeaderIs("X-Api-Key", api)},
 	"basic":         {200, eventlog.KindSwap, "api", "GET", "/echo", []string{"pass"}, basicIs("user", pw)},
 	"query":         {200, eventlog.KindSwap, "api", "GET", "/echo", []string{"pass"}, queryIs("key", pw)},
-	"path":          {200, eventlog.KindSwap, "api", "GET", "/echo/sbxb_t1_pass", []string{"pass"}, pathIs("/echo/" + pw)},
+	"path":          {200, eventlog.KindSwap, "api", "GET", "/echo/sbxb_t1_pass", []string{"pass"}, pathIs("/echo/"+pw, "/echo/"+url.PathEscape(pw))},
 	"form-token":    {200, eventlog.KindSwap, "idp", "POST", cases.TokenPath, []string{"client-secret"}, formIs("client_secret", cs)},
 	"form-token-rejected": {401, eventlog.KindSwap, "idp", "POST", cases.TokenPath, []string{"old-secret"},
 		formIs("client_secret", old)},
@@ -97,6 +97,11 @@ func TestProof(t *testing.T) {
 	}
 
 	t.Run("1-records-hold-values", func(t *testing.T) {
+		for key, recs := range byCase {
+			if x, ok := expects[key]; !ok || x.record == nil {
+				t.Errorf("%d records with %s %q, which is no swap case", len(recs), cases.CaseHeader, key)
+			}
+		}
 		for _, name := range sortedCases() {
 			want := expects[name]
 			if want.record == nil {
@@ -341,10 +346,13 @@ func queryIs(key, want string) check {
 	}
 }
 
-func pathIs(want string) check {
+// pathIs checks the decoded path and the escaped path as the upstream got
+// it: a raw value in the path would decode the same, but its "/" would be a
+// separator instead of %2F.
+func pathIs(want, wantEscaped string) check {
 	return func(r harness.Record) error {
-		if r.Path != want {
-			return fmt.Errorf("path is %q, want %q", r.Path, want)
+		if r.Path != want || r.RawPath != wantEscaped {
+			return fmt.Errorf("path is %q (escaped %q), want %q (escaped %q)", r.Path, r.RawPath, want, wantEscaped)
 		}
 		return nil
 	}

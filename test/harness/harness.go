@@ -135,7 +135,12 @@ func StartRecorder(t *testing.T) (base, records string) {
 				network.MustParsePort(recordsPort): loopback,
 			}
 		}),
-		testcontainers.WithWaitStrategy(wait.ForHTTP("/records").WithPort(recordsPort).WithForcedIPv4LocalHost()),
+		// Each port has its own server: wait for both. The cases port gets
+		// no request, since every request there is recorded.
+		testcontainers.WithWaitStrategy(wait.ForAll(
+			wait.ForHTTP("/records").WithPort(recordsPort).WithForcedIPv4LocalHost(),
+			wait.ForListeningPort(casesPort),
+		)),
 	)
 	testcontainers.CleanupContainer(t, ctr)
 	if err != nil {
@@ -166,7 +171,8 @@ func recorderDir(t *testing.T) string {
 // Record is one request the recorder got.
 type Record struct {
 	Method   string      `json:"method"`
-	Path     string      `json:"path"` // decoded
+	Path     string      `json:"path"`    // decoded
+	RawPath  string      `json:"rawPath"` // escaped, as the request line had it
 	RawQuery string      `json:"rawQuery"`
 	Headers  http.Header `json:"headers"`
 	Body     string      `json:"body"`
@@ -229,40 +235,58 @@ func StartBroker(t *testing.T, namespaces map[string]string) (configDir, stateDi
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(stateDir) })
 
+	serve(t, func(ctx context.Context) error {
+		return server.Run(ctx, server.Options{ConfigDir: configDir, StateDir: stateDir, FetchTimeout: startWait})
+	}, func() string { return notReady(stateDir, len(namespaces)) })
+	return configDir, stateDir
+}
+
+// brokerRun is a broker that runs in the background.
+type brokerRun struct {
+	stopped  chan struct{} // closed when the run returned
+	err      error         // what the run returned; read it after stopped
+	reported bool          // the test already failed with err
+}
+
+// serve runs run until the test ends, and waits until ready returns "". A
+// run that stops before that fails the test at once, and the cleanup does
+// not wait for it or report it again.
+func serve(t *testing.T, run func(context.Context) error, ready func() string) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
+	b := &brokerRun{stopped: make(chan struct{})}
 	go func() {
-		done <- server.Run(ctx, server.Options{ConfigDir: configDir, StateDir: stateDir, FetchTimeout: startWait})
+		b.err = run(ctx)
+		close(b.stopped)
 	}()
 	t.Cleanup(func() {
 		cancel()
 		select {
-		case err := <-done:
-			if err != nil {
-				t.Errorf("the broker: %v", err)
+		case <-b.stopped:
+			if b.err != nil && !b.reported {
+				t.Errorf("the broker: %v", b.err)
 			}
 		case <-time.After(stopWait):
 			t.Error("the broker did not stop")
 		}
 	})
-	waitReady(t, stateDir, len(namespaces), done)
-	return configDir, stateDir
+	waitReady(t, ready, b)
 }
 
-// waitReady polls the admin socket until n namespaces run with no listener
-// error and no pending secret.
-func waitReady(t *testing.T, stateDir string, n int, done <-chan error) {
+// waitReady polls ready until it returns "".
+func waitReady(t *testing.T, ready func() string, b *brokerRun) {
 	t.Helper()
 	deadline := time.Now().Add(startWait)
 	last := "no answer"
 	for time.Now().Before(deadline) {
 		select {
-		case err := <-done:
-			t.Fatalf("the broker stopped: %v", err)
+		case <-b.stopped:
+			b.reported = true
+			t.Fatalf("the broker stopped: %v", b.err)
 		default:
 		}
 		var why string
-		if why = notReady(stateDir, n); why == "" {
+		if why = ready(); why == "" {
 			return
 		}
 		last = why
@@ -271,7 +295,8 @@ func waitReady(t *testing.T, stateDir string, n int, done <-chan error) {
 	t.Fatalf("the broker is not ready: %s", last)
 }
 
-// notReady says why the broker is not ready, or "".
+// notReady says why the broker is not ready, or "": it is ready when n
+// namespaces run with no listener error and no pending secret.
 func notReady(stateDir string, n int) string {
 	c, err := admin.Dial(stateDir)
 	if err != nil {
