@@ -813,9 +813,19 @@ func TestLockHeldUntilRunReturns(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if err := second(); err != nil {
-		t.Fatalf("after Run returned: %v", err)
-	}
+	// flock belongs to the open file description. A fetch command that
+	// another test's broker in this process forks holds a copy of the lock
+	// fd until its exec (close-on-exec acts only then), so the lock may stay
+	// taken for a moment. A real broker has no fork in flight once Run
+	// returned: cmd.Start returns after the exec, and Run waits for every
+	// fetch.
+	waitFor(t, 2*time.Second, "a second Run after the first returned", func() bool {
+		err := second()
+		if err != nil && err.Error() != "a broker already runs" {
+			t.Fatal(err)
+		}
+		return err == nil
+	})
 }
 
 // testBroker is a broker without Run, for tests that drive scan directly.
