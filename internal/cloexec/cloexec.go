@@ -9,6 +9,13 @@
 // its port), and the fetch tool holds a socket of a sandboxed app. This
 // listener accepts and sets close-on-exec under ForkLock, so no fork falls
 // between the two.
+//
+// Invariant: the listening socket's open file description must stay
+// non-blocking. The dup shares it with the original listener, so a call of
+// Fd() on either (which puts the description in blocking mode) would make
+// the accept in Accept block while it holds syscall.ForkLock, and that
+// stalls every fork, so every fetch, until a client connects. Never call
+// Fd() on the listener, its dup, or a File() of them.
 package cloexec
 
 import (
