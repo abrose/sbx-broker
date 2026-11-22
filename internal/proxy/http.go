@@ -28,6 +28,7 @@ import (
 const (
 	readHeaderTimeout = 10 * time.Second
 	defaultCloseWait  = 5 * time.Second
+	handlerWait       = 2 * time.Second // after the forced close
 )
 
 // HTTP is the listener of one HTTP route.
@@ -40,9 +41,11 @@ type HTTP struct {
 	transport *http.Transport
 	closeWait time.Duration
 
-	mu   sync.Mutex
-	srv  *http.Server
-	addr string
+	mu     sync.Mutex
+	srv    *http.Server
+	addr   string
+	active int           // handlers that run now
+	idle   chan struct{} // closed when active drops to 0; set by Close
 }
 
 // NewHTTP returns the listener of route in namespace ns. trs run in order on
@@ -53,6 +56,9 @@ func NewHTTP(ns string, route config.Route, sec transform.Secrets, trs []transfo
 	// answers to scrub. The swap transform decodes an upstream that
 	// compresses anyway.
 	t.DisableCompression = true
+	// Never a proxy from HTTP_PROXY or HTTPS_PROXY: the swapped request,
+	// with its values, goes to the route's upstream only.
+	t.Proxy = nil
 	return &HTTP{ns: ns, route: route, sec: sec, trs: trs, log: log, transport: t, closeWait: defaultCloseWait}
 }
 
@@ -82,7 +88,9 @@ func (h *HTTP) Addr() string {
 }
 
 // Close stops accepting, waits for open requests at most 5 s, then closes
-// the connections that are still open.
+// the connections that are still open and waits up to 2 s more for their
+// handlers to end. After Close returns, the listener writes no more events,
+// unless those 2 s passed: then a late event (swap, upstream) may still come.
 func (h *HTTP) Close() error {
 	h.mu.Lock()
 	srv := h.srv
@@ -96,12 +104,52 @@ func (h *HTTP) Close() error {
 	if errors.Is(err, context.DeadlineExceeded) {
 		err = srv.Close()
 	}
+	h.waitHandlers(handlerWait)
 	h.transport.CloseIdleConnections()
 	return err
 }
 
+// waitHandlers waits until no handler runs, at most d. A handler cut by
+// srv.Close still writes its events on the way out.
+func (h *HTTP) waitHandlers(d time.Duration) {
+	h.mu.Lock()
+	if h.active == 0 {
+		h.mu.Unlock()
+		return
+	}
+	if h.idle == nil {
+		h.idle = make(chan struct{})
+	}
+	idle := h.idle
+	h.mu.Unlock()
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-idle:
+	case <-timer.C:
+	}
+}
+
+func (h *HTTP) enter() {
+	h.mu.Lock()
+	h.active++
+	h.mu.Unlock()
+}
+
+func (h *HTTP) leave() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.active--
+	if h.active == 0 && h.idle != nil {
+		close(h.idle)
+		h.idle = nil
+	}
+}
+
 // ServeHTTP runs the request transforms, then forwards the request.
 func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.enter()
+	defer h.leave()
 	// Taken before the transforms: they may put values into both.
 	x := &exchange{h: h, start: time.Now(), method: r.Method, path: r.URL.Path, names: map[string]bool{}}
 	contentType := r.Header.Get("Content-Type")

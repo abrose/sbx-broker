@@ -391,6 +391,30 @@ func TestProxyUpstreamDown(t *testing.T) {
 	noLeakInLog(t, l)
 }
 
+func TestProxyIgnoresEnvironmentProxy(t *testing.T) {
+	var calls atomic.Int32
+	envProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = io.WriteString(w, "from the environment proxy")
+	}))
+	defer envProxy.Close()
+	t.Setenv("HTTP_PROXY", envProxy.URL)
+	t.Setenv("HTTPS_PROXY", envProxy.URL)
+	t.Setenv("NO_PROXY", "")
+	// Not loopback: the environment proxy never applies to localhost.
+	h, _ := startProxy(t, "http://upstream.example.invalid")
+
+	// Go reads the environment once per process, so a test that ran first
+	// may hide the end-to-end case; the transport setting does not.
+	if h.transport.Proxy != nil {
+		t.Errorf("the transport has a Proxy func")
+	}
+	get(t, proxyURL(h, "/"), map[string]string{"Authorization": "Bearer sbxb_t1_api_key"})
+	if n := calls.Load(); n != 0 {
+		t.Errorf("the environment proxy got %d requests", n)
+	}
+}
+
 func TestProxyLoopbackOnly(t *testing.T) {
 	h, _ := startProxy(t, "http://127.0.0.1:1")
 	if !strings.HasPrefix(h.Addr(), "127.0.0.1:") {
@@ -712,7 +736,7 @@ func TestProxyCloseCutsLongStreams(t *testing.T) {
 	}))
 	defer up.Close()
 	defer close(stop)
-	h, _ := newProxy(t, up.URL)
+	h, l := newProxy(t, up.URL)
 	h.closeWait = 200 * time.Millisecond
 	if err := h.Start(); err != nil {
 		t.Fatal(err)
@@ -730,6 +754,11 @@ func TestProxyCloseCutsLongStreams(t *testing.T) {
 	_ = h.Close()
 	if d := time.Since(start); d > 2*time.Second {
 		t.Errorf("Close took %v", d)
+	}
+	// Task 7 closes the log right after Close: the cut stream's event
+	// must be in it already.
+	if n := len(eventsOf(l, eventlog.KindSwap)); n != 1 {
+		t.Errorf("%d swap events when Close returned, want 1", n)
 	}
 	if _, err := io.ReadAll(resp.Body); err == nil {
 		t.Errorf("the stream ended cleanly; want it cut")
