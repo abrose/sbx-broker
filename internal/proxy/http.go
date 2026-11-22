@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/abrose/sbx-broker/internal/cloexec"
 	"github.com/abrose/sbx-broker/internal/config"
 	"github.com/abrose/sbx-broker/internal/eventlog"
 	"github.com/abrose/sbx-broker/internal/transform"
@@ -69,8 +70,15 @@ func (h *HTTP) Start() error {
 	if h.srv != nil {
 		return fmt.Errorf("route %s: already started", h.route.Name)
 	}
-	ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(h.route.Listen)))
+	raw, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(h.route.Listen)))
 	if err != nil {
+		return fmt.Errorf("route %s: %w", h.route.Name, err)
+	}
+	// A fetch command must not inherit an app's connection: it would keep
+	// the connection (and the port) open until the command ends.
+	ln, err := cloexec.Listener(raw)
+	if err != nil {
+		_ = raw.Close()
 		return fmt.Errorf("route %s: %w", h.route.Name, err)
 	}
 	errLog := log.New(eventWriter{h}, "", 0)
