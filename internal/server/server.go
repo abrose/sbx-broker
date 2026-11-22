@@ -197,8 +197,13 @@ func (b *broker) shutdown(srv *admin.Server) {
 	}
 	b.mu.Unlock()
 	closeAll(all)
-	_ = srv.Close()
+	_ = srv.Close() // waits for the admin requests, a refresh among them
 	b.fetches.Wait()
+	b.mu.Lock()
+	for _, st := range b.nss {
+		st.store.Wipe()
+	}
+	b.mu.Unlock()
 }
 
 func closeAll(hs []*proxy.HTTP) {
@@ -356,6 +361,9 @@ func (b *broker) stop(st *nsState) {
 	closeAll(st.listeners)
 	<-st.fetched // the cancel kills the commands at once
 	b.red.retire(name, st.store.Values())
+	// The redactor keeps its own copies; the store's go now. A refresh
+	// that still runs under the cancelled ctx wipes its value on record.
+	st.store.Wipe()
 }
 
 // start opens the listeners of cfg, then fetches its secrets in the

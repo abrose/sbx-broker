@@ -64,6 +64,7 @@ type Store struct {
 	log     *eventlog.Log
 	mu      sync.RWMutex
 	entries map[string]*entry
+	closed  bool // guarded by mu; set by Wipe
 }
 
 // NewStore makes a store with every secret pending.
@@ -108,6 +109,11 @@ func (s *Store) Fetch(ctx context.Context, name string) error {
 
 func (s *Store) record(e *entry, value []byte, exit int, err error) {
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		wipe(value)
+		return
+	}
 	old := e.value
 	st := e.state
 	st.FetchedAt, st.ExitCode = time.Now(), exit
@@ -200,6 +206,20 @@ func (s *Store) runCommand(ctx context.Context, argv []string) ([]byte, int, err
 		return nil, exit, fail(fmt.Sprintf("value shorter than %d bytes", minValueLen))
 	}
 	return append([]byte(nil), value...), exit, nil
+}
+
+// Wipe zeroes and unpins every value and closes the store: every secret
+// turns pending, and a fetch that ends later wipes its value at once and
+// logs nothing. Call it when the store is dropped, after its fetches end.
+func (s *Store) Wipe() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	for _, e := range s.entries {
+		wipe(e.value)
+		e.value = nil
+		e.state.State, e.state.Length, e.state.Fingerprint = StatePending, 0, ""
+	}
 }
 
 // Lookup returns a copy of the value, or nil when the state is not ok.

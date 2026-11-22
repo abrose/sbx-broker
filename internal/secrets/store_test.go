@@ -291,3 +291,45 @@ func TestSecondFetchWhileRunning(t *testing.T) {
 		t.Fatal(st)
 	}
 }
+
+// Wipe zeroes every value and closes the store.
+func TestWipeZeroesValues(t *testing.T) {
+	s, _ := newTestStore(t, 5*time.Second, def("a", "printf", "%s", "value-aaaa-1"), def("b", "printf", "%s", "value-bbbb-2"))
+	s.FetchAll(context.Background())
+	held := [][]byte{s.entries["a"].value, s.entries["b"].value}
+	s.Wipe()
+	for i, v := range held {
+		if len(v) == 0 || strings.Trim(string(v), "\x00") != "" {
+			t.Errorf("value %d is not zeroed", i)
+		}
+	}
+	for _, name := range []string{"a", "b"} {
+		if v, st := s.Lookup(name); st == StateOK || v != nil {
+			t.Errorf("%s: state %s after Wipe", name, st)
+		}
+	}
+	if n := len(s.Values()); n != 0 {
+		t.Errorf("%d values after Wipe", n)
+	}
+}
+
+// A fetch that ends after Wipe leaves no value.
+func TestFetchAfterWipeKeepsNoValue(t *testing.T) {
+	s, _ := newTestStore(t, 5*time.Second, def("slow", "sh", "-c", "sleep 0.3; printf %s value-late-3"))
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = s.Fetch(context.Background(), "slow")
+	}()
+	time.Sleep(50 * time.Millisecond)
+	s.Wipe()
+	<-done
+	if v, st := s.Lookup("slow"); st == StateOK || v != nil {
+		t.Fatalf("state %s after a late fetch", st)
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.entries["slow"].value != nil {
+		t.Fatal("the late value is kept")
+	}
+}
