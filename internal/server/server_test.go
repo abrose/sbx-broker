@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/abrose/sbx-broker/internal/admin"
+	"github.com/abrose/sbx-broker/internal/config"
 	"github.com/abrose/sbx-broker/internal/eventlog"
 	"github.com/abrose/sbx-broker/internal/secrets"
 )
@@ -750,6 +751,37 @@ func testBroker(t *testing.T, cfg, state string) *broker {
 		_ = log.Close()
 	})
 	return b
+}
+
+// On a reload the new listener binds a port the old one just closed; a
+// fetch command forked a moment before may hold the old socket until its
+// exec. So a port the old state held is retried for a short while, and any
+// other busy port fails at once.
+func TestListenRetriesHeldPort(t *testing.T) {
+	t.Parallel()
+	cfg, state := dirs(t)
+	b := testBroker(t, cfg, state)
+	store := secrets.NewStore("t1", nil, time.Second, b.log)
+	hold := func() (int, net.Listener) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ln.Addr().(*net.TCPAddr).Port, ln
+	}
+	port, ln := hold()
+	up := &url.URL{Scheme: "http", Host: "127.0.0.1:1"}
+	if _, err := b.listen("t1", config.Route{Name: "api", Listen: port, Upstream: up}, store, false); err == nil {
+		t.Fatal("a busy port that the old state did not hold was retried")
+	}
+	_ = ln.Close()
+	port, ln = hold()
+	time.AfterFunc(200*time.Millisecond, func() { _ = ln.Close() })
+	h, err := b.listen("t1", config.Route{Name: "api", Listen: port, Upstream: up}, store, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = h.Close()
 }
 
 // An editor that truncates the file, then writes it: a poll that sees the

@@ -31,6 +31,8 @@ const (
 	// A poll acts on a change that two polls in a row saw: with 1 s, a
 	// change takes effect within 2 s.
 	defaultPollInterval = time.Second
+	rebindWait          = time.Second // see listen
+	rebindStep          = 20 * time.Millisecond
 	logName             = "broker.log"
 	logRing             = 10000
 	logMaxBytes         = 10 << 20
@@ -120,6 +122,7 @@ type nsState struct {
 	cfg       *config.Namespace
 	store     *secrets.Store
 	listeners []*proxy.HTTP
+	ports     map[int]bool       // the ports of the listeners
 	errs      []string           // listeners that did not start
 	ctx       context.Context    // of its fetches; cancelled when it stops
 	cancel    context.CancelFunc //
@@ -377,11 +380,12 @@ func (b *broker) replace(cfg *config.Namespace) {
 	old := b.nss[cfg.Name]
 	b.mu.Unlock()
 	verb := "loaded"
+	var held map[int]bool
 	if old != nil {
 		b.stop(old) // first: the new listeners may reuse its ports
-		verb = "reloaded"
+		verb, held = "reloaded", old.ports
 	}
-	st := b.start(cfg, verb)
+	st := b.start(cfg, verb, held)
 	b.mu.Lock()
 	b.nss[cfg.Name] = st
 	b.mu.Unlock()
@@ -418,23 +422,25 @@ func (b *broker) stop(st *nsState) {
 // start opens the listeners of cfg, then fetches its secrets in the
 // background. A listener that does not start is logged and shown in status;
 // the others run.
-func (b *broker) start(cfg *config.Namespace, verb string) *nsState {
+func (b *broker) start(cfg *config.Namespace, verb string, held map[int]bool) *nsState {
 	st := &nsState{
 		cfg:     cfg,
 		store:   secrets.NewStore(cfg.Name, cfg.Secrets, b.opt.FetchTimeout, b.log),
+		ports:   map[int]bool{},
 		fetched: make(chan struct{}),
 	}
 	st.ctx, st.cancel = context.WithCancel(b.fetchCtx)
 	b.red.set(cfg.Name, st.store)
 	b.log.Add(eventlog.Event{Kind: eventlog.KindReload, Namespace: cfg.Name, Message: verb})
 	for _, r := range cfg.HTTP {
-		h, err := b.listen(cfg.Name, r, st.store)
+		h, err := b.listen(cfg.Name, r, st.store, held[r.Listen])
 		if err != nil {
 			st.errs = append(st.errs, err.Error())
 			b.log.Add(eventlog.Event{Kind: eventlog.KindError, Namespace: cfg.Name, Route: r.Name, Message: err.Error()})
 			continue
 		}
 		st.listeners = append(st.listeners, h)
+		st.ports[r.Listen] = true
 	}
 	if cfg.Postgres != nil {
 		b.log.Add(eventlog.Event{Kind: eventlog.KindInfo, Namespace: cfg.Name, Message: postgresInfo})
@@ -448,7 +454,11 @@ func (b *broker) start(cfg *config.Namespace, verb string) *nsState {
 	return st
 }
 
-func (b *broker) listen(ns string, r config.Route, store *secrets.Store) (*proxy.HTTP, error) {
+// listen starts the listener of route r. With held set, the old state of
+// the namespace held the port: the old socket is closed, but a fetch
+// command forked a moment before holds a copy until its exec, so a bind
+// that finds the port in use is tried again for up to rebindWait.
+func (b *broker) listen(ns string, r config.Route, store *secrets.Store, held bool) (*proxy.HTTP, error) {
 	trs := make([]transform.Transform, 0, len(r.Transforms))
 	for _, spec := range r.Transforms {
 		tr, err := transform.New(spec)
@@ -458,10 +468,17 @@ func (b *broker) listen(ns string, r config.Route, store *secrets.Store) (*proxy
 		trs = append(trs, tr)
 	}
 	h := proxy.NewHTTP(ns, r, store, trs, b.log)
-	if err := h.Start(); err != nil {
-		return nil, err // it names the route
+	deadline := time.Now().Add(rebindWait)
+	for {
+		err := h.Start()
+		if err == nil {
+			return h, nil
+		}
+		if !held || !errors.Is(err, syscall.EADDRINUSE) || time.Now().After(deadline) {
+			return nil, err // it names the route
+		}
+		time.Sleep(rebindStep)
 	}
-	return h, nil
 }
 
 // Status implements admin.Backend.
