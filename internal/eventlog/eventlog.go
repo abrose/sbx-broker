@@ -74,6 +74,11 @@ func (l *Log) openFile() error {
 	if err != nil {
 		return err
 	}
+	// The mode argument of OpenFile applies on creation only.
+	if err := f.Chmod(fileMode); err != nil {
+		_ = f.Close()
+		return err
+	}
 	info, err := f.Stat()
 	if err != nil {
 		_ = f.Close()

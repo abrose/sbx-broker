@@ -198,6 +198,28 @@ func TestConcurrentAdd(t *testing.T) {
 	}
 }
 
+func TestOpenTightensExistingFileMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "broker.log")
+	if err := os.WriteFile(path, []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil { // defeat umask
+		t.Fatal(err)
+	}
+	l, err := Open(path, 10, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := info.Mode().Perm(); mode != 0o600 {
+		t.Errorf("mode = %o, want 600", mode)
+	}
+}
+
 func TestOpenAppendsToExistingFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "broker.log")
 	l, err := Open(path, 10, 1<<20)
