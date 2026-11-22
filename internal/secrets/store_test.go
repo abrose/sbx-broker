@@ -121,11 +121,37 @@ func TestStdoutNeverLogged(t *testing.T) {
 	if strings.Contains(string(data), "leak-value-9") {
 		t.Fatalf("log holds stdout: %s", data)
 	}
-	if !strings.Contains(string(data), `"kind":"fetch"`) || !strings.Contains(string(data), "oops") {
+	if !strings.Contains(string(data), `"kind":"fetch"`) || !strings.Contains(string(data), "failed: exit 3") {
 		t.Fatalf("log lacks fetch event: %s", data)
 	}
 	if st := status(t, s, "a"); strings.Contains(st.Err, "leak") {
 		t.Fatal("Err holds stdout")
+	}
+}
+
+// A fetch tool may print a value on stderr while it fails. The first stderr
+// line goes to the status (the owner's terminal), never to the log.
+func TestStderrNeverLogged(t *testing.T) {
+	s, path := newTestStore(t, 200*time.Millisecond,
+		def("a", "sh", "-c", "echo stderr-value-77 >&2; exit 3"),
+		def("b", "sh", "-c", "echo stderr-value-76 >&2; sleep 30"),
+		def("c", "printf", "short"),
+		def("d", "no-such-command-sbxb"))
+	s.FetchAll(context.Background())
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "stderr-value-7") {
+		t.Fatal("log holds a stderr line")
+	}
+	for _, want := range []string{"failed: exit 3", "failed: timeout after 200ms", "failed: value shorter than 8 bytes", "failed: command did not start"} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("log lacks %q: %s", want, data)
+		}
+	}
+	if st := status(t, s, "a"); st.Err != "stderr-value-77" {
+		t.Fatal("status lacks the stderr line")
 	}
 }
 

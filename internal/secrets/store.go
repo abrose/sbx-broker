@@ -129,16 +129,35 @@ func (s *Store) record(e *entry, value []byte, exit int, err error) {
 
 	ev := eventlog.Event{Kind: eventlog.KindFetch, Namespace: s.ns, Secrets: []string{e.def.Name}, Message: string(st.State)}
 	if err != nil {
-		ev.Message = "failed: " + st.Err
+		ev.Message = "failed: " + logReason(err)
 	}
 	s.log.Add(ev)
+}
+
+// fetchError is a failed fetch. Its text (the status Err) may be the first
+// stderr line of the command, which a fetch tool may fill with a value while
+// it fails; the redactor does not know such a value. So the log gets only
+// reason, a fixed text or the exit code.
+type fetchError struct{ text, reason string }
+
+func (e *fetchError) Error() string { return e.text }
+
+// fail returns a fetchError whose text is also safe for the log.
+func fail(text string) error { return &fetchError{text: text, reason: text} }
+
+func logReason(err error) string {
+	var fe *fetchError
+	if errors.As(err, &fe) {
+		return fe.reason
+	}
+	return "error"
 }
 
 // runCommand returns the value, the exit code and an error whose text is one
 // line and never holds stdout.
 func (s *Store) runCommand(ctx context.Context, argv []string) ([]byte, int, error) {
 	if len(argv) == 0 {
-		return nil, -1, errors.New("empty command")
+		return nil, -1, fail("empty command")
 	}
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
@@ -159,25 +178,26 @@ func (s *Store) runCommand(ctx context.Context, argv []string) ([]byte, int, err
 	}
 	switch {
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
-		return nil, exit, fmt.Errorf("timeout after %s", s.timeout)
+		return nil, exit, fail(fmt.Sprintf("timeout after %s", s.timeout))
 	case ctx.Err() != nil:
-		return nil, exit, errors.New("cancelled")
+		return nil, exit, fail("cancelled")
 	case err != nil:
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
+			reason := fmt.Sprintf("exit %d", exit)
 			if line := firstLine(stderr.buf.Bytes()); line != "" {
-				return nil, exit, errors.New(line)
+				return nil, exit, &fetchError{text: line, reason: reason}
 			}
-			return nil, exit, fmt.Errorf("exit status %d", exit)
+			return nil, exit, &fetchError{text: fmt.Sprintf("exit status %d", exit), reason: reason}
 		}
-		return nil, exit, errors.New(oneLine(err.Error()))
+		return nil, exit, &fetchError{text: oneLine(err.Error()), reason: "command did not start"}
 	}
 	value := bytes.TrimSuffix(stdout.buf.Bytes(), []byte("\n"))
 	if stdout.over || len(value) > maxStdout {
-		return nil, exit, errors.New("value longer than 64 KiB")
+		return nil, exit, fail("value longer than 64 KiB")
 	}
 	if len(value) < minValueLen {
-		return nil, exit, fmt.Errorf("value shorter than %d bytes", minValueLen)
+		return nil, exit, fail(fmt.Sprintf("value shorter than %d bytes", minValueLen))
 	}
 	return append([]byte(nil), value...), exit, nil
 }
