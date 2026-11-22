@@ -176,3 +176,27 @@ func TestFormatLogLine(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 }
+
+// The path, the method and the message come from a sandboxed app: no
+// control sequence reaches the owner's terminal and no line is forged.
+func TestLogLineEscapesControls(t *testing.T) {
+	at := time.Date(2026, 11, 22, 13, 2, 11, 0, time.Local)
+	var b bytes.Buffer
+	printEvent(&b, eventlog.Event{Time: at, Kind: eventlog.KindSwap, Namespace: "t1", Route: "api",
+		Method: "GE\x1bT x", Path: "/a b\x1b[2J\n13:00:00 swap", Status: 200,
+		Message: "msg \x9b31m\x1b[2J\nforged"})
+	want := `13:02:11 swap t1 api GE\x1bT%20x /a%20b\x1b[2J\x0a13:00:00%20swap 200 - msg \x9b31m\x1b[2J\x0aforged` + "\n"
+	if b.String() != want {
+		t.Fatalf("got  %q\nwant %q", b.String(), want)
+	}
+}
+
+// A failed fetch's stderr line and a namespace error are printed escaped.
+func TestStatusEscapesControls(t *testing.T) {
+	var b bytes.Buffer
+	printStatus(&b, []admin.NamespaceStatus{{Name: "t1", Listeners: []string{}, Error: "bad\x1b[2J",
+		Secrets: []secrets.Status{{Name: "a", Placeholder: "sbxb_t1_a", State: secrets.StateFailed, ExitCode: 3, Err: "oops\x1b]0;x\x07"}}}})
+	if strings.ContainsAny(b.String(), "\x1b\x07") {
+		t.Fatalf("got %q", b.String())
+	}
+}

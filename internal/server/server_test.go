@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -285,8 +286,23 @@ func hasEvent(events []eventlog.Event, f func(eventlog.Event) bool) bool {
 	return false
 }
 
-// noValues fails when the log files hold any test value. It names none.
+// noValues fails when the log files hold any test value, raw or in the
+// JSON form the file has (json.Marshal writes & < > as & ...). It
+// names none.
 func noValues(t *testing.T, state string, values ...string) {
+	t.Helper()
+	var forms []string
+	for _, v := range values {
+		j, err := json.Marshal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		forms = append(forms, v, strings.Trim(string(j), `"`))
+	}
+	noForms(t, state, forms...)
+}
+
+func noForms(t *testing.T, state string, values ...string) {
 	t.Helper()
 	for _, name := range []string{"broker.log", "broker.log.1"} {
 		data, err := os.ReadFile(filepath.Join(state, name))
@@ -536,6 +552,42 @@ func TestServeRedactsReplacedValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	noValues(t, state, allValues...)
+}
+
+// The proxy logs the escaped path, so the redactor must also know a value
+// in that form.
+func TestServeRedactsEscapedPath(t *testing.T) {
+	t.Parallel()
+	const pass = "p@ss word/1+&"
+	cfg, state := dirs(t)
+	up := newUpstream(t)
+	port := freePort(t)
+	writeNS(t, cfg, "t1", nsYAML(
+		[]string{secretYAML("pass", "printf", "%s", pass)},
+		[]string{routeYAML("api", port, up.URL)}))
+	r := start(t, cfg, state)
+	waitOK(t, state, "t1", "pass")
+	if _, _, err := get(port, "/x/"+url.PathEscape(pass), ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.stop(); err != nil {
+		t.Fatal(err)
+	}
+	if !hasEvent(readLog(t, state), func(e eventlog.Event) bool { return e.Kind == eventlog.KindSwap && strings.HasPrefix(e.Path, "/x/") }) {
+		t.Fatal("no swap event")
+	}
+	noValues(t, state, pass, (&url.URL{Path: pass}).EscapedPath())
+}
+
+// pathEscape works on bytes (no string copy of a value) and must give what
+// the proxy logs: url.URL.EscapedPath of the decoded path.
+func TestPathEscapeMatchesURL(t *testing.T) {
+	for c := range 256 {
+		v := []byte{'a', byte(c), 'b'}
+		if got, want := string(pathEscape(v)), (&url.URL{Path: string(v)}).EscapedPath(); got != want {
+			t.Errorf("byte %#x: got %q, want %q", c, got, want)
+		}
+	}
 }
 
 func TestServeSocketMode(t *testing.T) {

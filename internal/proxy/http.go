@@ -159,7 +159,7 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.enter()
 	defer h.leave()
 	// Taken before the transforms: they may put values into both.
-	x := &exchange{h: h, start: time.Now(), method: r.Method, path: r.URL.Path, names: map[string]bool{}}
+	x := &exchange{h: h, start: time.Now(), method: r.Method, path: eventPath(r.URL), names: map[string]bool{}}
 	contentType := r.Header.Get("Content-Type")
 	for _, tr := range h.trs {
 		res, err := tr.Request(r, h.ns, h.sec)
@@ -174,6 +174,13 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	h.proxy(x).ServeHTTP(noInformational{w}, r)
+}
+
+// eventPath is the path for an event: the broker's own escape of the
+// decoded path (no control byte, no space), not the client's RawPath. The
+// server's redactor knows a value in this form too.
+func eventPath(u *url.URL) string {
+	return (&url.URL{Path: u.Path}).EscapedPath()
 }
 
 // noInformational keeps the upstream's 1xx answers from the app (ruling

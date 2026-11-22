@@ -222,8 +222,7 @@ func (c *command) reload() int {
 func (c *command) log(follow bool, ns string) int {
 	err := c.do(admin.Request{Op: "log", Namespace: ns, Follow: follow}, func(r admin.Response) error {
 		if r.Event != nil {
-			_, err := fmt.Fprintln(c.stdout, logLine(*r.Event))
-			return err
+			return printEvent(c.stdout, *r.Event)
 		}
 		return nil
 	})
@@ -267,24 +266,34 @@ func printStatus(w io.Writer, nss []admin.NamespaceStatus) {
 			}
 		}
 		if ns.Error != "" {
-			fmt.Fprintf(w, "  error: %s\n", ns.Error)
+			fmt.Fprintf(w, "  error: %s\n", eventlog.Printable(ns.Error))
 		}
 	}
 }
 
-// failure is the exit code and the first stderr line of a failed fetch.
+// failure is the exit code and the first stderr line of a failed fetch,
+// escaped: the line comes from a tool.
 func failure(s secrets.Status) string {
+	msg := eventlog.Printable(s.Err)
 	if s.ExitCode > 0 {
 		if s.Err == "" || s.Err == fmt.Sprintf("exit status %d", s.ExitCode) {
 			return fmt.Sprintf("exit %d", s.ExitCode)
 		}
-		return fmt.Sprintf("exit %d: %s", s.ExitCode, s.Err)
+		return fmt.Sprintf("exit %d: %s", s.ExitCode, msg)
 	}
-	return s.Err
+	return msg
+}
+
+// printEvent writes one event as one line.
+func printEvent(w io.Writer, e eventlog.Event) error {
+	_, err := fmt.Fprintln(w, logLine(e))
+	return err
 }
 
 // logLine is one event: time, kind, namespace, route, method, path,
-// status, secret names, message. An empty field is "-".
+// status, secret names, message. An empty field is "-". Every field is
+// escaped (eventlog.Printable): the path, the method and the message come
+// from a sandboxed app. The fields before the message have no space.
 func logLine(e eventlog.Event) string {
 	status := ""
 	if e.Status != 0 {
@@ -292,9 +301,15 @@ func logLine(e eventlog.Event) string {
 	}
 	fields := []string{e.Time.Local().Format(time.TimeOnly), string(e.Kind), e.Namespace, e.Route, e.Method, e.Path,
 		status, strings.Join(e.Secrets, ","), e.Message}
+	last := len(fields) - 1
 	for i, f := range fields {
-		if f == "" {
+		switch {
+		case f == "":
 			fields[i] = "-"
+		case i == last:
+			fields[i] = eventlog.Printable(f)
+		default:
+			fields[i] = eventlog.PrintableField(f)
 		}
 	}
 	return strings.Join(fields, " ")

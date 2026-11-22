@@ -661,6 +661,29 @@ func TestProxyEvents(t *testing.T) {
 	noLeakInLog(t, l)
 }
 
+// The event path is the escaped form of the path: a sandboxed app cannot
+// put a control byte or a space into it. The client's own escapes do not
+// count; the broker escapes the decoded path itself.
+func TestEventPathIsEscaped(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer up.Close()
+	h, l := startProxy(t, up.URL)
+	conn, err := net.Dial("tcp", h.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	// %70 is "p": a valid but needless escape that EscapedPath would keep.
+	if _, err := io.WriteString(conn, "GET /a%1b%5B2J%20b%0Ac%70 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, conn)
+	e := waitEvent(t, l, eventlog.KindSwap)
+	if want := "/a%1B%5B2J%20b%0Acp"; e.Path != want {
+		t.Fatalf("event path %q, want %q", e.Path, want)
+	}
+}
+
 func TestProxyRefusesProtocolSwitch(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, bw, err := http.NewResponseController(w).Hijack()

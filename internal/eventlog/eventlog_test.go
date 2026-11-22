@@ -22,6 +22,29 @@ func openLog(t *testing.T, ring int, maxBytes int64) (*Log, string) {
 	return l, path
 }
 
+func TestPrintable(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"plain text, ok: /v1?a=b", "plain text, ok: /v1?a=b"},
+		{"\x1b[2J", `\x1b[2J`},
+		{"a\nb\r\tc", `a\x0ab\x0d\x09c`},
+		{"del\x7f", `del\x7f`},
+		{"c1 \u009b31m", `c1 \x9b31m`},
+		{"bad \xff\xfe utf8", `bad \xff\xfe utf8`},
+		{`back\slash`, `back\\slash`},
+		{"umlaut äöü and �", "umlaut äöü and �"},
+	} {
+		if got := Printable(tc.in); got != tc.want {
+			t.Errorf("Printable(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestPrintableField(t *testing.T) {
+	if got, want := PrintableField("/a b\x1b[2J"), `/a%20b\x1b[2J`; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
 func TestRingKeepsLastN(t *testing.T) {
 	l, _ := openLog(t, 3, 1<<20)
 	for i := 1; i <= 5; i++ {

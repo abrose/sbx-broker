@@ -524,6 +524,33 @@ func (r *redactor) wipeAll() {
 	}
 }
 
+// pathEscape is what url.URL.EscapedPath does to v inside a decoded path,
+// on bytes: a string copy of a value could never be wiped. The escape is
+// per byte, so a value has this form wherever it sits in a path.
+// TestPathEscapeMatchesURL holds it to the url package.
+func pathEscape(v []byte) []byte {
+	const upperHex = "0123456789ABCDEF"
+	out := make([]byte, 0, len(v)+8)
+	for _, c := range v {
+		if pathKeeps(c) {
+			out = append(out, c)
+			continue
+		}
+		out = append(out, '%', upperHex[c>>4], upperHex[c&0xf])
+	}
+	return out
+}
+
+// pathKeeps reports the bytes a path keeps unescaped (url's shouldEscape
+// in path mode).
+func pathKeeps(c byte) bool {
+	switch {
+	case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z', '0' <= c && c <= '9':
+		return true
+	}
+	return strings.IndexByte("-_.~$&+,/:;=@", c) >= 0
+}
+
 func (r *redactor) redact(s string) string {
 	if s == "" {
 		return s
@@ -538,6 +565,20 @@ func (r *redactor) redact(s string) string {
 		all = append(all, e.retired...)
 	}
 	all = append(all, fresh...)
+	// The proxy logs the escaped path (url.URL.EscapedPath of the decoded
+	// path); a value in it has this form.
+	var escaped [][]byte
+	for _, v := range all {
+		if e := pathEscape(v); !bytes.Equal(e, v) {
+			escaped = append(escaped, e)
+		}
+	}
+	all = append(all, escaped...)
+	defer func() {
+		for _, v := range escaped {
+			clear(v)
+		}
+	}()
 	// Longer values first, so a value inside another goes with it. Bytes,
 	// not strings: a string copy of a value could never be wiped.
 	sort.Slice(all, func(i, j int) bool { return len(all[i]) > len(all[j]) })
