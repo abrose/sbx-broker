@@ -735,6 +735,89 @@ func TestServeReloadRetriesPortClash(t *testing.T) {
 	}
 }
 
+// runHeld runs Run with a hook that blocks after shutdown, before the log
+// closes, until release is called. The hook gets the log.
+func runHeld(t *testing.T, cfg, state string, hook func(*eventlog.Log)) (cancel func(), release func(), done <-chan error) {
+	t.Helper()
+	ctx, stop := context.WithCancel(context.Background())
+	gate := make(chan struct{})
+	var once sync.Once
+	release = func() { once.Do(func() { close(gate) }) }
+	errs := make(chan error, 1)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		errs <- Run(ctx, Options{ConfigDir: cfg, StateDir: state, FetchTimeout: 10 * time.Second, PollInterval: 100 * time.Millisecond,
+			beforeLogClose: func(l *eventlog.Log) {
+				if hook != nil {
+					hook(l)
+				}
+				<-gate
+			}})
+	}()
+	t.Cleanup(func() {
+		stop()
+		release()
+		select {
+		case <-finished:
+		case <-time.After(15 * time.Second):
+			t.Error("Run did not end")
+		}
+	})
+	waitFor(t, 3*time.Second, "the admin socket", func() bool { _, err := do(t, state, admin.Request{Op: "status"}); return err == nil })
+	return stop, release, errs
+}
+
+// A late event (a listener may still write one after shutdown) is redacted
+// with the values of the namespaces that ran until the end.
+func TestShutdownKeepsRedactingUntilLogClose(t *testing.T) {
+	t.Parallel()
+	cfg, state := dirs(t)
+	writeNS(t, cfg, "t1", nsYAML([]string{secretYAML("api-key", "printf", "%s", apiKey)}, nil))
+	added := make(chan struct{})
+	cancel, release, done := runHeld(t, cfg, state, func(l *eventlog.Log) {
+		l.Add(eventlog.Event{Kind: eventlog.KindInfo, Namespace: "t1", Path: "/x/" + apiKey, Message: "late " + apiKey})
+		close(added)
+	})
+	waitOK(t, state, "t1", "api-key")
+	cancel()
+	<-added
+	release()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !hasEvent(readLog(t, state), func(e eventlog.Event) bool { return strings.HasPrefix(e.Message, "late ") }) {
+		t.Fatal("no late event")
+	}
+	noValues(t, state, apiKey)
+}
+
+// The lock is held for the broker's whole life: a second Run refuses while
+// the first still shuts down, and starts once the first returned.
+func TestLockHeldUntilRunReturns(t *testing.T) {
+	t.Parallel()
+	cfg, state := dirs(t)
+	reached := make(chan struct{})
+	cancel, release, done := runHeld(t, cfg, state, func(*eventlog.Log) { close(reached) })
+	cancel()
+	<-reached
+	second := func() error {
+		ctx, stop := context.WithCancel(context.Background())
+		stop() // a Run that starts, then stops at once
+		return Run(ctx, Options{ConfigDir: cfg, StateDir: state, PollInterval: 100 * time.Millisecond})
+	}
+	if err := second(); err == nil || err.Error() != "a broker already runs" {
+		t.Fatalf("during shutdown: got %v", err)
+	}
+	release()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := second(); err != nil {
+		t.Fatalf("after Run returned: %v", err)
+	}
+}
+
 // testBroker is a broker without Run, for tests that drive scan directly.
 func testBroker(t *testing.T, cfg, state string) *broker {
 	t.Helper()

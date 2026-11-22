@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -46,12 +47,16 @@ const (
 type Options struct {
 	ConfigDir, StateDir        string
 	FetchTimeout, PollInterval time.Duration
+
+	// beforeLogClose, if set, runs after the shutdown and before the log
+	// closes: the last point a late event can come. Tests only.
+	beforeLogClose func(*eventlog.Log)
 }
 
 // Run serves until ctx is done, then stops the file watch, closes every
-// listener, the admin socket and the log, in that order. It returns nil
-// after a clean stop.
-func Run(ctx context.Context, opt Options) error {
+// listener, the admin socket and the log, in that order, and releases the
+// single-instance lock last. It returns nil after a clean stop.
+func Run(ctx context.Context, opt Options) (err error) {
 	if opt.FetchTimeout <= 0 {
 		opt.FetchTimeout = defaultFetchTimeout
 	}
@@ -61,7 +66,14 @@ func Run(ctx context.Context, opt Options) error {
 	if err := prepareStateDir(opt.StateDir); err != nil {
 		return err
 	}
-	ln, err := admin.Listen(opt.StateDir)
+	lock, err := admin.TakeLock(opt.StateDir)
+	if err != nil {
+		return err
+	}
+	// Last: a second broker must not start while this one still writes
+	// the log or holds values.
+	defer func() { err = errors.Join(err, lock.Release()) }()
+	ln, err := lock.Listen()
 	if err != nil {
 		return err
 	}
@@ -80,6 +92,9 @@ func Run(ctx context.Context, opt Options) error {
 	srv := admin.Serve(ln, b, log)
 	b.watch(ctx)
 	b.shutdown(srv)
+	if opt.beforeLogClose != nil {
+		opt.beforeLogClose(log)
+	}
 	err = log.Close()
 	b.red.wipeAll()
 	return err
@@ -208,10 +223,14 @@ func (b *broker) shutdown(srv *admin.Server) {
 	_ = srv.Close() // waits for the admin requests, a refresh among them
 	b.fetches.Wait()
 	b.mu.Lock()
-	for _, st := range b.nss {
+	running := maps.Clone(b.nss)
+	b.mu.Unlock()
+	for name, st := range running {
+		// As in stop: the redactor keeps copies until the log closed (Run
+		// wipes them then), so a late event is still redacted.
+		b.red.retire(name, st.store.Values())
 		st.store.Wipe()
 	}
-	b.mu.Unlock()
 }
 
 func closeAll(hs []*proxy.HTTP) {

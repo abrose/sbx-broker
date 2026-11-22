@@ -59,7 +59,11 @@ func serve(t *testing.T) (string, *fakeBackend, *eventlog.Log, *Server) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ln, err := Listen(state)
+	lock, err := TakeLock(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := lock.Listen()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,6 +72,7 @@ func serve(t *testing.T) (string, *fakeBackend, *eventlog.Log, *Server) {
 	t.Cleanup(func() {
 		_ = s.Close()
 		_ = log.Close()
+		_ = lock.Release()
 	})
 	return state, b, log, s
 }
@@ -217,9 +222,24 @@ func TestCloseEndsFollow(t *testing.T) {
 	}
 }
 
-func TestListenRefusesLiveSocket(t *testing.T) {
+func TestTakeLockRefusesRunningBroker(t *testing.T) {
 	state, _, _, _ := serve(t)
-	if _, err := Listen(state); !errors.Is(err, ErrRunning) {
+	if _, err := TakeLock(state); !errors.Is(err, ErrRunning) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// Closing the server (and its listener) keeps the lock: the broker still
+// shuts down. Only Release frees it.
+func TestServerCloseKeepsLock(t *testing.T) {
+	state, _, _, s := serve(t)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if l, err := TakeLock(state); !errors.Is(err, ErrRunning) {
+		if l != nil {
+			_ = l.Release()
+		}
 		t.Fatalf("got %v", err)
 	}
 }
@@ -246,9 +266,9 @@ func TestListenRefusesWhileLockHeld(t *testing.T) {
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		t.Fatal(err)
 	}
-	if ln, err := Listen(state); !errors.Is(err, ErrRunning) {
-		if ln != nil {
-			_ = ln.Close()
+	if l, err := TakeLock(state); !errors.Is(err, ErrRunning) {
+		if l != nil {
+			_ = l.Release()
 		}
 		t.Fatalf("got %v", err)
 	}
@@ -264,7 +284,12 @@ func TestListenReplacesSocketWithoutLock(t *testing.T) {
 	}
 	old.(*net.UnixListener).SetUnlinkOnClose(false)
 	defer old.Close()
-	ln, err := Listen(state)
+	lock, err := TakeLock(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+	ln, err := lock.Listen()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,9 +313,9 @@ func TestListenReplacesSocketWithoutLock(t *testing.T) {
 	}
 }
 
-func TestCloseReleasesLock(t *testing.T) {
+func TestReleaseFreesLock(t *testing.T) {
 	state := shortDir(t)
-	ln, err := Listen(state)
+	lock, err := TakeLock(state)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,14 +326,17 @@ func TestCloseReleasesLock(t *testing.T) {
 	if fi.Mode().Perm() != 0o600 {
 		t.Errorf("lock mode %04o", fi.Mode().Perm())
 	}
-	if err := ln.Close(); err != nil {
+	if err := lock.Release(); err != nil {
 		t.Fatal(err)
 	}
-	ln2, err := Listen(state)
-	if err != nil {
-		t.Fatalf("after Close: %v", err)
+	if err := lock.Release(); err != nil {
+		t.Fatalf("second Release: %v", err)
 	}
-	_ = ln2.Close()
+	again, err := TakeLock(state)
+	if err != nil {
+		t.Fatalf("after Release: %v", err)
+	}
+	_ = again.Release()
 }
 
 func TestDialNoBroker(t *testing.T) {

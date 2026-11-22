@@ -39,7 +39,7 @@ const (
 )
 
 var (
-	// ErrRunning is the error of Listen when another broker answers on the socket.
+	// ErrRunning is the error of TakeLock when another broker holds the lock.
 	ErrRunning = errors.New("a broker already runs")
 	// ErrNoBroker is the error of Dial when no broker answers on the socket.
 	ErrNoBroker = errors.New("no broker runs")
@@ -76,34 +76,32 @@ type Backend interface {
 	// Refresh fetches one secret of ns again, or every secret when secret
 	// is empty, and returns the status of ns after the fetch.
 	Refresh(ctx context.Context, ns, secret string) ([]NamespaceStatus, error)
-	// Reload scans the config dir now.
+	// Reload scans the config dir now, without waiting for a change to
+	// settle, and also loads again every file that was refused (a port
+	// clash, or an error that may be gone) and every namespace with a
+	// listener that did not start.
 	Reload(ctx context.Context) error
 }
 
 // SocketPath returns the path of the socket in stateDir.
 func SocketPath(stateDir string) string { return filepath.Join(stateDir, SocketName) }
 
-// Listen takes the single-instance lock (an flock on admin.lock, mode 0600,
-// in stateDir) and listens on the socket with mode 0600. The lock, not a
-// dial, decides whether a broker runs: a lock held by another process gives
-// ErrRunning; with the lock held, a socket file at the path is stale and is
-// replaced. Close releases the lock after it closed the socket.
-func Listen(stateDir string) (net.Listener, error) {
-	lock, err := takeLock(filepath.Join(stateDir, LockName))
-	if err != nil {
-		return nil, err
-	}
-	ln, err := listenSocket(SocketPath(stateDir))
-	if err != nil {
-		_ = lock.Close()
-		return nil, err
-	}
-	return &lockedListener{Listener: ln, lock: lock}, nil
+// Lock is the single-instance lock of a state dir: an flock on admin.lock
+// (mode 0600). The lock, not a dial, decides whether a broker runs. Hold it
+// for the broker's whole life, its log close included, and Release it last.
+// The lock file stays: removing it would let a second broker lock a new
+// file while a first still holds the old one.
+type Lock struct {
+	dir  string
+	f    *os.File
+	once sync.Once
 }
 
-// takeLock opens path (close-on-exec, so no fetch command inherits the
-// lock) and locks it without waiting.
-func takeLock(path string) (*os.File, error) {
+// TakeLock locks stateDir without waiting. A lock held by another process
+// gives ErrRunning.
+func TakeLock(stateDir string) (*Lock, error) {
+	path := filepath.Join(stateDir, LockName)
+	// os.OpenFile sets close-on-exec: no fetch command inherits the lock.
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, lockMode)
 	if err != nil {
 		return nil, err
@@ -120,12 +118,21 @@ func takeLock(path string) (*os.File, error) {
 		}
 		return nil, fmt.Errorf("lock %s: %w", path, err)
 	}
-	return f, nil
+	return &Lock{dir: stateDir, f: f}, nil
 }
 
-// listenSocket listens on path; the caller holds the lock, so a socket
-// file there is stale.
-func listenSocket(path string) (net.Listener, error) {
+// Release frees the lock. A second call does nothing.
+func (l *Lock) Release() error {
+	var err error
+	l.once.Do(func() { err = l.f.Close() })
+	return err
+}
+
+// Listen listens on the socket of the locked state dir with mode 0600. The
+// lock is held, so a socket file at the path is stale and is replaced.
+// Closing the listener keeps the lock.
+func (l *Lock) Listen() (net.Listener, error) {
+	path := SocketPath(l.dir)
 	fi, err := os.Lstat(path)
 	switch {
 	case err == nil:
@@ -155,21 +162,6 @@ func listenSocket(path string) (net.Listener, error) {
 		return nil, err
 	}
 	return ln, nil
-}
-
-// lockedListener holds the lock for the life of the listener. The lock
-// file stays: removing it would let a second broker lock a new file while
-// a first still holds the old one.
-type lockedListener struct {
-	net.Listener
-	lock *os.File
-	once sync.Once
-}
-
-func (l *lockedListener) Close() error {
-	err := l.Listener.Close()
-	l.once.Do(func() { err = errors.Join(err, l.lock.Close()) })
-	return err
 }
 
 // Server answers the requests on one listener.
