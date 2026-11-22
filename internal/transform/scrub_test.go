@@ -6,10 +6,13 @@ import (
 	"compress/gzip"
 	"compress/zlib"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"regexp"
 	"slices"
@@ -129,6 +132,53 @@ var forms = []struct {
 	{"json escape", func(s string) string { return jsonEscape([]byte(s)) }},
 	{"std base64", b64},
 	{"url base64", func(s string) string { return base64.URLEncoding.EncodeToString([]byte(s)) }},
+	// The common re-encodings of ruling R9.
+	{"json with html escapes", func(s string) string {
+		b, _ := json.Marshal(s)
+		return string(b[1 : len(b)-1])
+	}},
+	{"json with \\/", func(s string) string {
+		return strings.ReplaceAll(jsonEscape([]byte(s)), "/", `\/`)
+	}},
+	{"encodeURIComponent", jsURIComponent},
+	{"lowercase query escape", func(s string) string { return lowerPercent(url.QueryEscape(s)) }},
+	{"lowercase path escape", func(s string) string { return lowerPercent(url.PathEscape(s)) }},
+	{"lowercase encodeURIComponent", func(s string) string { return lowerPercent(jsURIComponent(s)) }},
+}
+
+// jsURIComponent is JavaScript's encodeURIComponent, written out here so
+// the test does not share code with the scrub.
+func jsURIComponent(s string) string {
+	var b strings.Builder
+	for _, c := range []byte(s) {
+		if c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || strings.IndexByte("-_.!~*'()", c) >= 0 {
+			b.WriteByte(c)
+		} else {
+			fmt.Fprintf(&b, "%%%02X", c)
+		}
+	}
+	return b.String()
+}
+
+var percentHex = regexp.MustCompile(`%[0-9A-F]{2}`)
+
+func lowerPercent(s string) string { return percentHex.ReplaceAllStringFunc(s, strings.ToLower) }
+
+// r7Forms is how many of forms come from ruling R7; the rest are R9's.
+const r7Forms = 6
+
+// TestEscapedFormsDiffer checks the test data: each R9 form of pass is a
+// text of its own, so each R9 case of TestScrubEscapedForms tests something
+// new. (Some R7 forms of pass coincide, such as its JSON escape and text.)
+func TestEscapedFormsDiffer(t *testing.T) {
+	seen := map[string]string{}
+	for i, f := range forms {
+		got := f.enc(pass)
+		if other, ok := seen[got]; ok && i >= r7Forms {
+			t.Errorf("the %s form of pass equals the %s form", f.name, other)
+		}
+		seen[got] = f.name
+	}
 }
 
 func TestScrubEscapedForms(t *testing.T) {
@@ -145,6 +195,69 @@ func TestScrubEscapedForms(t *testing.T) {
 				if strings.Contains(got, g.enc(v)) {
 					t.Errorf("%s, %s: the %s form is left", name, f.name, g.name)
 				}
+			}
+		}
+	}
+}
+
+// TestResponseValueInContentEncoding: an upstream reflects a request value
+// into Content-Encoding. Neither the error nor the headers may hold it.
+func TestResponseValueInContentEncoding(t *testing.T) {
+	resp := newResp(&closeCounter{Reader: strings.NewReader("x")})
+	resp.Header.Set("Content-Encoding", apiKey)
+	resp.Header.Set("X-Echo", "k="+pass)
+	tr, _ := New(config.TransformSpec{Name: "swap"})
+	rec := &doneRec{}
+	err := tr.Response(resp, "t1", t1(), nil, rec.done)
+	if err == nil {
+		t.Fatal("no error for an unknown encoding")
+	}
+	noLeak(t, "error", err.Error())
+	check(t, "error", err.Error(), "unsupported content encoding sbxb_t1_api_key")
+	check(t, "Content-Encoding", resp.Header.Get("Content-Encoding"), "sbxb_t1_api_key")
+	check(t, "X-Echo", resp.Header.Get("X-Echo"), "k=sbxb_t1_pass")
+	if calls, names := rec.get(); calls != 1 || !slices.Equal(names, []string{"api-key", "pass"}) {
+		t.Errorf("done: %d calls, names %v", calls, names)
+	}
+}
+
+// TestResponseEmptyCompressedBody: HEAD, 204, 304 and an empty body of
+// unknown length carry a Content-Encoding but no bytes to decode.
+func TestResponseEmptyCompressedBody(t *testing.T) {
+	cases := []struct {
+		name   string
+		method string
+		status int
+		body   io.ReadCloser
+		length int64
+	}{
+		{"HEAD", http.MethodHead, 200, http.NoBody, 1234},
+		{"204", http.MethodGet, 204, http.NoBody, 0},
+		{"304", http.MethodGet, 304, http.NoBody, 0},
+		{"empty, length unknown", http.MethodGet, 200, io.NopCloser(strings.NewReader("")), -1},
+	}
+	for _, ce := range []string{"gzip", "deflate", "br"} {
+		for _, c := range cases {
+			name := c.name + ", " + ce
+			if ce == "br" && c.length == -1 {
+				continue // a body of unknown length may hold bytes: br is still refused
+			}
+			resp := &http.Response{
+				StatusCode: c.status, Header: http.Header{}, Body: c.body, ContentLength: c.length,
+				Request: httptest.NewRequest(c.method, "http://api.test/x", nil),
+			}
+			resp.Header.Set("Content-Encoding", ce)
+			tr, _ := New(config.TransformSpec{Name: "swap"})
+			if err := tr.Response(resp, "t1", t1(), nil, nil); err != nil {
+				t.Errorf("%s: %v", name, err)
+				continue
+			}
+			got, err := io.ReadAll(resp.Body)
+			if err != nil || len(got) != 0 {
+				t.Errorf("%s: body %d bytes, error %v", name, len(got), err)
+			}
+			if c.length != -1 && resp.Header.Get("Content-Encoding") != ce {
+				t.Errorf("%s: Content-Encoding %q, want it kept", name, resp.Header.Get("Content-Encoding"))
 			}
 		}
 	}

@@ -295,25 +295,31 @@ func wipe(vals map[string][]byte) {
 // the namespace, in each form the broker sends (see responsePatterns),
 // becomes the same form of its placeholder.
 func (swap) Response(resp *http.Response, ns string, sec Secrets, used map[string][]byte, done func(scrubbed []string)) error {
+	m := newMatcher(responsePatterns(ns, valueSets(used, sec.Values())))
+	hits := &hitSet{}
+	// The headers first, on every path: Content-Encoding may echo a value,
+	// and the error below quotes it.
+	scrubHeader(resp.Header, m, hits)
 	body := resp.Body
 	if body == nil {
 		body = http.NoBody
 	}
-	decoded, err := decodeBody(resp.Header, body)
-	if err != nil {
-		_ = body.Close()
-		if done != nil {
-			done(nil)
+	empty := emptyBody(resp)
+	decoded := io.ReadCloser(body)
+	if !empty {
+		var err error
+		if decoded, err = decodeBody(resp.Header, body); err != nil {
+			_ = body.Close()
+			if done != nil {
+				done(hits.list())
+			}
+			return err
 		}
-		return err
 	}
 	if decoded != body {
 		resp.Header.Del("Content-Encoding")
 		resp.Uncompressed = true
 	}
-	m := newMatcher(responsePatterns(ns, valueSets(used, sec.Values())))
-	hits := &hitSet{}
-	scrubHeader(resp.Header, m, hits)
 	s := newScrub(decoded, m, hits)
 	// The transport fills the trailers just before the body gives EOF.
 	s.atEOF = func() { scrubHeader(resp.Trailer, m, hits) }
@@ -323,9 +329,21 @@ func (swap) Response(resp *http.Response, ns string, sec Secrets, used map[strin
 		}
 	}
 	resp.Body = s
+	if empty {
+		return nil // no bytes to change: Content-Length stays as it is
+	}
 	resp.Header.Del("Content-Length")
 	resp.ContentLength = -1
 	return nil
+}
+
+// emptyBody reports an answer that has no body bytes by the rules of HTTP:
+// such a body is never decoded, and its headers (Content-Encoding and
+// Content-Length describe the resource) stay as they are.
+func emptyBody(resp *http.Response) bool {
+	return resp.Body == nil || resp.Body == http.NoBody || resp.ContentLength == 0 ||
+		resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotModified ||
+		(resp.Request != nil && resp.Request.Method == http.MethodHead)
 }
 
 // decodeBody returns body, or a reader that decodes it for a gzip or
@@ -365,7 +383,11 @@ type decoder struct {
 
 func (d *decoder) Read(p []byte) (int, error) {
 	if d.r == nil {
-		r, err := d.open(d.src)
+		br := bufio.NewReader(d.src)
+		if _, err := br.Peek(1); err == io.EOF {
+			return 0, io.EOF // an empty body of unknown length: nothing to decode
+		}
+		r, err := d.open(br)
 		if err != nil {
 			return 0, err
 		}

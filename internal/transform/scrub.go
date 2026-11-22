@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"cmp"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
 	"maps"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -20,10 +22,65 @@ type pattern struct{ from, to, tag string }
 
 // wholeForms are the encodings the broker sends a value in (rulings R4 and
 // R7): as text, escaped for a query or form, a path, a JSON string, and as
-// Base64 in both alphabets.
+// Base64 in both alphabets. Then the common re-encodings an upstream may
+// make (ruling R9): JSON with HTML escapes, JSON with \/, the
+// encodeURIComponent form, and each percent form with lowercase hex.
 var wholeForms = []func([]byte) string{
 	asIs, queryEscape, pathEscape, jsonEscape,
 	base64.StdEncoding.EncodeToString, base64.URLEncoding.EncodeToString,
+	jsonHTMLEscape, jsonSlashEscape, uriComponent,
+	func(v []byte) string { return lowerHex(queryEscape(v)) },
+	func(v []byte) string { return lowerHex(pathEscape(v)) },
+	func(v []byte) string { return lowerHex(uriComponent(v)) },
+}
+
+// jsonHTMLEscape is the inside of a JSON string as Go's json.Marshal writes
+// it: &, < and > as &, < and >.
+func jsonHTMLEscape(v []byte) string {
+	b, _ := json.Marshal(string(v)) // a string always encodes
+	return string(b[1 : len(b)-1])
+}
+
+// jsonSlashEscape is the inside of a JSON string with / as \/ (as PHP's
+// json_encode writes it).
+func jsonSlashEscape(v []byte) string {
+	return strings.ReplaceAll(jsonEscape(v), "/", `\/`)
+}
+
+// uriComponent is JavaScript's encodeURIComponent: every byte but
+// A-Z a-z 0-9 - _ . ! ~ * ' ( ) as %XX (space as %20).
+func uriComponent(v []byte) string {
+	const hex = "0123456789ABCDEF"
+	var b strings.Builder
+	for _, c := range v {
+		if 'A' <= c && c <= 'Z' || 'a' <= c && c <= 'z' || '0' <= c && c <= '9' || strings.IndexByte("-_.!~*'()", c) >= 0 {
+			b.WriteByte(c)
+			continue
+		}
+		b.WriteByte('%')
+		b.WriteByte(hex[c>>4])
+		b.WriteByte(hex[c&0x0f])
+	}
+	return b.String()
+}
+
+// lowerHex writes the two hex digits after each % in lowercase.
+func lowerHex(s string) string {
+	b := []byte(s)
+	for i := 0; i+2 < len(b); i++ {
+		if b[i] == '%' {
+			b[i+1], b[i+2] = toLower(b[i+1]), toLower(b[i+2])
+			i += 2
+		}
+	}
+	return string(b)
+}
+
+func toLower(c byte) byte {
+	if 'A' <= c && c <= 'Z' {
+		return c + 'a' - 'A'
+	}
+	return c
 }
 
 // responsePatterns returns, for each value, the patterns that turn it into
