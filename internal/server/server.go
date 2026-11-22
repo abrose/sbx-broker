@@ -28,7 +28,9 @@ import (
 
 const (
 	defaultFetchTimeout = 60 * time.Second
-	defaultPollInterval = 2 * time.Second
+	// A poll acts on a change that two polls in a row saw: with 1 s, a
+	// change takes effect within 2 s.
+	defaultPollInterval = time.Second
 	logName             = "broker.log"
 	logRing             = 10000
 	logMaxBytes         = 10 << 20
@@ -38,7 +40,7 @@ const (
 )
 
 // Options configures Run. A zero FetchTimeout means 60 s, a zero
-// PollInterval 2 s.
+// PollInterval 1 s.
 type Options struct {
 	ConfigDir, StateDir        string
 	FetchTimeout, PollInterval time.Duration
@@ -68,7 +70,7 @@ func Run(ctx context.Context, opt Options) error {
 	}
 	b := newBroker(opt, log)
 	log.SetRedactor(b.red.redact)
-	if err := b.scan(true); err != nil {
+	if err := b.scan(scanFirst); err != nil {
 		_ = ln.Close()
 		b.fetchStop()
 		return errors.Join(fmt.Errorf("config dir: %w", err), log.Close())
@@ -151,8 +153,10 @@ type broker struct {
 	reloads   chan chan struct{}
 
 	// Only the watch goroutine uses these.
-	stamps map[string]stamp // by file name
-	dirErr string           // the last config dir error logged
+	stamps  map[string]stamp // by file name: the stamp last acted on
+	seen    map[string]stamp // by file name: the stamps of the last scan
+	refused map[string]bool  // by file name: did not load or clashed on a port
+	dirErr  string           // the last config dir error logged
 
 	mu  sync.Mutex
 	nss map[string]*nsState // by namespace name
@@ -163,7 +167,8 @@ func newBroker(opt Options, log *eventlog.Log) *broker {
 	return &broker{
 		opt: opt, log: log, red: &redactor{ns: map[string]*redactNS{}},
 		fetchCtx: ctx, fetchStop: cancel, reloads: make(chan chan struct{}),
-		stamps: map[string]stamp{}, nss: map[string]*nsState{},
+		stamps: map[string]stamp{}, seen: map[string]stamp{}, refused: map[string]bool{},
+		nss: map[string]*nsState{},
 	}
 }
 
@@ -177,9 +182,9 @@ func (b *broker) watch(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			_ = b.scan(false) // a dir error is logged
+			_ = b.scan(scanPoll) // a dir error is logged
 		case done := <-b.reloads:
-			_ = b.scan(false)
+			_ = b.scan(scanReload)
 			close(done)
 		}
 	}
@@ -214,10 +219,25 @@ func closeAll(hs []*proxy.HTTP) {
 	wg.Wait()
 }
 
-// scan loads the files that are new or changed since the last scan and
-// stops the namespaces whose file is gone. With first set, a config dir
-// error is returned and not logged.
-func (b *broker) scan(first bool) error {
+type scanMode int
+
+const (
+	// scanFirst is the scan at start: it acts at once, and returns a config
+	// dir error without logging it.
+	scanFirst scanMode = iota
+	// scanPoll acts on a change (a new, changed or removed file) only when
+	// the previous scan saw the same state: an editor that truncates the
+	// file, then writes it, must not stop the namespace in between.
+	scanPoll
+	// scanReload is the reload op: it acts at once, and also loads again
+	// every namespace with a listener that did not start and every file
+	// that was refused (a port clash, or an error that may be gone).
+	scanReload
+)
+
+// scan loads the files that are new or changed since they were last acted
+// on and stops the namespaces whose file is gone, as mode says.
+func (b *broker) scan(mode scanMode) error {
 	dir := b.opt.ConfigDir
 	stamps, err := readStamps(dir)
 	var ok map[string]*config.Namespace
@@ -226,27 +246,42 @@ func (b *broker) scan(first bool) error {
 		ok, bad, err = config.LoadDir(dir)
 	}
 	if err != nil {
-		if !first && err.Error() != b.dirErr {
+		if mode != scanFirst && err.Error() != b.dirErr {
 			b.dirErr = err.Error()
 			b.log.Add(eventlog.Event{Kind: eventlog.KindError, Message: "config dir: " + err.Error()})
 		}
 		return err
 	}
 	b.dirErr = ""
+	prev := b.seen
+	b.seen = stamps
+	stable := func(file string) bool {
+		if mode != scanPoll {
+			return true
+		}
+		s, there := stamps[file]
+		p, was := prev[file]
+		return there == was && s == p
+	}
 	for _, file := range slices.Sorted(mapKeys(b.stamps)) {
-		if _, there := stamps[file]; !there {
+		if _, there := stamps[file]; !there && stable(file) {
 			delete(b.stamps, file)
+			delete(b.refused, file)
 			b.remove(strings.TrimSuffix(file, ".yaml"))
 		}
 	}
 	for _, file := range slices.Sorted(mapKeys(stamps)) {
 		s := stamps[file]
-		if old, seen := b.stamps[file]; seen && old == s {
+		name := strings.TrimSuffix(file, ".yaml")
+		old, acted := b.stamps[file]
+		if changed := !acted || old != s; changed && !stable(file) ||
+			!changed && (mode != scanReload || !b.needsRetry(file, name)) {
 			continue
 		}
-		name := strings.TrimSuffix(file, ".yaml")
 		if lerr, isBad := bad[file]; isBad {
+			// LoadDir refuses a file that claims a port of an earlier file.
 			b.stamps[file] = s
+			b.refused[file] = true
 			b.logBadFile(name, file, lerr)
 			continue
 		}
@@ -256,12 +291,26 @@ func (b *broker) scan(first bool) error {
 		}
 		b.stamps[file] = s
 		if perr := b.portClash(cfg); perr != nil {
+			b.refused[file] = true
 			b.logBadFile(name, file, perr)
 			continue
 		}
+		delete(b.refused, file)
 		b.replace(cfg)
 	}
 	return nil
+}
+
+// needsRetry reports a file that was refused (it did not load, or it
+// clashed on a port), or a namespace with a listener that did not start.
+func (b *broker) needsRetry(file, name string) bool {
+	if b.refused[file] {
+		return true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	st := b.nss[name]
+	return st != nil && len(st.errs) > 0
 }
 
 func mapKeys[V any](m map[string]V) func(func(string) bool) {

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -669,6 +670,132 @@ func TestServeListenerStartFails(t *testing.T) {
 		return e.Kind == eventlog.KindError && e.Namespace == "t1" && strings.Contains(e.Message, "idp")
 	}) {
 		t.Fatal("no error event")
+	}
+}
+
+// The reload op retries a listener that could not start.
+func TestServeReloadRetriesFailedListener(t *testing.T) {
+	t.Parallel()
+	cfg, state := dirs(t)
+	up := newUpstream(t)
+	taken, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	busy := taken.Addr().(*net.TCPAddr).Port
+	port := freePort(t)
+	writeNS(t, cfg, "t1", nsYAML(
+		[]string{secretYAML("api-key", "printf", "%s", apiKey)},
+		[]string{routeYAML("api", port, up.URL), routeYAML("idp", busy, up.URL)}))
+	start(t, cfg, state)
+	if n, _ := status(t, state, "t1"); !strings.Contains(n.Error, "idp") {
+		t.Fatalf("error %q", n.Error)
+	}
+	_ = taken.Close()
+	if _, err := do(t, state, admin.Request{Op: "reload"}); err != nil {
+		t.Fatal(err)
+	}
+	n, _ := status(t, state, "t1")
+	if len(n.Listeners) != 2 || n.Error != "" {
+		t.Fatalf("status %+v", n)
+	}
+	waitOK(t, state, "t1", "api-key")
+	if code, _, err := get(busy, "/v1", "sbxb_t1_api_key"); err != nil || code != http.StatusOK {
+		t.Fatalf("idp route: %d %v", code, err)
+	}
+}
+
+// The reload op retries a file refused for a port clash once the port is
+// free.
+func TestServeReloadRetriesPortClash(t *testing.T) {
+	t.Parallel()
+	cfg, state := dirs(t)
+	up := newUpstream(t)
+	port := freePort(t)
+	writeNS(t, cfg, "t1", nsYAML(nil, []string{routeYAML("api", port, up.URL)}))
+	start(t, cfg, state)
+	waitFor(t, 3*time.Second, "t1", func() bool { _, ok := status(t, state, "t1"); return ok })
+	writeNS(t, cfg, "t2", nsYAML(nil, []string{routeYAML("api", port, up.URL)}))
+	waitFor(t, 3*time.Second, "the clash error", func() bool {
+		return hasEvent(readLog(t, state), func(e eventlog.Event) bool {
+			return e.Kind == eventlog.KindError && e.Namespace == "t2" && strings.Contains(e.Message, "is used by namespace t1")
+		})
+	})
+	if err := os.Remove(filepath.Join(cfg, "t1.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, "t1 to stop", func() bool { _, ok := status(t, state, "t1"); return !ok })
+	if _, err := do(t, state, admin.Request{Op: "reload"}); err != nil {
+		t.Fatal(err)
+	}
+	n, ok := status(t, state, "t2")
+	if !ok || len(n.Listeners) != 1 {
+		t.Fatalf("status %+v %v", n, ok)
+	}
+}
+
+// testBroker is a broker without Run, for tests that drive scan directly.
+func testBroker(t *testing.T, cfg, state string) *broker {
+	t.Helper()
+	log, err := eventlog.Open(filepath.Join(state, logName), logRing, logMaxBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := newBroker(Options{ConfigDir: cfg, StateDir: state, FetchTimeout: 10 * time.Second, PollInterval: time.Hour}, log)
+	t.Cleanup(func() {
+		b.fetchStop()
+		for _, st := range b.nss {
+			b.stop(st)
+		}
+		_ = log.Close()
+	})
+	return b
+}
+
+// An editor that truncates the file, then writes it: a poll that sees the
+// empty file must not act on it. A change counts once two polls in a row
+// saw the same stamp.
+func TestScanWaitsForStableFile(t *testing.T) {
+	t.Parallel()
+	cfg, state := dirs(t)
+	up := newUpstream(t)
+	content := nsYAML([]string{secretYAML("api-key", "printf", "%s", apiKey)},
+		[]string{routeYAML("api", freePort(t), up.URL)})
+	writeNS(t, cfg, "t1", content)
+	b := testBroker(t, cfg, state)
+	if err := b.scan(scanFirst); err != nil {
+		t.Fatal(err)
+	}
+	st0 := b.nss["t1"]
+	<-st0.fetched
+	path := filepath.Join(cfg, "t1.yaml")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = b.scan(scanPoll)
+	if b.nss["t1"] != st0 || st0.ctx.Err() != nil {
+		t.Fatal("a poll acted on the empty file")
+	}
+	if err := os.WriteFile(path, []byte(content+"# edited\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = b.scan(scanPoll)
+	if b.nss["t1"] != st0 {
+		t.Fatal("a poll acted on a stamp seen once")
+	}
+	_ = b.scan(scanPoll)
+	st1 := b.nss["t1"]
+	if st1 == st0 || len(st1.cfg.Secrets) != 1 {
+		t.Fatal("the stable file was not loaded")
+	}
+	var reloads []string
+	for _, e := range b.log.Recent(1000) {
+		if e.Kind == eventlog.KindReload {
+			reloads = append(reloads, e.Message)
+		}
+	}
+	if !slices.Equal(reloads, []string{"loaded", "reloaded"}) {
+		t.Fatalf("reload events %v", reloads)
 	}
 }
 

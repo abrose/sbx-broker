@@ -30,13 +30,14 @@ commands:
   serve                      run the broker until SIGINT or SIGTERM
   status [<ns>]              namespaces, listeners and secret states, without values
   refresh <ns> [<secret>]    run the fetch commands again
-  reload                     read the namespace files again now
+  reload                     read the namespace files again now and retry
+                             the files and listeners that failed
   log [-f] [<ns>]            the last 100 events; -f follows new ones
   help                       this text
 
 environment:
   SBX_BROKER_CONFIG_DIR      the namespace files (default ~/.config/sbx-broker/namespaces)
-  SBX_BROKER_STATE_DIR       admin.sock and broker.log (default ~/.local/state/sbx-broker)
+  SBX_BROKER_STATE_DIR       admin.sock, admin.lock and broker.log (default ~/.local/state/sbx-broker)
   SBX_BROKER_FETCH_TIMEOUT   the timeout of a fetch command, a Go duration (default 60s)
 `
 
