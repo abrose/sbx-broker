@@ -1,7 +1,11 @@
 package transform
 
 import (
+	"bufio"
 	"bytes"
+	"compress/flate"
+	"compress/gzip"
+	"compress/zlib"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -41,12 +45,12 @@ func (swap) Request(r *http.Request, ns string, sec Secrets) (Result, error) {
 		return Result{}, err
 	}
 	vals, refusal := s.resolve(ns, sec)
-	defer wipe(vals)
 	if refusal != nil {
 		return Result{}, refusal
 	}
 	s.apply(vals)
-	return Result{Swapped: s.names(), Unscanned: unscanned}, nil
+	// The copies from Lookup go to the caller for the scrub (ruling R8).
+	return Result{Swapped: s.names(), Unscanned: unscanned, Used: vals}, nil
 }
 
 // spot is a text of the request that holds placeholders, with the escape a
@@ -279,25 +283,38 @@ func (s *scan) names() []string {
 	return slices.Compact(names)
 }
 
-// wipe zeroes the copies of the values this request fetched.
+// wipe zeroes the copies of the values a refused request fetched.
 func wipe(vals map[string][]byte) {
 	for _, v := range vals {
 		clear(v)
 	}
 }
 
-// Response scrubs every header value and the body: each ok value of the
-// namespace, its Base64, and the Base64 of the value inside a longer Base64
-// text, becomes the matching text of its placeholder.
-func (swap) Response(resp *http.Response, ns string, sec Secrets, done func(scrubbed []string)) error {
-	m := newMatcher(responsePatterns(ns, sec.Values()))
-	hits := &hitSet{}
-	scrubHeader(resp.Header, m, hits)
+// Response scrubs every header value and the body, decoded from gzip or
+// deflate first: each value that went into the request and each ok value of
+// the namespace, in each form the broker sends (see responsePatterns),
+// becomes the same form of its placeholder.
+func (swap) Response(resp *http.Response, ns string, sec Secrets, used map[string][]byte, done func(scrubbed []string)) error {
 	body := resp.Body
 	if body == nil {
 		body = http.NoBody
 	}
-	s := newScrub(body, m, hits)
+	decoded, err := decodeBody(resp.Header, body)
+	if err != nil {
+		_ = body.Close()
+		if done != nil {
+			done(nil)
+		}
+		return err
+	}
+	if decoded != body {
+		resp.Header.Del("Content-Encoding")
+		resp.Uncompressed = true
+	}
+	m := newMatcher(responsePatterns(ns, valueSets(used, sec.Values())))
+	hits := &hitSet{}
+	scrubHeader(resp.Header, m, hits)
+	s := newScrub(decoded, m, hits)
 	// The transport fills the trailers just before the body gives EOF.
 	s.atEOF = func() { scrubHeader(resp.Trailer, m, hits) }
 	s.onDone = func() {
@@ -310,6 +327,54 @@ func (swap) Response(resp *http.Response, ns string, sec Secrets, done func(scru
 	resp.ContentLength = -1
 	return nil
 }
+
+// decodeBody returns body, or a reader that decodes it for a gzip or
+// deflate Content-Encoding (ruling R7): compressed bytes would hide a value
+// from the scrub. Any other encoding is an error.
+func decodeBody(h http.Header, body io.ReadCloser) (io.ReadCloser, error) {
+	ce := strings.TrimSpace(strings.Join(h.Values("Content-Encoding"), ", "))
+	switch strings.ToLower(ce) {
+	case "", "identity":
+		return body, nil
+	case "gzip":
+		return &decoder{src: body, open: func(r io.Reader) (io.Reader, error) { return gzip.NewReader(r) }}, nil
+	case "deflate":
+		return &decoder{src: body, open: openDeflate}, nil
+	}
+	return nil, fmt.Errorf("unsupported content encoding %s", ce)
+}
+
+// openDeflate reads HTTP deflate: zlib-wrapped as RFC 9110 defines it, or
+// raw deflate, which some servers send. A zlib header has compression method
+// 8 in its low nibble, and the two header bytes are a multiple of 31.
+func openDeflate(r io.Reader) (io.Reader, error) {
+	br := bufio.NewReader(r)
+	if h, err := br.Peek(2); err == nil && h[0]&0x0f == 8 && (uint16(h[0])<<8|uint16(h[1]))%31 == 0 {
+		return zlib.NewReader(br)
+	}
+	return flate.NewReader(br), nil
+}
+
+// decoder opens its decoding reader at the first Read, so Response never
+// waits for body bytes. Close closes the original body.
+type decoder struct {
+	src  io.ReadCloser
+	open func(io.Reader) (io.Reader, error)
+	r    io.Reader
+}
+
+func (d *decoder) Read(p []byte) (int, error) {
+	if d.r == nil {
+		r, err := d.open(d.src)
+		if err != nil {
+			return 0, err
+		}
+		d.r = r
+	}
+	return d.r.Read(p)
+}
+
+func (d *decoder) Close() error { return d.src.Close() }
 
 func scrubHeader(h http.Header, m *matcher, hits *hitSet) {
 	for _, values := range h {

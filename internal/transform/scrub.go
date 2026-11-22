@@ -1,6 +1,7 @@
 package transform
 
 import (
+	"bytes"
 	"cmp"
 	"encoding/base64"
 	"errors"
@@ -17,35 +18,65 @@ import (
 // name, or for NewScrubReader the replacement.
 type pattern struct{ from, to, tag string }
 
+// wholeForms are the encodings the broker sends a value in (rulings R4 and
+// R7): as text, escaped for a query or form, a path, a JSON string, and as
+// Base64 in both alphabets.
+var wholeForms = []func([]byte) string{
+	asIs, queryEscape, pathEscape, jsonEscape,
+	base64.StdEncoding.EncodeToString, base64.URLEncoding.EncodeToString,
+}
+
 // responsePatterns returns, for each value, the patterns that turn it into
-// its placeholder: the value as text, its whole StdEncoding Base64, and the
-// core of its Base64 at each of the three byte offsets (ruling R4), so a
-// value inside a longer Base64 text is caught too.
-func responsePatterns(ns string, values map[string][]byte) []pattern {
+// its placeholder: each whole form of the value into the same form of the
+// placeholder, and the core of its Base64 in both alphabets at each of the
+// three byte offsets (ruling R4), so a value inside a longer Base64 text is
+// caught too.
+func responsePatterns(ns string, values map[string][][]byte) []pattern {
 	names := slices.Sorted(maps.Keys(values))
 	var pats []pattern
 	// The whole patterns come first: a core can be the same text as a whole
 	// Base64, and newMatcher keeps the first pattern of a text.
 	for _, name := range names {
-		v, ph := values[name], []byte(placeholder.Format(ns, name))
-		pats = append(pats,
-			pattern{from: string(v), to: string(ph), tag: name},
-			pattern{from: base64.StdEncoding.EncodeToString(v), to: base64.StdEncoding.EncodeToString(ph), tag: name})
+		ph := []byte(placeholder.Format(ns, name))
+		for _, v := range values[name] {
+			for _, form := range wholeForms {
+				pats = append(pats, pattern{from: form(v), to: form(ph), tag: name})
+			}
+		}
 	}
 	for _, name := range names {
-		v, ph := values[name], []byte(placeholder.Format(ns, name))
-		for k := range 3 {
-			pats = append(pats, pattern{from: base64Core(v, k), to: base64Core(ph, k), tag: name})
+		ph := []byte(placeholder.Format(ns, name))
+		for _, v := range values[name] {
+			for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.URLEncoding} {
+				for k := range 3 {
+					pats = append(pats, pattern{from: base64Core(enc, v, k), to: base64Core(enc, ph, k), tag: name})
+				}
+			}
 		}
 	}
 	return pats
 }
 
-// base64Core returns the characters of the StdEncoding of k zero bytes and v
-// whose 6 bits all come from bytes of v. The bits of v run from bit 8k to
-// bit 8(k+len(v)); character j holds bits 6j to 6j+6.
-func base64Core(v []byte, k int) string {
-	enc := base64.StdEncoding.EncodeToString(append(make([]byte, k), v...))
+// valueSets returns the values to scrub, by name: the union of the values
+// that went into the request and the current ones (ruling R8). A name keeps
+// both when a refresh changed its value in between.
+func valueSets(used, current map[string][]byte) map[string][][]byte {
+	out := map[string][][]byte{}
+	for _, m := range []map[string][]byte{used, current} {
+		for name, v := range m {
+			if !slices.ContainsFunc(out[name], func(w []byte) bool { return bytes.Equal(v, w) }) {
+				out[name] = append(out[name], v)
+			}
+		}
+	}
+	return out
+}
+
+// base64Core returns the characters of the Base64 (in the alphabet of e) of
+// k zero bytes and v whose 6 bits all come from bytes of v. The bits of v
+// run from bit 8k to bit 8(k+len(v)); character j holds bits 6j to 6j+6.
+func base64Core(e *base64.Encoding, v []byte, k int) string {
+	enc := e.EncodeToString(append(make([]byte, k), v...))
 	from := (8*k + 5) / 6      // the first character that starts at or after bit 8k
 	to := 8 * (k + len(v)) / 6 // the end of the last character that ends at or before the last bit of v
 	if to <= from {

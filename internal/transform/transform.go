@@ -43,6 +43,9 @@ func notLoaded(name string, st secrets.State) *Refusal {
 type Result struct {
 	Swapped   []string // the names of the secrets put in, sorted, each once
 	Unscanned bool     // the body went on without a scan
+	// Used holds a copy of each value put in, by secret name, for the
+	// scrub of the answer (ruling R8). The caller wipes it after done runs.
+	Used map[string][]byte
 }
 
 // Transform changes one request and its response.
@@ -51,9 +54,11 @@ type Transform interface {
 	// Request changes r in place. On an error, r is unchanged; the error
 	// may be a *Refusal.
 	Request(r *http.Request, ns string, sec Secrets) (Result, error)
-	// Response changes resp in place. done gets the names of the secrets
-	// taken out, once, when the body reaches EOF or is closed.
-	Response(resp *http.Response, ns string, sec Secrets, done func(scrubbed []string)) error
+	// Response changes resp in place. It scrubs the values of used (the
+	// Used of the request) and of sec. done gets the names of the secrets
+	// taken out, exactly once: when the body reaches EOF or is closed, or
+	// before Response returns an error (it closes the body then).
+	Response(resp *http.Response, ns string, sec Secrets, used map[string][]byte, done func(scrubbed []string)) error
 }
 
 // New returns the transform that spec names. Only swap exists.

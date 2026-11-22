@@ -2,13 +2,18 @@ package transform
 
 import (
 	"bytes"
+	"compress/flate"
+	"compress/gzip"
+	"compress/zlib"
 	"encoding/base64"
 	"errors"
 	"io"
 	"maps"
 	"net/http"
+	"net/url"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +21,7 @@ import (
 	"time"
 
 	"github.com/abrose/sbx-broker/internal/config"
+	"github.com/abrose/sbx-broker/internal/secrets"
 )
 
 var (
@@ -106,10 +112,185 @@ func scrubT1(t *testing.T, resp *http.Response) *doneRec {
 		t.Fatal(err)
 	}
 	rec := &doneRec{}
-	if err := tr.Response(resp, "t1", t1(), rec.done); err != nil {
+	if err := tr.Response(resp, "t1", t1(), nil, rec.done); err != nil {
 		t.Fatal(err)
 	}
 	return rec
+}
+
+// forms are the encodings the broker sends a value in (ruling R7).
+var forms = []struct {
+	name string
+	enc  func(string) string
+}{
+	{"text", func(s string) string { return s }},
+	{"query escape", url.QueryEscape},
+	{"path escape", url.PathEscape},
+	{"json escape", func(s string) string { return jsonEscape([]byte(s)) }},
+	{"std base64", b64},
+	{"url base64", func(s string) string { return base64.URLEncoding.EncodeToString([]byte(s)) }},
+}
+
+func TestScrubEscapedForms(t *testing.T) {
+	for _, name := range []string{"pass", "api-key", "odd"} {
+		v, ph := testValues[name], "sbxb_t1_"+strings.ReplaceAll(name, "-", "_")
+		for _, f := range forms {
+			resp := newResp(strings.NewReader("x " + f.enc(v) + " y"))
+			scrubT1(t, resp)
+			got := readBody(t, resp)
+			if got != "x "+f.enc(ph)+" y" {
+				t.Errorf("%s, %s: not replaced by the same form of the placeholder", name, f.name)
+			}
+			for _, g := range forms {
+				if strings.Contains(got, g.enc(v)) {
+					t.Errorf("%s, %s: the %s form is left", name, f.name, g.name)
+				}
+			}
+		}
+	}
+}
+
+// TestScrubURLBase64 uses a value whose Base64 differs by alphabet at every
+// offset ("?>" gives / and +), so the Std patterns cannot catch it.
+func TestScrubURLBase64(t *testing.T) {
+	const q = "??>>~~??>>~~??"
+	const ph = "sbxb_t1_q"
+	used := map[string][]byte{"q": []byte(q)}
+	whole := base64.URLEncoding.EncodeToString([]byte(q))
+	cases := []struct{ name, body string }{
+		{"whole", "x " + whole + " y"},
+		{"offset 0", base64.RawURLEncoding.EncodeToString([]byte(q + "abc"))},
+		{"offset 1", base64.RawURLEncoding.EncodeToString([]byte("u" + q + "abc"))},
+		{"offset 2", base64.URLEncoding.EncodeToString([]byte("us" + q + "ab"))},
+	}
+	tr, _ := New(config.TransformSpec{Name: "swap"})
+	for _, c := range cases {
+		if !strings.ContainsAny(c.body, "-_") || !containsDecoded(c.body, q) {
+			t.Fatalf("%s: the input does not hold q in the URL alphabet", c.name)
+		}
+		resp := newResp(strings.NewReader(c.body))
+		if err := tr.Response(resp, "t1", t1(), used, nil); err != nil {
+			t.Fatal(err)
+		}
+		got := readBody(t, resp)
+		if containsDecoded(got, q) {
+			t.Errorf("%s: leaks q", c.name)
+		}
+		if c.name == "whole" && got != "x "+base64.URLEncoding.EncodeToString([]byte(ph))+" y" {
+			t.Errorf("whole: not replaced by the URL Base64 of the placeholder")
+		}
+	}
+}
+
+func containsDecoded(s, v string) bool {
+	if strings.Contains(s, v) {
+		return true
+	}
+	for _, d := range decodings(s) {
+		if bytes.Contains(d, []byte(v)) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestScrubUsesRequestValues(t *testing.T) {
+	store := t1()
+	tr, _ := New(config.TransformSpec{Name: "swap"})
+	r := get("http://api.test/x")
+	r.Header.Set("Authorization", "Bearer sbxb_t1_api_key")
+	res, err := tr.Request(r, "t1", store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Used) != 1 || string(res.Used["api-key"]) != apiKey {
+		t.Fatalf("Used has %d entries, api-key matches: %v", len(res.Used), string(res.Used["api-key"]) == apiKey)
+	}
+
+	store["api-key"] = fakeSecret{value: "new-api-key-22", state: secrets.StateOK} // a refresh
+	resp := newResp(strings.NewReader("old " + apiKey + " new new-api-key-22"))
+	rec := &doneRec{}
+	if err := tr.Response(resp, "t1", store, res.Used, rec.done); err != nil {
+		t.Fatal(err)
+	}
+	got := readBody(t, resp)
+	if got != "old sbxb_t1_api_key new sbxb_t1_api_key" {
+		t.Errorf("old or new value not scrubbed: %s", show(strings.ReplaceAll(got, "new-api-key-22", "<new api-key>")))
+	}
+}
+
+func TestSwapRefusalUsesNothing(t *testing.T) {
+	r := get("http://api.test/x")
+	r.Header.Set("A", "sbxb_t1_api_key")
+	r.Header.Set("B", "sbxb_t1_slow")
+	res, err := swapT1(t, r)
+	if err == nil || res.Used != nil {
+		t.Errorf("refusal: err %v, Used has %d entries", err, len(res.Used))
+	}
+}
+
+func gzipped(t *testing.T, s string) []byte {
+	var b bytes.Buffer
+	zw := gzip.NewWriter(&b)
+	if _, err := zw.Write([]byte(s)); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return b.Bytes()
+}
+
+func TestResponseDecodesGzip(t *testing.T) {
+	z := gzipped(t, "x "+apiKey+" y")
+	resp := newResp(bytes.NewReader(z))
+	resp.Header.Set("Content-Encoding", "gzip")
+	resp.Header.Set("Content-Length", strconv.Itoa(len(z)))
+	resp.ContentLength = int64(len(z))
+	scrubT1(t, resp)
+	check(t, "body", readBody(t, resp), "x sbxb_t1_api_key y")
+	if ce, cl := resp.Header.Get("Content-Encoding"), resp.Header.Get("Content-Length"); ce != "" || cl != "" || resp.ContentLength != -1 {
+		t.Errorf("Content-Encoding %q, Content-Length %q, ContentLength %d", ce, cl, resp.ContentLength)
+	}
+}
+
+func TestResponseDecodesDeflate(t *testing.T) {
+	var raw, wrapped bytes.Buffer
+	fw, _ := flate.NewWriter(&raw, flate.DefaultCompression)
+	zw := zlib.NewWriter(&wrapped)
+	for _, w := range []io.WriteCloser{fw, zw} {
+		_, _ = w.Write([]byte("x " + apiKey + " y"))
+		_ = w.Close()
+	}
+	for name, body := range map[string][]byte{"raw deflate": raw.Bytes(), "zlib deflate": wrapped.Bytes()} {
+		resp := newResp(bytes.NewReader(body))
+		resp.Header.Set("Content-Encoding", "Deflate")
+		scrubT1(t, resp)
+		check(t, name, readBody(t, resp), "x sbxb_t1_api_key y")
+		if resp.Header.Get("Content-Encoding") != "" {
+			t.Errorf("%s: Content-Encoding left", name)
+		}
+	}
+}
+
+func TestResponseRefusesBrotli(t *testing.T) {
+	for _, ce := range []string{"br", "zstd", "gzip, br"} {
+		body := &closeCounter{Reader: strings.NewReader("x")}
+		resp := newResp(body)
+		resp.Header.Set("Content-Encoding", ce)
+		tr, _ := New(config.TransformSpec{Name: "swap"})
+		rec := &doneRec{}
+		err := tr.Response(resp, "t1", t1(), nil, rec.done)
+		if err == nil || err.Error() != "unsupported content encoding "+ce {
+			t.Errorf("%s: error = %v", ce, err)
+		}
+		if body.closed != 1 {
+			t.Errorf("%s: body closed %d times, want 1", ce, body.closed)
+		}
+		if calls, _ := rec.get(); calls != 1 {
+			t.Errorf("%s: done ran %d times, want 1", ce, calls)
+		}
+	}
 }
 
 func readBody(t *testing.T, resp *http.Response) string {
@@ -417,7 +598,7 @@ func FuzzScrubSplit(f *testing.F) {
 	f.Add([]byte(b64(apiKey)), []byte{5, 1, 1})
 	f.Add([]byte(b64("user:"+pass)), []byte{9, 1})
 	f.Add([]byte("abcabcabcab bca"), []byte{1, 2, 3})
-	pats := append(responsePatterns("t1", t1().Values()),
+	pats := append(responsePatterns("t1", valueSets(nil, t1().Values())),
 		pattern{from: "ab", to: "X", tag: "s"}, pattern{from: "abc", to: "Y", tag: "s"},
 		pattern{from: "abcab", to: "Z", tag: "s"}, pattern{from: "bca", to: "W", tag: "s"})
 	m := newMatcher(pats)
