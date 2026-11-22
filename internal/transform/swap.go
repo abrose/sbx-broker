@@ -304,8 +304,8 @@ func (swap) Response(resp *http.Response, ns string, sec Secrets, used map[strin
 	if body == nil {
 		body = http.NoBody
 	}
-	empty := emptyBody(resp)
-	decoded := io.ReadCloser(body)
+	body, empty := peekEmpty(resp.Header, body)
+	decoded := body
 	if !empty {
 		var err error
 		if decoded, err = decodeBody(resp.Header, body); err != nil {
@@ -337,23 +337,40 @@ func (swap) Response(resp *http.Response, ns string, sec Secrets, used map[strin
 	return nil
 }
 
-// emptyBody reports an answer that has no body bytes by the rules of HTTP:
-// such a body is never decoded, and its headers (Content-Encoding and
-// Content-Length describe the resource) stay as they are.
-func emptyBody(resp *http.Response) bool {
-	return resp.Body == nil || resp.Body == http.NoBody || resp.ContentLength == 0 ||
-		resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotModified ||
-		(resp.Request != nil && resp.Request.Method == http.MethodHead)
+// peekEmpty reports a body with no bytes, decided by the bytes alone: status,
+// method and Content-Length do not count, so Response does not depend on the
+// caller's transport. An empty body is never decoded, and its headers
+// (Content-Encoding and Content-Length describe the resource) stay as they
+// are. It peeks only when a Content-Encoding asks for decoding: a plain
+// stream (such as SSE) must not wait here for its first byte. The returned
+// body gives the peeked byte too and closes the original.
+func peekEmpty(h http.Header, body io.ReadCloser) (io.ReadCloser, bool) {
+	if body == http.NoBody {
+		return body, true
+	}
+	if identity(contentEncoding(h)) {
+		return body, false
+	}
+	br := bufio.NewReader(body)
+	_, err := br.Peek(1)
+	return readCloser{br, body}, err == io.EOF
 }
+
+func contentEncoding(h http.Header) string {
+	return strings.TrimSpace(strings.Join(h.Values("Content-Encoding"), ", "))
+}
+
+func identity(ce string) bool { return ce == "" || strings.EqualFold(ce, "identity") }
 
 // decodeBody returns body, or a reader that decodes it for a gzip or
 // deflate Content-Encoding (ruling R7): compressed bytes would hide a value
 // from the scrub. Any other encoding is an error.
 func decodeBody(h http.Header, body io.ReadCloser) (io.ReadCloser, error) {
-	ce := strings.TrimSpace(strings.Join(h.Values("Content-Encoding"), ", "))
-	switch strings.ToLower(ce) {
-	case "", "identity":
+	ce := contentEncoding(h)
+	if identity(ce) {
 		return body, nil
+	}
+	switch strings.ToLower(ce) {
 	case "gzip":
 		return &decoder{src: body, open: func(r io.Reader) (io.Reader, error) { return gzip.NewReader(r) }}, nil
 	case "deflate":
@@ -383,11 +400,7 @@ type decoder struct {
 
 func (d *decoder) Read(p []byte) (int, error) {
 	if d.r == nil {
-		br := bufio.NewReader(d.src)
-		if _, err := br.Peek(1); err == io.EOF {
-			return 0, io.EOF // an empty body of unknown length: nothing to decode
-		}
-		r, err := d.open(br)
+		r, err := d.open(d.src) // not empty: Response peeked a byte
 		if err != nil {
 			return 0, err
 		}

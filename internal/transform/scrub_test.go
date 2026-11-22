@@ -263,6 +263,65 @@ func TestResponseEmptyCompressedBody(t *testing.T) {
 	}
 }
 
+// TestResponseEmptyLookingBodyWithBytes: status, method and length say
+// "empty", but the body holds bytes. They are decoded and scrubbed, or
+// refused; the decision comes from the bytes, not from the caller's transport.
+func TestResponseEmptyLookingBodyWithBytes(t *testing.T) {
+	cases := []struct {
+		name   string
+		method string
+		status int
+		length int64
+	}{
+		{"204", http.MethodGet, 204, -1},
+		{"HEAD", http.MethodHead, 200, -1},
+		{"ContentLength 0", http.MethodGet, 200, 0},
+	}
+	for _, c := range cases {
+		for _, ce := range []string{"gzip", "br"} {
+			name := c.name + ", " + ce
+			resp := &http.Response{
+				StatusCode: c.status, Header: http.Header{}, ContentLength: c.length,
+				Body:    io.NopCloser(bytes.NewReader(gzipped(t, "x "+apiKey+" y"))),
+				Request: httptest.NewRequest(c.method, "http://api.test/x", nil),
+			}
+			resp.Header.Set("Content-Encoding", ce)
+			tr, _ := New(config.TransformSpec{Name: "swap"})
+			err := tr.Response(resp, "t1", t1(), nil, nil)
+			if ce == "br" {
+				if err == nil || err.Error() != "unsupported content encoding br" {
+					t.Errorf("%s: error = %v", name, err)
+				}
+				continue
+			}
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			check(t, name, readBody(t, resp), "x sbxb_t1_api_key y")
+		}
+	}
+}
+
+// TestResponsePlainStreamDoesNotWait: with no Content-Encoding there is
+// nothing to decode, so Response must not wait for the first byte (an SSE
+// stream may send it much later).
+func TestResponsePlainStreamDoesNotWait(t *testing.T) {
+	block := make(chan struct{})
+	t.Cleanup(func() { close(block) })
+	resp := newResp(&stepReader{block: block})
+	tr, _ := New(config.TransformSpec{Name: "swap"})
+	errc := make(chan error, 1)
+	go func() { errc <- tr.Response(resp, "t1", t1(), nil, nil) }()
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Response waits for the first body byte")
+	}
+}
+
 // TestScrubURLBase64 uses a value whose Base64 differs by alphabet at every
 // offset ("?>" gives / and +), so the Std patterns cannot catch it.
 func TestScrubURLBase64(t *testing.T) {
