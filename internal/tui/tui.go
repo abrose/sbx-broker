@@ -12,6 +12,7 @@ package tui
 
 import (
 	"errors"
+	"os"
 	"time"
 
 	"charm.land/bubbles/v2/help"
@@ -144,10 +145,24 @@ func New(cl Client, opt Options) *Model {
 	return m
 }
 
-// Run shows the TUI in the alternate screen until the owner quits.
-func Run(cl Client, opt Options) error {
+// Run shows the TUI in the alternate screen until the owner quits. It clears
+// TEA_TRACE and UV_DEBUG first: either would log every frame to a file.
+func Run(cl Client, opt Options) error { return run(cl, opt) }
+
+// frameLogs are the variables that make Bubble Tea (TEA_TRACE) or its
+// renderer library (UV_DEBUG, not reached by bubbletea v2.1.2) append every
+// frame to a file: a shown value would reach the disk.
+var frameLogs = []string{"TEA_TRACE", "UV_DEBUG"}
+
+// run is Run with options for the program; tests run it without a terminal.
+func run(cl Client, opt Options, popts ...tea.ProgramOption) error {
+	for _, k := range frameLogs {
+		if err := os.Unsetenv(k); err != nil {
+			return err
+		}
+	}
 	m := New(cl, opt)
-	_, err := tea.NewProgram(m).Run()
+	_, err := tea.NewProgram(m, popts...).Run()
 	m.hide() // the model hid it on quit already; this covers a crash of the program
 	m.stopFollow()
 	return err

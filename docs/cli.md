@@ -115,7 +115,8 @@ in one step and sends `reload`.
 in state `ok`, and logs a `reveal` event. The TUI shows `value: <value>   (any key hides it)` and holds the value only
 while it shows it: it overwrites the value with zeros and drops it at the next key, at a view switch, 30 s after it
 appeared, and when the TUI quits. A status update does not hide it. The TUI runs in the terminal's alternate screen, so
-no value stays in the scrollback. No CLI command reveals a value.
+no value stays in the scrollback. The TUI clears `TEA_TRACE` and `UV_DEBUG` before it starts: with either set, the
+terminal library would append every frame, a shown value included, to a file. No CLI command reveals a value.
 
 ## `status`
 

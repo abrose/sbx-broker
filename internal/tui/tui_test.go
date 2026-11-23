@@ -1,8 +1,10 @@
 package tui
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -629,6 +631,30 @@ func TestSocketClientNoBroker(t *testing.T) {
 	t.Cleanup(func() { _ = os.RemoveAll(state) })
 	if _, err := NewSocketClient(state).Status(""); !errors.Is(err, admin.ErrNoBroker) {
 		t.Fatalf("err %v", err)
+	}
+}
+
+// TEA_TRACE makes Bubble Tea append every frame to the file it names, a
+// shown value included: Run clears it before the program starts.
+func TestRunClearsTeaTrace(t *testing.T) {
+	trace := filepath.Join(t.TempDir(), "trace.log")
+	t.Setenv("TEA_TRACE", trace)
+	t.Setenv("UV_DEBUG", filepath.Join(t.TempDir(), "uv.log"))
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	out := &bytes.Buffer{}
+	_ = run(&fakeClient{nss: fixture()}, Options{},
+		tea.WithContext(ctx), tea.WithInput(nil), tea.WithOutput(out), tea.WithWindowSize(100, 30), tea.WithoutSignalHandler())
+	if !strings.Contains(out.String(), "acme") {
+		t.Fatalf("the program rendered no frame: %q", out.String())
+	}
+	if data, err := os.ReadFile(trace); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Bubble Tea wrote a trace (%v):\n%s", err, data)
+	}
+	for _, k := range []string{"TEA_TRACE", "UV_DEBUG"} {
+		if v, ok := os.LookupEnv(k); ok {
+			t.Fatalf("%s is still set: %q", k, v)
+		}
 	}
 }
 
