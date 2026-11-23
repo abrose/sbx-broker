@@ -252,6 +252,16 @@ func TestStatusUsesMarker(t *testing.T) {
 	}
 }
 
+func TestStatusEscapesMarkerPath(t *testing.T) {
+	env, _ := broker(t)
+	dir := filepath.Join(t.TempDir(), "evil\x1b]0;x\x07")
+	writeFile(t, filepath.Join(dir, markerName), "t1\n", 0o644)
+	code, out, errOut := cliIn(dir, env, "status")
+	if code != 0 || !strings.HasPrefix(out, "marker: ") || strings.ContainsAny(out, "\x1b\x07") {
+		t.Fatalf("code %d, out %q, err %q", code, out, errOut)
+	}
+}
+
 func TestStatusArgBeatsMarker(t *testing.T) {
 	env, _ := broker(t)
 	code, out, errOut := cliIn(project(t, "t9"), env, "status", "t1")

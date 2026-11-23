@@ -34,6 +34,8 @@ commands:
   reload                     read the namespace files again now and retry
                              the files and listeners that failed
   log [-f] [<ns>]            the last 100 events; -f follows new ones
+  edit [<ns>]                open the namespace file in $VISUAL or $EDITOR
+  init <ns>                  mark this folder as a project of <ns> and create its namespace file
   help                       this text
 
 <ns> defaults to the name in a .sbx-broker file in this folder or above.
@@ -80,6 +82,10 @@ func (c *command) run(args []string) int {
 		return c.refresh(rest)
 	case cmd == "reload" && len(rest) == 0:
 		return c.reload()
+	case cmd == "edit" && len(rest) <= 1:
+		return c.edit(rest)
+	case cmd == "init" && len(rest) == 1:
+		return c.initProject(rest[0])
 	case cmd == "log":
 		if follow, ns, ok := logArgs(rest); ok {
 			return c.log(follow, ns)
@@ -88,9 +94,6 @@ func (c *command) run(args []string) int {
 	fmt.Fprint(c.stderr, usage)
 	return exitUsage
 }
-
-// runTerminal runs an editor on the terminal. Task 3 replaces this stub.
-func runTerminal(argv []string) error { return errors.New("not implemented") }
 
 func logArgs(args []string) (follow bool, ns string, ok bool) {
 	for _, a := range args {
@@ -142,7 +145,9 @@ func (c *command) fail(err error) int {
 	if errors.Is(err, admin.ErrNoBroker) {
 		fmt.Fprintln(c.stderr, noBroker)
 	} else {
-		fmt.Fprintf(c.stderr, "sbx-broker: %v\n", err)
+		// Escaped: an error may name a path of the workspace, which the
+		// sandbox can name.
+		fmt.Fprintf(c.stderr, "sbx-broker: %s\n", eventlog.Printable(err.Error()))
 	}
 	return exitFail
 }
@@ -241,7 +246,7 @@ func (c *command) status(args []string) int {
 		return exitOK
 	}
 	if marker != "" {
-		fmt.Fprintf(c.stdout, "marker: %s\n", marker)
+		fmt.Fprintf(c.stdout, "marker: %s\n", eventlog.Printable(marker))
 	}
 	printStatus(c.stdout, nss, cfg)
 	return exitOK
