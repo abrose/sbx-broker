@@ -120,6 +120,11 @@ func parseStartup(c io.Writer, code uint32, body []byte) (*startup, error) {
 	}
 	st := &startup{Params: map[string]string{}}
 	for k, v := range msg.Parameters {
+		// An empty name ends the list in PostgreSQL, and that NUL must be
+		// the last byte; pgproto3 accepts more, and Params goes upstream.
+		if k == "" {
+			return nil, fmt.Errorf("%w: empty parameter name", errProtocol)
+		}
 		if strings.HasPrefix(k, pqPrefix) {
 			st.PQ = append(st.PQ, k)
 			continue

@@ -323,3 +323,23 @@ func TestWriteFatal(t *testing.T) {
 		t.Fatalf("got %#v", msg)
 	}
 }
+
+// TestStartupRefusesEmptyParameterName: PostgreSQL ends the list at an empty
+// name and wants that NUL to be the last byte. pgproto3 accepts more, and
+// Params goes on to the upstream.
+func TestStartupRefusesEmptyParameterName(t *testing.T) {
+	for name, params := range map[string]string{
+		"empty pair":          "user\x00app\x00\x00\x00\x00",
+		"pairs after the end": "user\x00app\x00\x00junk\x00\x00",
+	} {
+		t.Run(name, func(t *testing.T) {
+			app, _, res := runStartup(t)
+			body := binary.BigEndian.AppendUint32(nil, pgproto3.ProtocolVersion30)
+			body = append(body, params...)
+			go app.Write(append(binary.BigEndian.AppendUint32(nil, uint32(len(body)+4)), body...))
+			if r := awaitStartup(t, res); !errors.Is(r.err, errProtocol) {
+				t.Fatalf("err=%v st=%+v", r.err, r.st)
+			}
+		})
+	}
+}
