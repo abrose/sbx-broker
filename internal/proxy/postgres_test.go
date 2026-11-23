@@ -659,6 +659,19 @@ func TestUpstreamConfigIgnoresPGEnv(t *testing.T) {
 	}
 }
 
+// TestUpstreamConfigFailsWithPGService documents why server.Run removes the
+// PG* variables: no connection string turns off pgconn's service lookup
+// (an empty service is still a service), so a PGSERVICE that does not resolve
+// fails every upstream login.
+func TestUpstreamConfigFailsWithPGService(t *testing.T) {
+	t.Setenv("PGSERVICE", "acme-missing")
+	t.Setenv("PGSERVICEFILE", "/nonexistent/pg_service.conf")
+	db := config.Database{Alias: "app", Upstream: "127.0.0.1:6543", DBName: "appdb", User: "app", Password: "db-pass"}
+	if _, err := upstreamConfig(db, "pw", nil); err == nil || !strings.Contains(err.Error(), "failed to read service") {
+		t.Fatalf("err = %v; if pgconn no longer reads the service here, server.Run need not drop PG*", err)
+	}
+}
+
 func TestPGLoginTimeoutCloses(t *testing.T) {
 	p, l := newPG(t, pgEntries("127.0.0.1:1"))
 	p.loginTimeout = 100 * time.Millisecond

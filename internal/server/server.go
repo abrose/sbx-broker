@@ -56,7 +56,13 @@ type Options struct {
 // Run serves until ctx is done, then stops the file watch, closes every
 // listener, the admin socket and the log, in that order, and releases the
 // single-instance lock last. It returns nil after a clean stop.
+//
+// First, Run removes every variable whose name starts with PG from the
+// process environment: pgconn reads PG* variables (PGSERVICE makes it read
+// a service file) in every upstream login, and none may apply there. The
+// fetch commands still get the environment Run started with.
 func Run(ctx context.Context, opt Options) (err error) {
+	fetchEnv := dropPGEnv()
 	if opt.FetchTimeout <= 0 {
 		opt.FetchTimeout = defaultFetchTimeout
 	}
@@ -83,6 +89,7 @@ func Run(ctx context.Context, opt Options) (err error) {
 		return err
 	}
 	b := newBroker(opt, log)
+	b.fetchEnv = fetchEnv
 	log.SetRedactor(b.red.redact)
 	if err := b.scan(scanFirst); err != nil {
 		_ = ln.Close()
@@ -98,6 +105,18 @@ func Run(ctx context.Context, opt Options) (err error) {
 	err = log.Close()
 	b.red.wipeAll()
 	return err
+}
+
+// dropPGEnv removes every PG* variable from the process environment and
+// returns the environment as it was before.
+func dropPGEnv() []string {
+	env := os.Environ()
+	for _, kv := range env {
+		if name, _, _ := strings.Cut(kv, "="); strings.HasPrefix(name, "PG") {
+			_ = os.Unsetenv(name)
+		}
+	}
+	return env
 }
 
 // prepareStateDir makes the state dir with mode 0700, or tightens the mode
@@ -163,6 +182,7 @@ func (st *nsState) status() admin.NamespaceStatus {
 
 type broker struct {
 	opt       Options
+	fetchEnv  []string // the environment Run started with, for the fetch commands
 	log       *eventlog.Log
 	red       *redactor
 	fetchCtx  context.Context // the parent of every namespace's fetches
@@ -448,7 +468,7 @@ func (b *broker) start(cfg *config.Namespace, verb string, held map[int]bool) *n
 	retire := func(name string, v []byte) { b.red.retireOne(cfg.Name, name, v) }
 	st := &nsState{
 		cfg:     cfg,
-		store:   secrets.NewStore(cfg.Name, cfg.Secrets, b.opt.FetchTimeout, b.log, retire),
+		store:   secrets.NewStore(cfg.Name, cfg.Secrets, b.opt.FetchTimeout, b.log, retire, b.fetchEnv),
 		ports:   map[int]bool{},
 		fetched: make(chan struct{}),
 	}

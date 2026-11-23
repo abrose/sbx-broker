@@ -1022,7 +1022,7 @@ func TestListenRetriesHeldPort(t *testing.T) {
 	t.Parallel()
 	cfg, state := dirs(t)
 	b := testBroker(t, cfg, state)
-	store := nsSecrets{Store: secrets.NewStore("t1", nil, time.Second, b.log, nil), ns: "t1", red: b.red}
+	store := nsSecrets{Store: secrets.NewStore("t1", nil, time.Second, b.log, nil, nil), ns: "t1", red: b.red}
 	hold := func() (int, net.Listener) {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
@@ -1107,6 +1107,34 @@ func TestServePostgresInfo(t *testing.T) {
 	if c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond); err == nil {
 		_ = c.Close()
 		t.Fatal("a postgres port listens")
+	}
+}
+
+// TestServeKeepsPGEnvForFetchesOnly: serve drops every PG* variable from its
+// own environment, so the upstream login of pgconn reads no service file,
+// while a fetch command still gets the environment serve started with. Not
+// parallel: t.Setenv.
+func TestServeKeepsPGEnvForFetchesOnly(t *testing.T) {
+	t.Setenv("PGSERVICE", "acme-missing")
+	t.Setenv("PGSERVICEFILE", "/nonexistent")
+	cfg, state := dirs(t)
+	up := newUpstream(t)
+	port := freePort(t)
+	writeNS(t, cfg, "t1", nsYAML(
+		[]string{secretYAML("api-key", "sh", "-c", `printf %s "svc=$PGSERVICE"`)},
+		[]string{routeYAML("api", port, up.URL)}))
+	start(t, cfg, state)
+	for _, k := range []string{"PGSERVICE", "PGSERVICEFILE"} {
+		if _, ok := os.LookupEnv(k); ok {
+			t.Errorf("%s is still set in the broker's environment", k)
+		}
+	}
+	waitOK(t, state, "t1", "api-key")
+	if status, _, err := get(port, "/", "sbxb_t1_api_key"); err != nil || status != http.StatusOK {
+		t.Fatalf("status %d err %v", status, err)
+	}
+	if got := up.lastKey(); got != "svc=acme-missing" {
+		t.Fatalf("the fetch got %q, want svc=acme-missing", got)
 	}
 }
 

@@ -63,6 +63,7 @@ type Store struct {
 	timeout time.Duration
 	log     *eventlog.Log
 	retire  func(name string, v []byte)
+	env     []string // of the fetch commands; nil: the broker's own
 	mu      sync.RWMutex
 	entries map[string]*entry
 	closed  bool // guarded by mu; set by Wipe
@@ -72,9 +73,10 @@ type Store struct {
 // value (it fails) or replaces it with another, retire, if not nil, gets a
 // copy of the old value first, while the store still serves it: an upstream
 // may have stored the value, so the answer scrub must still know it. retire
-// owns the copy and runs with no lock of the store held.
-func NewStore(ns string, defs []config.Secret, timeout time.Duration, log *eventlog.Log, retire func(name string, v []byte)) *Store {
-	s := &Store{ns: ns, timeout: timeout, log: log, retire: retire, entries: map[string]*entry{}}
+// owns the copy and runs with no lock of the store held. env is the
+// environment of the fetch commands; nil means the broker's own.
+func NewStore(ns string, defs []config.Secret, timeout time.Duration, log *eventlog.Log, retire func(name string, v []byte), env []string) *Store {
+	s := &Store{ns: ns, timeout: timeout, log: log, retire: retire, env: env, entries: map[string]*entry{}}
 	for _, d := range defs {
 		s.entries[d.Name] = &entry{def: d, state: Status{
 			Name: d.Name, Placeholder: placeholder.Format(ns, d.Name), State: StatePending,
@@ -205,6 +207,7 @@ func (s *Store) runCommand(ctx context.Context, argv []string) ([]byte, int, err
 	}()
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Stdin = nil // /dev/null, never the terminal
+	cmd.Env = s.env
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }

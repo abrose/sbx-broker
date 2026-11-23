@@ -25,7 +25,7 @@ func newRetiringStore(t *testing.T, timeout time.Duration, retire func(string, [
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = log.Close() })
-	return NewStore("t1", defs, timeout, log, retire), path
+	return NewStore("t1", defs, timeout, log, retire, nil), path
 }
 
 // A fetch that drops or changes an ok value hands a copy of the old value to
