@@ -133,6 +133,27 @@ func TestLogFollowsAgainAfterBrokerRestart(t *testing.T) {
 	}
 }
 
+// The broker does not deliver events in time order (concurrent Adds); a live
+// event older than the newest one is still shown.
+func TestLogKeepsOutOfOrderLiveEvents(t *testing.T) {
+	h := startLog(t, followStep{events: []eventlog.Event{ev(eventlog.KindSwap, "acme", 2), ev(eventlog.KindRefuse, "acme", 1)}})
+	h.logScreen("/e0001")
+	h.has("/e0002", "/e0001")
+}
+
+func TestLogShowsFollowError(t *testing.T) {
+	h := startLog(t, followStep{err: errors.New("bad request\x1b[2J")})
+	h.logScreen(`follow: bad request\x1b[2J`)
+	h.hasNot("\x1b[2J")
+	// A new follow that delivers events clears it.
+	h.fake.mu.Lock()
+	h.fake.script = []followStep{{events: []eventlog.Event{ev(eventlog.KindSwap, "acme", 1)}}}
+	h.fake.mu.Unlock()
+	h.send(h.lastTimer(pollEvery).msg)
+	h.logScreen("/e0001")
+	h.hasNot("follow:")
+}
+
 func TestLogOnlyOneFollowAndQuitCancels(t *testing.T) {
 	h := startLog(t)
 	for range 3 {

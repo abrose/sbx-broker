@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/abrose/sbx-broker/internal/admin"
 	"github.com/abrose/sbx-broker/internal/eventlog"
 )
 
@@ -31,6 +33,7 @@ type logFeed struct {
 	mu     sync.Mutex
 	events []eventlog.Event
 	ended  bool // Follow returned: the connection dropped or the context ended
+	err    error
 }
 
 func (f *logFeed) add(e eventlog.Event) {
@@ -39,17 +42,17 @@ func (f *logFeed) add(e eventlog.Event) {
 	f.mu.Unlock()
 }
 
-func (f *logFeed) end() {
+func (f *logFeed) end(err error) {
 	f.mu.Lock()
-	f.ended = true
+	f.ended, f.err = true, err
 	f.mu.Unlock()
 }
 
-func (f *logFeed) take() (events []eventlog.Event, ended bool) {
+func (f *logFeed) take() (events []eventlog.Event, ended bool, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	events, f.events = f.events, nil
-	return events, f.ended
+	return events, f.ended, f.err
 }
 
 // logView is the state of the Log view.
@@ -58,6 +61,8 @@ type logView struct {
 	nsFilter string           // "" shows all
 	kind     eventlog.Kind    // "" shows all
 	scroll   int              // lines above the newest; 0 follows the newest
+	mark     time.Time        // the newest time held when the current follow started
+	err      string           // why the last follow ended, printable; "" when none or expected
 
 	following bool // one follow runs at a time
 	feed      *logFeed
@@ -74,11 +79,19 @@ func (m *Model) followCmd() tea.Cmd {
 	ctx, cancel := context.WithCancel(context.Background())
 	feed := &logFeed{}
 	m.log.following, m.log.feed, m.log.ctx, m.log.cancel = true, feed, ctx, cancel
+	m.log.mark = time.Time{}
+	if n := len(m.log.events); n > 0 {
+		for _, e := range m.log.events {
+			if e.Time.After(m.log.mark) {
+				m.log.mark = e.Time
+			}
+		}
+	}
 	cl := m.cl
 	return func() tea.Msg {
 		go func() {
-			_ = cl.Follow(ctx, feed.add) // an error or a drop ends the feed; the next good status follows again
-			feed.end()
+			// A drop or an error ends the feed; the next good status follows again.
+			feed.end(cl.Follow(ctx, feed.add))
 		}()
 		return followMsg{}
 	}
@@ -98,11 +111,18 @@ func (m *Model) logTick() tea.Cmd {
 	if l.feed == nil {
 		return nil
 	}
-	events, ended := l.feed.take()
+	events, ended, err := l.feed.take()
 	for _, e := range events {
 		m.addEvent(e)
 	}
+	if len(events) > 0 {
+		l.err = "" // a follow that delivers is working
+	}
 	if ended {
+		// No broker and a cancel are expected; anything else the owner should see.
+		if err != nil && !errors.Is(err, admin.ErrNoBroker) && !errors.Is(err, context.Canceled) {
+			l.err = eventlog.Printable(err.Error())
+		}
 		l.cancel()
 		l.following, l.feed = false, nil
 		return nil
@@ -110,18 +130,20 @@ func (m *Model) logTick() tea.Cmd {
 	return m.after(logEvery, logTickMsg{})
 }
 
-// addEvent appends e unless the log has it already: a follow that starts
-// again replays the broker's last 100 events.
+// addEvent appends e unless it is a replay: a follow that starts again gets
+// the broker's last 100 events first. Only an event at or before the newest
+// time held when the follow started can be a replay, and only when an
+// identical (time, line) is held. The broker does not deliver live events in
+// time order, so a live event is never dropped for being old.
 func (m *Model) addEvent(e eventlog.Event) {
 	l := &m.log
-	line := eventlog.Line(e)
-	for i := len(l.events) - 1; i >= 0 && !l.events[i].Time.Before(e.Time); i-- {
-		if l.events[i].Time.Equal(e.Time) && eventlog.Line(l.events[i]) == line {
-			return
+	if !e.Time.After(l.mark) {
+		line := eventlog.Line(e)
+		for i := len(l.events) - 1; i >= 0; i-- {
+			if l.events[i].Time.Equal(e.Time) && eventlog.Line(l.events[i]) == line {
+				return
+			}
 		}
-	}
-	if n := len(l.events); n > 0 && e.Time.Before(l.events[n-1].Time) {
-		return // older than the newest: a replay
 	}
 	l.events = append(l.events, e)
 	if len(l.events) > logKeep {
@@ -210,6 +232,9 @@ func (m *Model) logBody() string {
 		return s
 	}
 	head := fmt.Sprintf("log · ns %s · kind %s", p(all(l.nsFilter)), all(string(l.kind)))
+	if l.err != "" {
+		head += "\nfollow: " + l.err
+	}
 	lines := m.logLines()
 	if len(lines) == 0 {
 		return head + "\n\nno events"
