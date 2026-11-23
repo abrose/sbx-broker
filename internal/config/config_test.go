@@ -126,7 +126,7 @@ func TestLoadRequireAuth(t *testing.T) {
 			t.Errorf("RequireAuth %q, want %q", got, want)
 		}
 	}
-	for _, v := range []string{"md5", "SCRAM-SHA-256", "none", `""`} {
+	for _, v := range []string{"md5", "SCRAM-SHA-256", "none", `""`, "", "~", "null"} {
 		ok, bad := load(pg("      require-auth: " + v + "\n"))
 		e := bad["acme.yaml"]
 		if len(ok) != 0 || e == nil || !strings.Contains(e.Error(), `"app"`) || !strings.Contains(e.Error(), "require-auth") {

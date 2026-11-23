@@ -108,8 +108,9 @@ type rawDatabase struct {
 	DBName   string `yaml:"dbname"`
 	User     string `yaml:"user"`
 	Password string `yaml:"password"`
-	// RequireAuth is a pointer so that an empty value is not "absent".
-	RequireAuth *string `yaml:"require-auth"`
+	// RequireAuth is a node so that a present-but-empty or null value is not
+	// "absent": only a zero Kind means the key was not written.
+	RequireAuth yaml.Node `yaml:"require-auth"`
 }
 
 // LoadDir reads every *.yaml in dir. ok holds the valid namespaces. bad maps a
@@ -358,11 +359,12 @@ func buildPostgres(rp *rawPostgres, secrets []Secret) (*Postgres, error) {
 			return nil, fmt.Errorf("postgres database %q: password names the undefined secret %q", alias, rd.Password)
 		}
 		requireAuth := ""
-		if rd.RequireAuth != nil {
-			if *rd.RequireAuth != RequireAuthSCRAM {
-				return nil, fmt.Errorf("postgres database %q: require-auth %q must be %q", alias, *rd.RequireAuth, RequireAuthSCRAM)
+		if rd.RequireAuth.Kind != 0 {
+			got := rd.RequireAuth.Value
+			if rd.RequireAuth.Kind != yaml.ScalarNode || rd.RequireAuth.Tag == "!!null" || got != RequireAuthSCRAM {
+				return nil, fmt.Errorf("postgres database %q: require-auth %q must be %q", alias, got, RequireAuthSCRAM)
 			}
-			requireAuth = *rd.RequireAuth
+			requireAuth = got
 		}
 		pg.Databases = append(pg.Databases, Database{
 			Alias: alias, Upstream: rd.Upstream, DBName: rd.DBName, User: rd.User, Password: rd.Password,
