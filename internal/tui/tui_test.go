@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -601,7 +602,7 @@ func realBroker(t *testing.T, file string) (string, Client) {
 		close(done)
 	}()
 	t.Cleanup(func() { cancel(); <-done })
-	cl := NewSocketClient(state)
+	cl := NewSocketClient(state, admin.Waits{})
 	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(50 * time.Millisecond) {
 		nss, err := cl.Status("")
 		if err == nil && len(nss) == 1 && len(nss[0].Secrets) > 0 && allOK(nss[0].Secrets) {
@@ -629,8 +630,91 @@ func TestSocketClientNoBroker(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(state) })
-	if _, err := NewSocketClient(state).Status(""); !errors.Is(err, admin.ErrNoBroker) {
+	if _, err := NewSocketClient(state, admin.Waits{}).Status(""); !errors.Is(err, admin.ErrNoBroker) {
 		t.Fatalf("err %v", err)
+	}
+}
+
+// silentBroker listens on the admin socket of a new state dir, accepts, and
+// never answers: a serve stopped with ctrl+z, or a broker that hangs. accepts
+// counts the connections so far.
+func silentBroker(t *testing.T) (state string, accepts func() int) {
+	t.Helper()
+	state, err := os.MkdirTemp("/tmp", "sbxb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("unix", admin.SocketPath(state))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var conns []net.Conn
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+		mu.Unlock()
+		_ = os.RemoveAll(state)
+	})
+	return state, func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(conns)
+	}
+}
+
+// within runs fn and fails the test when it does not return in d.
+func within(t *testing.T, d time.Duration, what string, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fn()
+	}()
+	select {
+	case <-done:
+	case <-time.After(d):
+		t.Fatalf("%s did not return in %v", what, d)
+	}
+}
+
+// A broker that accepts and never answers: the header says so, like no
+// broker, and the poll keeps asking (C6).
+func TestStatusPollShowsNoAnswerAndRetries(t *testing.T) {
+	state, accepts := silentBroker(t)
+	cl := NewSocketClient(state, admin.Waits{Answer: 100 * time.Millisecond})
+	var h *harness
+	within(t, 2*time.Second, "the first status", func() { h = newHarness(t, cl, Options{}) })
+	h.has("\nthe broker does not answer\n")
+	h.hasNot(NoBroker, "status: ")
+	poll := h.lastTimer(2 * time.Second)
+	within(t, 2*time.Second, "the next poll", func() { h.send(poll.msg) })
+	if n := accepts(); n != 2 {
+		t.Fatalf("%d status requests, want 2", n)
+	}
+	h.has("\nthe broker does not answer\n")
+	polls := 0
+	for _, tm := range h.timers {
+		if tm.d == 2*time.Second {
+			polls++
+		}
+	}
+	if h.quit || polls != 2 {
+		t.Fatalf("quit %v, %d polls armed, want 2", h.quit, polls)
 	}
 }
 

@@ -408,7 +408,7 @@ func (m *Model) gotEdited(msg editedMsg) tea.Cmd {
 
 func (m *Model) gotReloaded(msg reloadedMsg) {
 	if errors.Is(msg.err, admin.ErrNoBroker) {
-		m.gone = true
+		m.down = NoBroker
 		return
 	}
 	m.note = "reload: " + p(msg.err.Error())

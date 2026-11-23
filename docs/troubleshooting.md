@@ -60,6 +60,13 @@ Do not approve the request by hand.
   (`command -v op`).
 - **`install` refuses: `a broker already runs on <socket>, not as the launchd agent`:** a `serve` runs, for example in
   a terminal tab. Stop it, then run `sbx-broker install` again.
+- **`the broker does not answer`** (a command, the TUI's header, or the TUI's start): a broker accepted the connection
+  on `admin.sock` but sent no answer within 5 s (a `refresh` waits `SBX_BROKER_FETCH_TIMEOUT` plus 5 s). Most often a
+  `serve` in a terminal was stopped with `ctrl+z`: run `fg` in that terminal, or stop it. Else the broker hangs: stop it
+  (`kill <pid>`; for the launchd agent `sbx-broker uninstall`), then start it again. The running TUI keeps asking every
+  2 s and shows the broker again when it answers.
+- **`install` refuses: `a broker holds <socket> but does not answer`:** the same, at install: that broker still holds
+  the state directory's lock, so the agent's broker could not start. Stop it, then run `sbx-broker install` again.
 - **A port did not open:** another process used it. Free it, then run `sbx-broker reload`.
 - **A placeholder reached the upstream unchanged:** the body was not scanned. Check the log for `unscanned` and the
   [request limits](how-it-works.md#request-limits).

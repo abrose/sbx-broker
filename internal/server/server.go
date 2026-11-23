@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	defaultFetchTimeout = 60 * time.Second
+	defaultFetchTimeout = admin.DefaultFetchTimeout // an admin client's refresh waits for it
 	// A poll acts on a change that two polls in a row saw: with 1 s, a
 	// change takes effect within 2 s.
 	defaultPollInterval = time.Second

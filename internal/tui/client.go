@@ -25,13 +25,19 @@ type Client interface {
 }
 
 // NewSocketClient returns a Client that dials the admin socket in stateDir
-// once per call.
-func NewSocketClient(stateDir string) Client { return socketClient{stateDir: stateDir} }
+// once per call and waits w for an answer: a call to a broker that accepts
+// and never answers returns admin.ErrNoAnswer.
+func NewSocketClient(stateDir string, w admin.Waits) Client {
+	return socketClient{stateDir: stateDir, w: w}
+}
 
-type socketClient struct{ stateDir string }
+type socketClient struct {
+	stateDir string
+	w        admin.Waits
+}
 
 func (c socketClient) do(req admin.Request, each func(admin.Response) error) error {
-	cl, err := admin.Dial(c.stateDir)
+	cl, err := admin.DialWaits(c.stateDir, c.w)
 	if err != nil {
 		return err
 	}
@@ -77,7 +83,7 @@ func (c socketClient) Reveal(ns, secret string) ([]byte, error) {
 }
 
 func (c socketClient) Follow(ctx context.Context, each func(eventlog.Event)) error {
-	cl, err := admin.Dial(c.stateDir)
+	cl, err := admin.DialWaits(c.stateDir, c.w)
 	if err != nil {
 		return err
 	}

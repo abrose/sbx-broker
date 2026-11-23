@@ -52,6 +52,11 @@ no broker runs (start it with: sbx-broker serve, or as a service with: sbx-broke
 
 When the broker goes away later, the header shows the same line and the TUI keeps asking.
 
+A broker can accept on the socket and never answer, for example a `serve` stopped with `ctrl+z`. Every request but
+`log -f` waits at most 5 s for its answer (`refresh`: `SBX_BROKER_FETCH_TIMEOUT` plus 5 s), then gives up with
+`the broker does not answer`. A command prints `sbx-broker: the broker does not answer` and exits 1; the TUI's start does
+the same; a running TUI shows `the broker does not answer` in its header and keeps asking.
+
 | View | Columns or fields |
 |---|---|
 | Namespaces | `NAME`, `LISTENERS`, `SECRETS` (`<ok> of <n> ok`), `ERROR` |
@@ -175,6 +180,7 @@ the broker answers on /Users/<you>/.local/state/sbx-broker/admin.sock
 ```
 
 With no answer in 75 s it prints `installed <plist>, but the broker does not answer; see <state>/serve.log` and exits 1.
+Each probe in that wait gives up at the end of the 75 s, so a broker that accepts and never answers does not stretch it.
 
 `install` again replaces the agent: it stops the running agent and starts it with the new plist. Run it again after you
 move the binary or change `PATH`. It refuses while a broker that is not the agent answers on the socket, for example a
@@ -182,6 +188,13 @@ move the binary or change `PATH`. It refuses while a broker that is not the agen
 
 ```text
 sbx-broker: a broker already runs on <state>/admin.sock, not as the launchd agent: stop it, then run sbx-broker install again
+```
+
+It also refuses, agent or not, while a broker accepts on the socket but gives no answer in 5 s, since that broker still
+holds the lock:
+
+```text
+sbx-broker: a broker holds <state>/admin.sock but does not answer: stop it, then run sbx-broker install again
 ```
 
 `uninstall` stops the agent and removes the plist. It prints `removed <plist>`, or `not installed` when there was

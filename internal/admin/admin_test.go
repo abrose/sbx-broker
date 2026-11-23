@@ -397,3 +397,86 @@ func TestDialNoBroker(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+// silent listens on the socket of a new state dir, accepts, and never
+// answers: a serve stopped with ctrl+z, or a broker that hangs.
+func silent(t *testing.T) string {
+	t.Helper()
+	state := shortDir(t)
+	ln, err := net.Listen("unix", SocketPath(state))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var conns []net.Conn
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+	return state
+}
+
+// Every request but a follow gives up on a broker that accepts and never
+// answers: a refresh after the fetch timeout plus the answer wait, the
+// others after the answer wait.
+func TestClientTimesOutOnSilentBroker(t *testing.T) {
+	state := silent(t)
+	w := Waits{Answer: 100 * time.Millisecond, Fetch: 300 * time.Millisecond}
+	ask := func(req Request) (time.Duration, error) {
+		t.Helper()
+		c, err := DialWaits(state, w)
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		done := make(chan error, 1)
+		go func() { done <- c.Do(req, func(Response) error { return nil }) }()
+		select {
+		case err := <-done:
+			return time.Since(start), err
+		case <-time.After(2 * time.Second):
+			_ = c.Close()
+			t.Fatalf("%+v: Do did not return in 2 s", req)
+			return 0, nil
+		}
+	}
+	for _, req := range []Request{{Op: "status"}, {Op: "reload"}, {Op: "reveal", Namespace: "t1", Secret: "api-key"}, {Op: "log"}} {
+		took, err := ask(req)
+		if !errors.Is(err, ErrNoAnswer) || err.Error() != "the broker does not answer" || took < w.Answer || took > time.Second {
+			t.Fatalf("%+v: %v after %v", req, err, took)
+		}
+	}
+	if took, err := ask(Request{Op: "refresh", Namespace: "t1"}); !errors.Is(err, ErrNoAnswer) || took < w.Fetch+w.Answer {
+		t.Fatalf("refresh: %v after %v, want ErrNoAnswer after %v", err, took, w.Fetch+w.Answer)
+	}
+
+	// A follow is a stream: it waits for events as long as the caller wants.
+	c, err := DialWaits(state, w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- c.Do(Request{Op: "log", Follow: true}, func(Response) error { return nil }) }()
+	select {
+	case err := <-done:
+		t.Fatalf("the follow ended: %v", err)
+	case <-time.After(2 * (w.Fetch + w.Answer)):
+	}
+	_ = c.Close()
+	<-done
+}

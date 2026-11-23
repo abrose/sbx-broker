@@ -65,8 +65,8 @@ func (m *Model) header() string {
 	}
 	h := strings.Join(parts, " ")
 	switch {
-	case m.gone:
-		h += "\n" + NoBroker
+	case m.down != "":
+		h += "\n" + m.down
 	case m.statusErr != "":
 		h += "\nstatus: " + m.statusErr
 	}

@@ -67,7 +67,7 @@ func main() {
 // run runs one command and returns the exit code.
 func run(args []string, getenv func(string) string, stdout, stderr io.Writer) int {
 	c := &command{getenv: getenv, getwd: os.Getwd, home: os.UserHomeDir, runEditor: runTerminal, tui: tui.Run,
-		launchctl: launchd.Real, agentWait: agentWait, stdout: stdout, stderr: stderr}
+		launchctl: launchd.Real, agentWait: agentWait, answerWait: admin.AnswerWait, stdout: stdout, stderr: stderr}
 	return c.run(args)
 }
 
@@ -134,12 +134,14 @@ type command struct {
 	tui            func(cl tui.Client, opt tui.Options) error
 	launchctl      launchd.Launchctl
 	agentWait      time.Duration // how long install waits for the agent's broker to answer
+	answerWait     time.Duration // how long a request waits for an answer (admin.Waits.Answer)
 	stdout, stderr io.Writer
 }
 
 // startTUI runs the TUI on the namespace of the project marker, if any. It
 // asks the broker for its status first: with no broker it prints the
-// no-broker line and exits 1, and it never starts one.
+// no-broker line, with a broker that does not answer it prints that, and it
+// exits 1; it never starts a broker.
 func (c *command) startTUI() int {
 	cfg, err := c.configDir()
 	if err != nil {
@@ -153,7 +155,11 @@ func (c *command) startTUI() int {
 	if err != nil && !errors.Is(err, errNoMarker) {
 		return c.fail(err)
 	}
-	cl := tui.NewSocketClient(state)
+	fetch, err := c.fetchTimeout() // a refresh waits for it
+	if err != nil {
+		return c.fail(err)
+	}
+	cl := tui.NewSocketClient(state, admin.Waits{Answer: c.answerWait, Fetch: fetch})
 	if _, err := cl.Status(""); err != nil {
 		return c.fail(err)
 	}
@@ -269,13 +275,20 @@ func (c *command) serve() int {
 	return exitOK
 }
 
-// do sends one request to the broker.
+// do sends one request to the broker. It waits c.answerWait for the answer,
+// a refresh SBX_BROKER_FETCH_TIMEOUT more, a follow as long as it runs.
 func (c *command) do(req admin.Request, each func(admin.Response) error) error {
 	state, err := c.stateDir()
 	if err != nil {
 		return err
 	}
-	cl, err := admin.Dial(state)
+	w := admin.Waits{Answer: c.answerWait}
+	if req.Op == "refresh" {
+		if w.Fetch, err = c.fetchTimeout(); err != nil {
+			return err
+		}
+	}
+	cl, err := admin.DialWaits(state, w)
 	if err != nil {
 		return err
 	}
@@ -306,7 +319,7 @@ func (c *command) status(args []string) int {
 	nss, err := c.namespaces(admin.Request{Op: "status", Namespace: ns})
 	if err != nil {
 		code := c.fail(err)
-		if ns != "" && !errors.Is(err, admin.ErrNoBroker) {
+		if ns != "" && !errors.Is(err, admin.ErrNoBroker) && !errors.Is(err, admin.ErrNoAnswer) {
 			if _, serr := os.Stat(filepath.Join(cfg, ns+".yaml")); errors.Is(serr, fs.ErrNotExist) {
 				fmt.Fprintf(c.stderr, "create it with: sbx-broker init %s\n", ns)
 			}
@@ -374,23 +387,34 @@ const (
 // install runs serve as the launchd agent and waits for its broker to
 // answer. It refuses while a broker that is not the agent answers (C8): two
 // brokers would fight over the lock, and KeepAlive would restart the loser.
+// It also refuses while a broker accepts on the socket but does not answer:
+// that broker still holds the lock. The wait for the agent's broker ends
+// after c.agentWait, however long one probe could wait.
 func (c *command) install() int {
 	a, err := c.agent()
 	if err != nil {
 		return c.fail(err)
 	}
 	state := filepath.Dir(a.LogPath)
-	if answers(state) && !launchd.Loaded(c.launchctl, a.Label) {
+	switch err := probe(state, c.answerWait); {
+	case errors.Is(err, admin.ErrNoAnswer):
+		return c.fail(fmt.Errorf("a broker holds %s but does not answer: stop it, then run sbx-broker install again",
+			admin.SocketPath(state)))
+	case err == nil && !launchd.Loaded(c.launchctl, a.Label):
 		return c.fail(fmt.Errorf("a broker already runs on %s, not as the launchd agent: stop it, then run sbx-broker install again",
 			admin.SocketPath(state)))
 	}
 	if err := launchd.Install(a, c.launchctl); err != nil {
 		return c.fail(err)
 	}
-	for deadline := time.Now().Add(c.agentWait); !answers(state); time.Sleep(agentPoll) {
-		if time.Now().After(deadline) {
+	for deadline := time.Now().Add(c.agentWait); ; time.Sleep(agentPoll) {
+		left := time.Until(deadline)
+		if left <= 0 {
 			fmt.Fprintf(c.stderr, "installed %s, but the broker does not answer; see %s\n", a.PlistPath, a.LogPath)
 			return exitFail
+		}
+		if probe(state, min(c.answerWait, left)) == nil {
+			break
 		}
 	}
 	fmt.Fprintf(c.stdout, "installed %s\nthe broker answers on %s\n", a.PlistPath, admin.SocketPath(state))
@@ -463,13 +487,15 @@ func (c *command) agent() (launchd.Agent, error) {
 	return launchd.Agent{Label: agentLabel, PlistPath: plist, Program: exe, Env: env, LogPath: filepath.Join(state, "serve.log")}, nil
 }
 
-// answers reports whether a broker answers status on the socket in state.
-func answers(state string) bool {
-	cl, err := admin.Dial(state)
+// probe asks the broker on the socket in state for its status and waits at
+// most wait for the answer. nil: it answers; admin.ErrNoBroker: none runs;
+// admin.ErrNoAnswer: one accepts but does not answer.
+func probe(state string, wait time.Duration) error {
+	cl, err := admin.DialWaits(state, admin.Waits{Answer: wait})
 	if err != nil {
-		return false
+		return err
 	}
-	return cl.Do(admin.Request{Op: "status"}, func(admin.Response) error { return nil }) == nil
+	return cl.Do(admin.Request{Op: "status"}, func(admin.Response) error { return nil })
 }
 
 // log shows the events of one namespace (the argument or the marker's) or,

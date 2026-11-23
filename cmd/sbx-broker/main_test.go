@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -65,24 +66,26 @@ func cliTUI(dir string, env map[string]string, run func(tui.Client, tui.Options)
 func testCommand(dir string, env map[string]string) (c *command, out, errOut *bytes.Buffer) {
 	out, errOut = &bytes.Buffer{}, &bytes.Buffer{}
 	c = &command{
-		getenv:    func(k string) string { return env[k] },
-		getwd:     func() (string, error) { return dir, nil },
-		home:      func() (string, error) { return fakeHome, nil },
-		runEditor: func(string, []string) error { return errors.New("no editor in tests") },
-		tui:       func(tui.Client, tui.Options) error { return errors.New("no TUI in tests") },
-		launchctl: func(...string) ([]byte, error) { return nil, errors.New("no launchctl in tests") },
-		agentWait: time.Second,
-		stdout:    out,
-		stderr:    errOut,
+		getenv:     func(k string) string { return env[k] },
+		getwd:      func() (string, error) { return dir, nil },
+		home:       func() (string, error) { return fakeHome, nil },
+		runEditor:  func(string, []string) error { return errors.New("no editor in tests") },
+		tui:        func(tui.Client, tui.Options) error { return errors.New("no TUI in tests") },
+		launchctl:  func(...string) ([]byte, error) { return nil, errors.New("no launchctl in tests") },
+		agentWait:  time.Second,
+		answerWait: time.Second,
+		stdout:     out,
+		stderr:     errOut,
 	}
 	return c, out, errOut
 }
 
 // fakeLaunchctl knows one agent: print succeeds while it is loaded,
-// bootstrap loads it and bootout unloads it.
+// bootstrap loads it (and calls onBootstrap, when set) and bootout unloads it.
 type fakeLaunchctl struct {
-	loaded bool
-	calls  []string
+	loaded      bool
+	calls       []string
+	onBootstrap func()
 }
 
 func (f *fakeLaunchctl) run(args ...string) ([]byte, error) {
@@ -94,6 +97,9 @@ func (f *fakeLaunchctl) run(args ...string) ([]byte, error) {
 		}
 	case "bootstrap":
 		f.loaded = true
+		if f.onBootstrap != nil {
+			f.onBootstrap()
+		}
 	case "bootout":
 		f.loaded = false
 	}
@@ -126,6 +132,92 @@ func TestInstallRefusesTerminalBroker(t *testing.T) {
 	}
 	if !slices.Equal(f.calls, []string{"print"}) {
 		t.Fatalf("calls %q", f.calls)
+	}
+}
+
+// silent listens on the admin socket in state, accepts, and never answers:
+// a serve stopped with ctrl+z, or a broker that hangs.
+func silent(t *testing.T, state string) {
+	t.Helper()
+	ln, err := net.Listen("unix", admin.SocketPath(state))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var conns []net.Conn
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+}
+
+// within runs fn and fails the test when it does not return in d.
+func within(t *testing.T, d time.Duration, what string, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fn()
+	}()
+	select {
+	case <-done:
+	case <-time.After(d):
+		t.Fatalf("%s did not return in %v", what, d)
+	}
+}
+
+// A broker that accepts and never answers still holds the lock: install
+// refuses, as it does for a terminal broker (C8), and writes no plist.
+func TestInstallRefusesSilentBroker(t *testing.T) {
+	state := stateDir(t)
+	silent(t, state)
+	f := &fakeLaunchctl{}
+	var code int
+	var out, errOut, plist string
+	within(t, 3*time.Second, "install", func() {
+		code, out, errOut, plist = agentCLI(t, noProject, t.TempDir(), map[string]string{"SBX_BROKER_STATE_DIR": state}, f, "install")
+	})
+	want := "sbx-broker: a broker holds " + filepath.Join(state, "admin.sock") + " but does not answer: stop it, then run sbx-broker install again\n"
+	if code != 1 || out != "" || errOut != want {
+		t.Fatalf("code %d, out %q, err %q", code, out, errOut)
+	}
+	if _, err := os.Stat(plist); !errors.Is(err, os.ErrNotExist) || len(f.calls) != 0 {
+		t.Fatalf("plist %v, calls %q", err, f.calls)
+	}
+}
+
+// The agent's broker accepts but never answers: install gives up after its
+// wait, however long one probe could wait.
+func TestInstallWaitIsBounded(t *testing.T) {
+	state := stateDir(t)
+	home := t.TempDir()
+	f := &fakeLaunchctl{onBootstrap: func() { silent(t, state) }}
+	c, out, errOut := testCommand(noProject, map[string]string{"SBX_BROKER_STATE_DIR": state})
+	c.home = func() (string, error) { return home, nil }
+	c.launchctl = f.run
+	c.agentWait = 300 * time.Millisecond
+	c.answerWait = 5 * time.Second
+	var code int
+	within(t, 3*time.Second, "install", func() { code = c.run([]string{"install"}) })
+	plist := filepath.Join(home, "Library", "LaunchAgents", "io.github.abrose.sbx-broker.plist")
+	want := "installed " + plist + ", but the broker does not answer; see " + filepath.Join(state, "serve.log") + "\n"
+	if code != 1 || out.String() != "" || errOut.String() != want {
+		t.Fatalf("code %d, out %q, err %q", code, out, errOut)
 	}
 }
 
@@ -358,6 +450,23 @@ func TestTUINoBrokerOneLine(t *testing.T) {
 	}
 	if noBroker != "no broker runs (start it with: sbx-broker serve, or as a service with: sbx-broker install)" {
 		t.Fatalf("noBroker %q", noBroker)
+	}
+}
+
+// A broker that accepts and never answers: the TUI does not start on a blank
+// terminal; it prints one line and exits 1.
+func TestTUIStartSilentBroker(t *testing.T) {
+	state := stateDir(t)
+	silent(t, state)
+	ran := false
+	var code int
+	var out, errOut string
+	within(t, 3*time.Second, "the TUI start", func() {
+		code, out, errOut = cliTUI(noProject, map[string]string{"SBX_BROKER_STATE_DIR": state},
+			func(tui.Client, tui.Options) error { ran = true; return nil })
+	})
+	if code != 1 || out != "" || errOut != "sbx-broker: the broker does not answer\n" || ran {
+		t.Fatalf("code %d, out %q, err %q, ran %v", code, out, errOut, ran)
 	}
 }
 

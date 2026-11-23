@@ -104,7 +104,7 @@ type Model struct {
 	view      view
 	nss       []admin.NamespaceStatus
 	loaded    bool   // a status came
-	gone      bool   // the last status found no broker
+	down      string // why the last status got no answer: NoBroker or ErrNoAnswer's text; "": it answered
 	statusErr string // the last status error other than no broker, printable
 	note      string // the outcome of the last action, printable; cleared at the next key
 
@@ -208,7 +208,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !msg.once {
 			cmds = append(cmds, m.after(pollEvery, pollMsg{}))
 		}
-		if !m.gone && m.statusErr == "" {
+		if m.down == "" && m.statusErr == "" {
 			cmds = append(cmds, m.followCmd()) // the broker answers: follow its log if no follow runs
 		}
 		return m, tea.Batch(cmds...)
@@ -369,10 +369,12 @@ func (m *Model) statusCmd() tea.Cmd {
 }
 
 func (m *Model) gotStatus(msg statusMsg) {
-	m.gone, m.statusErr = false, ""
+	m.down, m.statusErr = "", ""
 	switch {
 	case errors.Is(msg.err, admin.ErrNoBroker):
-		m.gone = true // keep the last status on screen; the next poll tries again
+		m.down = NoBroker // keep the last status on screen; the next poll tries again
+	case errors.Is(msg.err, admin.ErrNoAnswer):
+		m.down = admin.ErrNoAnswer.Error() // the same: the broker may be stopped (ctrl+z) or hang
 	case msg.err != nil:
 		m.statusErr = eventlog.Printable(msg.err.Error())
 	default:
@@ -417,7 +419,7 @@ func (m *Model) gotRefresh(msg refreshMsg) {
 	delete(m.fetching, msg.key)
 	switch {
 	case errors.Is(msg.err, admin.ErrNoBroker):
-		m.gone = true
+		m.down = NoBroker
 	case msg.err != nil:
 		m.note = "refresh " + eventlog.Printable(msg.key) + ": " + eventlog.Printable(msg.err.Error())
 	default:

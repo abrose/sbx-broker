@@ -44,6 +44,9 @@ var (
 	ErrRunning = errors.New("a broker already runs")
 	// ErrNoBroker is the error of Dial when no broker answers on the socket.
 	ErrNoBroker = errors.New("no broker runs")
+	// ErrNoAnswer is the error of Do when a broker accepted the connection
+	// but did not answer in time.
+	ErrNoAnswer = errors.New("the broker does not answer")
 )
 
 // Request is one request line. Ops: "status", "refresh", "reload", "log",
@@ -415,11 +418,56 @@ func eventKey(e eventlog.Event) string {
 }
 
 // Client is one connection to the admin socket, for one request.
-type Client struct{ conn net.Conn }
+type Client struct {
+	conn net.Conn
+	w    Waits
+}
 
-// Dial connects to the socket in stateDir. It returns ErrNoBroker when no
-// socket file exists or none answers on it.
-func Dial(stateDir string) (*Client, error) {
+// Waits are how long a Client waits for the whole answer of a request before
+// it gives up with ErrNoAnswer: a broker can accept and never answer (a serve
+// stopped with ctrl+z, or one that hangs). A follow waits as long as the
+// caller wants. A zero field takes its default.
+type Waits struct {
+	// Answer is the wait of every request but a refresh and a follow;
+	// default AnswerWait.
+	Answer time.Duration
+	// Fetch is the fetch timeout of the broker (SBX_BROKER_FETCH_TIMEOUT); a
+	// refresh waits Fetch plus Answer. Default DefaultFetchTimeout.
+	Fetch time.Duration
+}
+
+const (
+	// AnswerWait is the default Waits.Answer.
+	AnswerWait = 5 * time.Second
+	// DefaultFetchTimeout is the fetch timeout of a broker when
+	// SBX_BROKER_FETCH_TIMEOUT is not set.
+	DefaultFetchTimeout = 60 * time.Second
+)
+
+// of returns the wait of req; ok is false for a follow, which has none.
+func (w Waits) of(req Request) (wait time.Duration, ok bool) {
+	answer, fetch := w.Answer, w.Fetch
+	if answer <= 0 {
+		answer = AnswerWait
+	}
+	if fetch <= 0 {
+		fetch = DefaultFetchTimeout
+	}
+	switch {
+	case req.Op == "log" && req.Follow:
+		return 0, false
+	case req.Op == "refresh":
+		return fetch + answer, true
+	}
+	return answer, true
+}
+
+// Dial connects to the socket in stateDir with the default Waits. It returns
+// ErrNoBroker when no socket file exists or none answers on it.
+func Dial(stateDir string) (*Client, error) { return DialWaits(stateDir, Waits{}) }
+
+// DialWaits is Dial with the waits w.
+func DialWaits(stateDir string, w Waits) (*Client, error) {
 	c, err := net.Dial("unix", SocketPath(stateDir))
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ECONNREFUSED) {
@@ -427,20 +475,26 @@ func Dial(stateDir string) (*Client, error) {
 		}
 		return nil, err
 	}
-	return &Client{conn: c}, nil
+	return &Client{conn: c, w: w}, nil
 }
 
 // Do sends req and calls each for every response, until the broker closes
 // the connection or each returns an error. A response with ok false ends Do
-// with its error. Do closes the connection.
+// with its error. With no whole answer within the wait of req (see Waits) it
+// returns ErrNoAnswer. Do closes the connection.
 func (c *Client) Do(req Request, each func(Response) error) error {
 	defer c.conn.Close()
+	if wait, ok := c.w.of(req); ok {
+		if err := c.conn.SetDeadline(time.Now().Add(wait)); err != nil {
+			return err
+		}
+	}
 	line, err := json.Marshal(req)
 	if err != nil {
 		return err
 	}
 	if _, err := c.conn.Write(append(line, '\n')); err != nil {
-		return err
+		return noAnswer(err)
 	}
 	dec := json.NewDecoder(c.conn)
 	for {
@@ -449,7 +503,7 @@ func (c *Client) Do(req Request, each func(Response) error) error {
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
-			return err
+			return noAnswer(err)
 		}
 		if !resp.OK {
 			if resp.Error == "" {
@@ -461,6 +515,14 @@ func (c *Client) Do(req Request, each func(Response) error) error {
 			return err
 		}
 	}
+}
+
+// noAnswer turns the error of a passed deadline into ErrNoAnswer.
+func noAnswer(err error) error {
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return ErrNoAnswer
+	}
+	return err
 }
 
 // Close closes the connection without a request.
