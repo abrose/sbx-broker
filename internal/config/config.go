@@ -147,6 +147,42 @@ func LoadDir(dir string) (ok map[string]*Namespace, bad map[string]error, err er
 	return ok, bad, nil
 }
 
+// Check validates data as the namespace file `file` (<ns>.yaml) of dir, with
+// the rules of LoadDir, and checks its ports against every other valid file of
+// dir. It does not read `file` from disk, so it works on bytes not yet written.
+func Check(dir, file string, data []byte) error {
+	name := strings.TrimSuffix(file, ".yaml")
+	if file == name || !placeholder.ValidNamespace(name) {
+		return fmt.Errorf("namespace name %q is invalid (want 1-16 characters of a-z, 0-9)", name)
+	}
+	ns, err := parse(filepath.Join(dir, file), name, data)
+	if err != nil {
+		return err
+	}
+	if err := checkOwnerOnly(dir, true); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	var others []string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".yaml") && e.Name() != file {
+			others = append(others, e.Name())
+		}
+	}
+	sort.Strings(others)
+	portOwner := map[int]string{}
+	for _, o := range others {
+		other, err := loadFile(filepath.Join(dir, o), strings.TrimSuffix(o, ".yaml"))
+		if err == nil {
+			_ = claimPorts(other, portOwner) // a clash among the others is not ours
+		}
+	}
+	return claimPorts(ns, portOwner)
+}
+
 // claimPorts records the ports of ns, or fails on one held by another namespace.
 func claimPorts(ns *Namespace, owner map[int]string) error {
 	for _, p := range ns.Ports() {
@@ -159,6 +195,10 @@ func claimPorts(ns *Namespace, owner map[int]string) error {
 	}
 	return nil
 }
+
+// CheckOwnerOnlyFile applies to a namespace file the rule LoadDir applies: a
+// regular file, not a symlink, owned by the user, not writable by others.
+func CheckOwnerOnlyFile(path string) error { return checkOwnerOnly(path, false) }
 
 func checkOwnerOnly(path string, wantDir bool) error {
 	fi, err := os.Lstat(path)
@@ -198,6 +238,11 @@ func loadFile(path, name string) (*Namespace, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parse(path, name, data)
+}
+
+// parse decodes and validates the bytes of one namespace file.
+func parse(path, name string, data []byte) (*Namespace, error) {
 	var raw rawFile
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)

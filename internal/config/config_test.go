@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -52,6 +53,51 @@ func writeFile(t *testing.T, dir, file, content string) {
 	}
 	if err := os.Chmod(p, 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+const routeOn = `
+http:
+  - name: api
+    listen: %d
+    upstream: https://api.example.com
+`
+
+func TestCheckRefusesPortOfOtherNamespace(t *testing.T) {
+	dir := newDir(t)
+	writeFile(t, dir, "b.yaml", fmt.Sprintf(routeOn, 29700))
+	err := Check(dir, "a.yaml", []byte(fmt.Sprintf(routeOn, 29700)))
+	if err == nil || err.Error() != "port 29700 is used by namespace b" {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestCheckAcceptsOwnFileOnDisk(t *testing.T) {
+	dir := newDir(t)
+	writeFile(t, dir, "a.yaml", fmt.Sprintf(routeOn, 29700))
+	if err := Check(dir, "a.yaml", []byte(fmt.Sprintf(routeOn, 29700))); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCheckIgnoresInvalidOtherFiles(t *testing.T) {
+	dir := newDir(t)
+	writeFile(t, dir, "b.yaml", fmt.Sprintf(routeOn, 29700)+"bogus: 1\n")
+	if err := Check(dir, "a.yaml", []byte(fmt.Sprintf(routeOn, 29700))); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCheckAppliesLoadRules(t *testing.T) {
+	dir := newDir(t)
+	if err := Check(dir, "a.yaml", []byte("secrets:\n  k:\n    command: []\n")); err == nil {
+		t.Fatal("empty command accepted")
+	}
+	if err := Check(dir, "A.yaml", []byte("")); err == nil {
+		t.Fatal("invalid namespace name accepted")
+	}
+	if err := Check(dir, "a.yaml", []byte("nope: 1\n")); err == nil {
+		t.Fatal("unknown key accepted")
 	}
 }
 
