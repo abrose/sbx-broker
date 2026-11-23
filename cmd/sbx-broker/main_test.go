@@ -215,6 +215,19 @@ func TestFormatLogLine(t *testing.T) {
 	}
 }
 
+func TestLogLineShowsPostgresUser(t *testing.T) {
+	at := time.Date(2026, 11, 22, 13, 2, 11, 0, time.Local)
+	got := logLine(eventlog.Event{Time: at, Kind: eventlog.KindSwap, Namespace: "t1", Route: "app", User: "app",
+		Secrets: []string{"db-pass"}, Message: "login"})
+	if want := "13:02:11 swap t1 app@app - - - db-pass login"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	got = logLine(eventlog.Event{Time: at, Kind: eventlog.KindSwap, Namespace: "t1", Route: "app", Method: "GET", Path: "/"})
+	if want := "13:02:11 swap t1 app GET / - - -"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
 // The path, the method and the message come from a sandboxed app: no
 // control sequence reaches the owner's terminal and no line is forged.
 func TestLogLineEscapesControls(t *testing.T) {

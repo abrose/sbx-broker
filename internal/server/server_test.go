@@ -23,6 +23,7 @@ import (
 	"github.com/abrose/sbx-broker/internal/config"
 	"github.com/abrose/sbx-broker/internal/eventlog"
 	"github.com/abrose/sbx-broker/internal/secrets"
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
 const (
@@ -1092,21 +1093,118 @@ func TestScanWaitsForStableFile(t *testing.T) {
 	}
 }
 
-func TestServePostgresInfo(t *testing.T) {
+// pgNS is a namespace with one Postgres entry whose upstream is a port.
+func pgNS(pgPort, upPort int) string {
+	return nsYAML([]string{secretYAML("db-pass", "printf", "%s", apiKey)}, nil) +
+		fmt.Sprintf("postgres:\n  listen: %d\n  databases:\n    app:\n      upstream: 127.0.0.1:%d\n      dbname: appdb\n      user: app\n      password: db-pass\n", pgPort, upPort)
+}
+
+// pgStart dials the Postgres listener, sends a startup and reads the
+// password request.
+func pgStart(t *testing.T, port int, database string) (*pgproto3.Frontend, net.Conn) {
+	t.Helper()
+	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+	fe := pgproto3.NewFrontend(c, c)
+	fe.Send(&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber,
+		Parameters: map[string]string{"user": "app", "database": database}})
+	if err := fe.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := fe.Receive()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := msg.(*pgproto3.AuthenticationCleartextPassword); !ok {
+		t.Fatalf("got %T, want a cleartext password request", msg)
+	}
+	return fe, c
+}
+
+func TestServeOpensPostgresListener(t *testing.T) {
 	t.Parallel()
 	cfg, state := dirs(t)
 	port := freePort(t)
-	writeNS(t, cfg, "t1", nsYAML([]string{secretYAML("db-pass", "printf", "%s", apiKey)}, nil)+
-		fmt.Sprintf("postgres:\n  listen: %d\n  databases:\n    app:\n      upstream: 127.0.0.1:5432\n      dbname: app\n      user: app\n      password: db-pass\n", port))
+	writeNS(t, cfg, "t1", pgNS(port, freePort(t)))
 	start(t, cfg, state)
-	if !hasEvent(readLog(t, state), func(e eventlog.Event) bool {
-		return e.Kind == eventlog.KindInfo && e.Namespace == "t1" && e.Message == "postgres listeners come in a later version"
-	}) {
-		t.Fatal("no postgres info event")
+	n, ok := status(t, state, "t1")
+	if !ok || !slices.Equal(n.Listeners, []string{fmt.Sprintf("127.0.0.1:%d", port)}) || n.Error != "" {
+		t.Fatalf("status %+v", n)
 	}
-	if c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond); err == nil {
-		_ = c.Close()
-		t.Fatal("a postgres port listens")
+	fe, _ := pgStart(t, port, "nope")
+	fe.Send(&pgproto3.PasswordMessage{Password: "x"})
+	if err := fe.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := fe.Receive()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e, ok := msg.(*pgproto3.ErrorResponse); !ok || e.Code != "3D000" {
+		t.Fatalf("got %#v, want 3D000", msg)
+	}
+	if hasEvent(readLog(t, state), func(e eventlog.Event) bool {
+		return e.Kind == eventlog.KindInfo && strings.Contains(strings.ToLower(e.Message), "postgres")
+	}) {
+		t.Fatal("an info event names Postgres")
+	}
+}
+
+// Review focus 5: the owner edits the file while an app holds a connection.
+func TestServeReloadRestartsPostgres(t *testing.T) {
+	t.Parallel()
+	cfg, state := dirs(t)
+	port, up := freePort(t), freePort(t)
+	writeNS(t, cfg, "t1", pgNS(port, up))
+	start(t, cfg, state)
+	fe, c := pgStart(t, port, "appdb")
+	writeNS(t, cfg, "t1", pgNS(port, up)+"# edited\n")
+	_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, err := fe.Receive()
+	if err == nil {
+		t.Fatal("the connection got a message")
+	}
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatal("the connection was not closed within 3 s")
+	}
+	waitFor(t, 5*time.Second, "the same port again", func() bool {
+		n, ok := status(t, state, "t1")
+		if !ok || !slices.Equal(n.Listeners, []string{fmt.Sprintf("127.0.0.1:%d", port)}) || n.Error != "" {
+			return false
+		}
+		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), time.Second)
+		if err == nil {
+			_ = c.Close()
+		}
+		return err == nil
+	})
+}
+
+// A Postgres port that another process holds: the namespace keeps its HTTP
+// listeners and shows the error.
+func TestServePostgresPortClash(t *testing.T) {
+	t.Parallel()
+	cfg, state := dirs(t)
+	taken, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = taken.Close() })
+	busy := taken.Addr().(*net.TCPAddr).Port
+	httpPort := freePort(t)
+	up := newUpstream(t)
+	writeNS(t, cfg, "t1", pgNS(busy, freePort(t))+"http:\n"+routeYAML("api", httpPort, up.URL))
+	start(t, cfg, state)
+	n, ok := status(t, state, "t1")
+	if !ok || !slices.Equal(n.Listeners, []string{fmt.Sprintf("127.0.0.1:%d", httpPort)}) {
+		t.Fatalf("status %+v", n)
+	}
+	if !strings.Contains(n.Error, "postgres") {
+		t.Fatalf("error %q", n.Error)
 	}
 }
 

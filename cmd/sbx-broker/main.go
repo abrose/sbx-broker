@@ -392,7 +392,11 @@ func logLine(e eventlog.Event) string {
 	if e.Status != 0 {
 		status = strconv.Itoa(e.Status)
 	}
-	fields := []string{e.Time.Local().Format(time.TimeOnly), string(e.Kind), e.Namespace, e.Route, e.Method, e.Path,
+	route := e.Route
+	if e.User != "" {
+		route = e.User + "@" + e.Route // a Postgres event: the app's user and the alias
+	}
+	fields := []string{e.Time.Local().Format(time.TimeOnly), string(e.Kind), e.Namespace, route, e.Method, e.Path,
 		status, strings.Join(e.Secrets, ","), e.Message}
 	last := len(fields) - 1
 	for i, f := range fields {

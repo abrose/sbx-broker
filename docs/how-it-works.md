@@ -70,13 +70,56 @@ double encoding, or any other transformation an upstream makes before it echoes 
   from the file. An upstream may have stored such a value. The broker keeps these retired values until the namespace
   file is removed or the broker stops.
 
-## Postgres (coming)
+## Postgres
 
-A later version adds a Postgres proxy per namespace. The app's URL will name the broker's Postgres listener, the
-database entry and the placeholder as the password, with no TLS on the hop from the sandbox:
+A namespace with a `postgres` section has one more listener on `127.0.0.1:<postgres.listen>`. The app's URL names it,
+the alias of a database entry and the placeholder as the password, with no TLS on the hop from the sandbox:
 
 ```text
-postgres://<user>:sbxb_acme_app_db_password@host.docker.internal:29620/<db>?sslmode=disable
+postgres://<user>:sbxb_acme_app_db_password@host.docker.internal:29620/<alias>?sslmode=disable
 ```
+
+### The login
+
+```mermaid
+sequenceDiagram
+    participant App as App in the sandbox
+    participant Broker as sbx-broker on the Mac
+    participant DB as Postgres server
+    App->>Broker: startup (user, database = alias)
+    Broker-->>App: ask for a cleartext password
+    App->>Broker: password = placeholder
+    Note over Broker: checks, in order: no other namespace's placeholder,<br/>alias, user, exact placeholder of the entry, secret loaded
+    Broker->>DB: TLS, then login with the real password
+    DB-->>Broker: login ok, parameters, PID and cancel key
+    Broker-->>App: login ok, the same parameters, PID and cancel key
+    App->>DB: queries (bytes pass through the broker)
+    DB-->>App: results (bytes pass through the broker)
+```
+
+- The broker answers an `SSLRequest` or a `GSSENCRequest` of the app with `N`, so the app stays on the plain hop.
+- It speaks protocol 3.0 on both sides. A newer client is negotiated down to 3.0.
+- A refused login ends with a `FATAL` error and no connection to the real server. The codes are in
+  [troubleshooting.md](troubleshooting.md#postgres-logins).
+- The startup parameters of the app (such as `application_name` and `options`) go to the real server.
+
+### The hand-off
+
+After the real server accepts the login, the broker sends the app the login confirmation, the server's parameters, the
+server's process ID and cancel key, and the ready signal. From then on the two connections copy bytes both ways until
+one side closes; the broker then closes the other. A byte the app sends right after its password (a pipelined query)
+reaches the real server.
+
+### No scan after the login
+
+The broker swaps and scrubs only the login. It does not read the queries or the results afterwards, so a value that an
+answer echoes is not scrubbed (see [security.md](security.md#postgres)). The real server's error at login is scrubbed:
+each value of the namespace in it is replaced by its placeholder.
+
+### Cancel requests
+
+A client cancels a query on a new connection that sends the process ID and cancel key it got at login. The broker
+matches them against the open sessions of its listener. On a match, it sends the same request to that session's
+real server over plain TCP. With no match, it sends nothing. Either way it closes the connection with no answer.
 
 The full design is in [specs/2026-11-22-sbx-broker-design.md](specs/2026-11-22-sbx-broker-design.md).

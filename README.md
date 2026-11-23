@@ -25,7 +25,7 @@ Many real calls put the credential somewhere else, and there the built-in swap d
 | A header in Base64 (`Authorization: Basic <base64 of user:secret>`, a Base64 API key) | no: it swaps only the literal text | yes |
 | A form or JSON body, such as the `client_secret` of an OAuth token request | no: it swaps only in headers | yes |
 | The path or the query of the URL | no: it swaps only in headers | yes |
-| A Postgres login | no: the login is not HTTP | coming |
+| A Postgres login | no: the login is not HTTP | yes: the placeholder is the password, the broker logs in with the real one |
 | An answer that echoes the secret, such as an IdP error page that quotes the rejected client secret | no: the real value reaches the sandbox | yes: the broker scrubs it |
 
 The last row matters even for header tokens. The sbx proxy does not scrub answers. An upstream that echoes a request
@@ -76,7 +76,7 @@ sequenceDiagram
 |---|---|
 | HTTP routes, swap and scrub | ready |
 | The CLI (`serve`, `status`, `refresh`, `reload`, `log`) | ready |
-| A Postgres proxy (placeholder as the database password) | coming |
+| A Postgres proxy (placeholder as the database password) | ready |
 | A TUI to manage secrets and watch the log, and a launchd agent | coming |
 
 It is made and tested for macOS.
@@ -147,10 +147,12 @@ capabilities:
     config:
       runtime:
         allow:
-          - hosts: ["localhost:29610", "localhost:29611"]   # the routes of namespace acme
+          - hosts: ["localhost:29610", "localhost:29611", "localhost:29620"]   # the routes and the Postgres port of namespace acme
 ```
 
-Open only the ports of the project's own namespace. When you change a port in the namespace file, change the kit too.
+The Postgres listener of a namespace has its own port (`postgres.listen`, here 29620), and it needs a rule like a route
+does. Open only the ports of the project's own namespace. When you change a port in the namespace file, change the kit
+too.
 
 ### 4. Give the app placeholders
 
@@ -166,13 +168,22 @@ API_KEY=sbxb_acme_api_key
 
 A route forwards every method and path as they come, so only the base URL changes.
 
+For a database, the placeholder is the password, and the database name is the alias of the entry in the `postgres`
+section of the namespace file. The sandbox reaches the broker's Postgres port with no TLS, because the hop stays on
+your Mac:
+
+```sh
+DATABASE_URL=postgres://<user>:sbxb_acme_db_password@host.docker.internal:29620/<alias>?sslmode=disable
+```
+
 ### 5. Watch it work
 
 ```sh
 sbx-broker log -f
 ```
 
-Each call of the app shows as a `swap` event with the names of the secrets it used.
+Each call of the app shows as a `swap` event with the names of the secrets it used. A Postgres login shows as a `swap`
+event with `<user>@<alias>` in the route column, and `close` when its connection ends.
 
 ## Day to day
 
@@ -198,6 +209,7 @@ All commands are in [docs/cli.md](docs/cli.md).
 | 403 with `"placeholder of another namespace"` | The app used a placeholder of another project. |
 | 502 with a JSON body | The service is unreachable, or it answered in a way the broker cannot scrub. |
 | 403 with `Approval required for ...` | The sbx proxy blocked the port: the project kit has no rule for it. |
+| A Postgres `FATAL` with a code such as `28P01` or `57P03` | The broker refused the login. The codes are in [docs/troubleshooting.md](docs/troubleshooting.md#postgres-logins). |
 
 Details and fixes are in [docs/troubleshooting.md](docs/troubleshooting.md).
 

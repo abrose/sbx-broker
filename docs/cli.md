@@ -80,12 +80,15 @@ The broker loads the template as an empty namespace. Fill it with `sbx-broker ed
 
 | Kind | Meaning |
 |---|---|
-| `swap` | a request went to the upstream; names the secrets it used |
-| `refuse` | the broker refused a request with a 503 or a 403 |
+| `swap` | a request went to the upstream, or a Postgres login reached the real server; names the secrets it used |
+| `refuse` | the broker refused a request with a 503 or a 403, or refused a Postgres login |
 | `violation` | a placeholder of another namespace; comes with the `refuse` event of the 403 |
 | `unscanned` | a body the broker did not scan (see [how-it-works.md](how-it-works.md#request-limits)) |
-| `upstream` | the upstream failed or answered in a way the broker refuses (a 502) |
+| `upstream` | the upstream failed or answered in a way the broker refuses (a 502, or a failed Postgres login) |
 | `fetch` | a fetch command ended, with the secret's new state |
 | `reload` | a namespace was loaded, reloaded or stopped |
 | `error` | a request that could not be scanned (a 400), a namespace file with an error, a listener that did not start |
-| `info` | other notes, for example that Postgres listeners come in a later version |
+| `close` | a Postgres session ended, with its duration |
+| `info` | other notes |
+
+A Postgres event shows `<user>@<alias>` in the route column, for example `app@app`.

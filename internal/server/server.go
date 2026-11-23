@@ -39,8 +39,14 @@ const (
 	logMaxBytes         = 10 << 20
 	stateDirMode        = 0o700
 	redacted            = "[redacted]"
-	postgresInfo        = "postgres listeners come in a later version"
 )
+
+// listener is what a namespace runs: an HTTP route or the Postgres listener.
+type listener interface {
+	Start() error
+	Addr() string
+	Close() error
+}
 
 // Options configures Run. A zero FetchTimeout means 60 s, a zero
 // PollInterval 1 s.
@@ -155,7 +161,7 @@ type stamp struct {
 type nsState struct {
 	cfg       *config.Namespace
 	store     *secrets.Store
-	listeners []*proxy.HTTP
+	listeners []listener
 	ports     map[int]bool       // the ports of the listeners
 	errs      []string           // listeners that did not start
 	ctx       context.Context    // of its fetches; cancelled when it stops
@@ -234,7 +240,7 @@ func (b *broker) watch(ctx context.Context) {
 func (b *broker) shutdown(srv *admin.Server) {
 	b.fetchStop()
 	b.mu.Lock()
-	var all []*proxy.HTTP
+	var all []listener
 	for _, st := range b.nss {
 		all = append(all, st.listeners...)
 	}
@@ -253,7 +259,7 @@ func (b *broker) shutdown(srv *admin.Server) {
 	}
 }
 
-func closeAll(hs []*proxy.HTTP) {
+func closeAll(hs []listener) {
 	var wg sync.WaitGroup
 	for _, h := range hs {
 		wg.Go(func() { _ = h.Close() }) // the error is an event of the listener
@@ -477,7 +483,10 @@ func (b *broker) start(cfg *config.Namespace, verb string, held map[int]bool) *n
 	b.log.Add(eventlog.Event{Kind: eventlog.KindReload, Namespace: cfg.Name, Message: verb})
 	sec := nsSecrets{Store: st.store, ns: cfg.Name, red: b.red}
 	for _, r := range cfg.HTTP {
-		h, err := b.listen(cfg.Name, r, sec, held[r.Listen])
+		h, err := b.route(cfg.Name, r, sec)
+		if err == nil {
+			err = b.bind(h, held[r.Listen])
+		}
 		if err != nil {
 			st.errs = append(st.errs, err.Error())
 			b.log.Add(eventlog.Event{Kind: eventlog.KindError, Namespace: cfg.Name, Route: r.Name, Message: err.Error()})
@@ -486,8 +495,15 @@ func (b *broker) start(cfg *config.Namespace, verb string, held map[int]bool) *n
 		st.listeners = append(st.listeners, h)
 		st.ports[r.Listen] = true
 	}
-	if cfg.Postgres != nil {
-		b.log.Add(eventlog.Event{Kind: eventlog.KindInfo, Namespace: cfg.Name, Message: postgresInfo})
+	if pg := cfg.Postgres; pg != nil {
+		l := proxy.NewPostgres(cfg.Name, *pg, sec, b.log)
+		if err := b.bind(l, held[pg.Listen]); err != nil {
+			st.errs = append(st.errs, err.Error())
+			b.log.Add(eventlog.Event{Kind: eventlog.KindError, Namespace: cfg.Name, Message: err.Error()})
+		} else {
+			st.listeners = append(st.listeners, l)
+			st.ports[pg.Listen] = true
+		}
 	}
 	b.fetches.Add(1)
 	go func() {
@@ -498,11 +514,8 @@ func (b *broker) start(cfg *config.Namespace, verb string, held map[int]bool) *n
 	return st
 }
 
-// listen starts the listener of route r. With held set, the old state of
-// the namespace held the port: the old socket is closed, but a fetch
-// command forked a moment before holds a copy until its exec, so a bind
-// that finds the port in use is tried again for up to rebindWait.
-func (b *broker) listen(ns string, r config.Route, sec transform.Secrets, held bool) (*proxy.HTTP, error) {
+// route builds the listener of route r.
+func (b *broker) route(ns string, r config.Route, sec transform.Secrets) (*proxy.HTTP, error) {
 	trs := make([]transform.Transform, 0, len(r.Transforms))
 	for _, spec := range r.Transforms {
 		tr, err := transform.New(spec)
@@ -511,15 +524,34 @@ func (b *broker) listen(ns string, r config.Route, sec transform.Secrets, held b
 		}
 		trs = append(trs, tr)
 	}
-	h := proxy.NewHTTP(ns, r, sec, trs, b.log)
+	return proxy.NewHTTP(ns, r, sec, trs, b.log), nil
+}
+
+// listen builds and binds the listener of route r (see bind).
+func (b *broker) listen(ns string, r config.Route, sec transform.Secrets, held bool) (*proxy.HTTP, error) {
+	h, err := b.route(ns, r, sec)
+	if err != nil {
+		return nil, err
+	}
+	if err := b.bind(h, held); err != nil {
+		return nil, err
+	}
+	return h, nil
+}
+
+// bind starts l. With held set, the old state of the namespace held the
+// port: the old socket is closed, but a fetch command forked a moment before
+// holds a copy until its exec, so a bind that finds the port in use is tried
+// again for up to rebindWait.
+func (b *broker) bind(l listener, held bool) error {
 	deadline := time.Now().Add(rebindWait)
 	for {
-		err := h.Start()
+		err := l.Start()
 		if err == nil {
-			return h, nil
+			return nil
 		}
 		if !held || !errors.Is(err, syscall.EADDRINUSE) || time.Now().After(deadline) {
-			return nil, err // it names the route
+			return err // it names the route
 		}
 		time.Sleep(rebindStep)
 	}

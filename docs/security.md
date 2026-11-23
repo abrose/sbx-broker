@@ -35,10 +35,34 @@ placeholders and states, never values), and `edit` opens that file, which your e
 - It does not choose the rights of a credential. It passes on the credentials you configure; choosing a role with the
   right rights is your job.
 - It has no secret store of its own. The values stay where you keep them.
-- It does not speak TLS to the sandbox. The hop from the sandbox to the broker is plain HTTP on the Mac.
+- It does not speak TLS to the sandbox. The hop from the sandbox to the broker is plain HTTP, or a plain Postgres
+  connection, on the Mac.
 - It does not start tunnels or port-forwards, and it does not watch upstreams. It only forwards to their ports.
 - It does not support WebSockets or other protocol upgrades.
 - It is made and tested for macOS, where it runs as your user. It does not run in Docker.
+
+## Postgres
+
+- The hop from the sandbox to the broker's Postgres port is plain, like the HTTP hop: the app uses `sslmode=disable`,
+  and the broker answers an `SSLRequest` with `N`.
+- The broker swaps and scrubs only the login. After the hand-off it copies bytes and does not read them, so a query
+  can use the database as the credential allows, and a result that holds a value is not scrubbed.
+- The app gets the real server's cancel key. It works only through the broker, which matches it against its open
+  sessions and forwards it. The broker sends that cancel request to the real server over plain TCP, because the request
+  carries only a process ID and a key, no value of a namespace.
+- `pgconn` takes the password as a Go string, so a copy of the real password stays in the broker's memory until the
+  garbage collector frees it. It cannot be wiped, and nothing writes it anywhere. The broker wipes the byte copy it
+  gets from the store as soon as the login call returns.
+- The broker's TLS to the real server encrypts but checks no certificate. A fake server on the path could therefore ask
+  for a cleartext password and read it. `require-auth: scram-sha-256` closes this: the login ends before the password
+  leaves the broker, unless the server speaks SCRAM.
+- Channel binding stays `prefer`. An active attacker between the Mac and the real server can still relay a SCRAM
+  login. This is a known limit: the broker's goal is to keep values out of the sandbox, not to secure the Mac's path
+  to the database.
+- `serve` removes every `PG*` variable from its own process when it starts, so no `PGSERVICE`, `PGSSLMODE` or
+  `PGOPTIONS` of the terminal changes an upstream login. The fetch commands keep the environment `serve` started
+  with.
+- Replication connections are refused.
 
 ## Known gaps
 
