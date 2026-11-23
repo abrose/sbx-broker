@@ -78,11 +78,14 @@ var formSpecs = [...]struct {
 
 // form is an open add or edit form.
 type form struct {
-	id     int
-	kind   formKind
-	edit   bool // the name or alias, the first field, is fixed (C3)
-	ns     string
-	base   []byte // the namespace file as the form opened it: a save refuses when the file changed since
+	id   int
+	kind formKind
+	edit bool // the name or alias, the first field, is fixed (C3)
+	ns   string
+	// base is the namespace file as the form read it when it opened; nil
+	// until the read arrives, and after a failed read. A save needs it, and
+	// refuses when the file changed since.
+	base   []byte
 	inputs []textinput.Model
 	focus  int
 	err    string // why the last save failed, printable
@@ -98,9 +101,10 @@ type removal struct {
 // Messages of the forms and the editor key.
 type (
 	formBaseMsg struct {
-		id   int
-		data []byte
-		err  error
+		id     int
+		data   []byte   // the file as nsfile read it
+		values []string // the fields from the file; nil: none
+		err    error    // the read failed, or the entry of an edit is gone
 	}
 	savedMsg struct {
 		id        int    // the form or removal that saved
@@ -114,13 +118,18 @@ type (
 
 func (m *Model) nsPath(ns string) string { return filepath.Join(m.opt.ConfigDir, ns+".yaml") }
 
-// openForm opens a form for ns with values in its fields, and reads the
-// namespace file the save will start from.
-func (m *Model) openForm(kind formKind, ns string, edit bool, values ...string) tea.Cmd {
+// openForm opens a form for ns: an edit form of the entry name, or with name
+// "" an add form. It reads the namespace file once, the bytes the save will
+// start from, and fills the fields from that read: an edit form all of them,
+// a database add form postgres listen. The broker's status does not fill
+// them: it lags a save in the editor by about 2 s, and a save from it would
+// put the old values back.
+func (m *Model) openForm(kind formKind, ns, name string) tea.Cmd {
 	m.hide()
 	m.edits++
+	edit := name != ""
 	f := &form{id: m.edits, kind: kind, edit: edit, ns: ns}
-	for i := range formSpecs[kind].labels {
+	for range formSpecs[kind].labels {
 		in := textinput.New()
 		in.Prompt = ""
 		st := in.Styles()
@@ -130,30 +139,78 @@ func (m *Model) openForm(kind formKind, ns string, edit bool, values ...string) 
 		// message the TUI drops: a value it holds but never shows. A paste
 		// of the terminal still arrives as a tea.PasteMsg.
 		in.KeyMap.Paste.SetEnabled(false)
-		if i < len(values) {
-			in.SetValue(values[i])
-		}
 		f.inputs = append(f.inputs, in)
 	}
 	if edit {
+		f.inputs[0].SetValue(name)
 		f.focus = 1
 	}
 	f.inputs[f.focus].Focus()
 	m.form = f
 	path, id := m.nsPath(ns), f.id
 	return func() tea.Msg {
-		data, err := os.ReadFile(path)
-		return formBaseMsg{id: id, data: data, err: err}
+		nf, err := nsfile.Open(path)
+		if err != nil {
+			return formBaseMsg{id: id, err: err}
+		}
+		values, err := formValues(kind, name, nf)
+		if err != nil {
+			return formBaseMsg{id: id, err: err}
+		}
+		return formBaseMsg{id: id, data: nf.Source(), values: values}
 	}
 }
 
-func (m *Model) gotBase(msg formBaseMsg) {
-	if f := m.form; f != nil && f.id == msg.id {
-		if msg.err != nil {
-			f.err = p(msg.err.Error())
-			return
+// formValues returns the fields of a form of kind for the entry name as nf
+// writes them. An add form (name "") gets only a database form's postgres
+// listen; its other fields are "".
+func formValues(kind formKind, name string, nf *nsfile.File) ([]string, error) {
+	if name == "" {
+		if kind == databaseForm {
+			return []string{"", "", "", "", "", "", nf.PostgresListen()}, nil
 		}
-		f.base = msg.data
+		return nil, nil
+	}
+	var v []string
+	var err error
+	switch kind {
+	case secretForm:
+		var argv []string
+		argv, err = nf.Secret(name)
+		v = []string{name, JoinArgs(argv)}
+	case routeForm:
+		var listen, upstream string
+		listen, upstream, err = nf.Route(name)
+		v = []string{name, listen, upstream}
+	default:
+		var d nsfile.Database
+		var listen string
+		d, listen, err = nf.Database(name)
+		v = []string{name, d.Upstream, d.DBName, d.User, d.Password, d.RequireAuth, listen}
+	}
+	if errors.Is(err, nsfile.ErrNotFound) {
+		return nil, fmt.Errorf("%s %s is no longer in the file", formSpecs[kind].word, name)
+	}
+	return v, err
+}
+
+// gotBase takes the read of the file: its bytes become the base of the save,
+// and its values fill the fields (of an add form only those it has). A failed
+// read leaves no base: the form shows why and saves nothing.
+func (m *Model) gotBase(msg formBaseMsg) {
+	f := m.form
+	if f == nil || f.id != msg.id {
+		return
+	}
+	if msg.err != nil {
+		f.err = p(msg.err.Error())
+		return
+	}
+	f.base = msg.data
+	for i, v := range msg.values {
+		if i < len(f.inputs) && (f.edit || v != "") {
+			f.inputs[i].SetValue(v)
+		}
 	}
 }
 
@@ -198,8 +255,8 @@ func (m *Model) formInput(msg tea.Msg) tea.Cmd {
 
 func (m *Model) saveForm() tea.Cmd {
 	f := m.form
-	if f.saving {
-		return nil
+	if f.saving || f.base == nil {
+		return nil // a save needs the read of the file: the form shows that it reads, or why the read failed
 	}
 	v := make([]string, len(f.inputs))
 	for i, in := range f.inputs {
@@ -419,10 +476,9 @@ func (m *Model) secretsEditKey(k tea.KeyPressMsg, ns *admin.NamespaceStatus) tea
 	at := m.secCursor < len(ns.Secrets)
 	switch {
 	case key.Matches(k, m.keys.add):
-		return m.openForm(secretForm, ns.Name, false)
+		return m.openForm(secretForm, ns.Name, "")
 	case key.Matches(k, m.keys.edit) && at:
-		s := ns.Secrets[m.secCursor]
-		return m.openForm(secretForm, ns.Name, true, s.Name, JoinArgs(s.Command))
+		return m.openForm(secretForm, ns.Name, ns.Secrets[m.secCursor].Name)
 	case key.Matches(k, m.keys.remove) && at:
 		m.askRemove(secretForm, ns.Name, ns.Secrets[m.secCursor].Name)
 	case key.Matches(k, m.keys.editor):
@@ -450,21 +506,14 @@ func (m *Model) routesKey(k tea.KeyPressMsg) tea.Cmd {
 	case key.Matches(k, m.keys.down):
 		m.routeCursor = min(m.routeCursor+1, max(n-1, 0))
 	case key.Matches(k, m.keys.addRoute):
-		return m.openForm(routeForm, ns.Name, false)
+		return m.openForm(routeForm, ns.Name, "")
 	case key.Matches(k, m.keys.addDatabase):
-		listen := ""
-		if ns.Postgres != nil {
-			listen = strconv.Itoa(pg.Listen)
-		}
-		return m.openForm(databaseForm, ns.Name, false, "", "", "", "", "", "", listen)
+		return m.openForm(databaseForm, ns.Name, "")
 	case key.Matches(k, m.keys.edit) && at:
 		if i := m.routeCursor; i < len(ns.HTTP) {
-			r := ns.HTTP[i]
-			return m.openForm(routeForm, ns.Name, true, r.Name, strconv.Itoa(r.Listen), r.Upstream)
+			return m.openForm(routeForm, ns.Name, ns.HTTP[i].Name)
 		}
-		d := pg.Databases[m.routeCursor-len(ns.HTTP)]
-		return m.openForm(databaseForm, ns.Name, true, d.Alias, d.Upstream, d.DBName, d.User, d.Password,
-			d.RequireAuth, strconv.Itoa(pg.Listen))
+		return m.openForm(databaseForm, ns.Name, pg.Databases[m.routeCursor-len(ns.HTTP)].Alias)
 	case key.Matches(k, m.keys.remove) && at:
 		if i := m.routeCursor; i < len(ns.HTTP) {
 			m.askRemove(routeForm, ns.Name, ns.HTTP[i].Name)
@@ -499,6 +548,8 @@ func (m *Model) formView() string {
 		out += "\n\nsaving…"
 	case f.err != "":
 		out += "\n\n" + f.err
+	case f.base == nil:
+		out += "\n\nreading the file…"
 	}
 	return out
 }

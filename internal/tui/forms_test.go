@@ -140,7 +140,7 @@ func TestAddSecretWritesFileAndReloads(t *testing.T) {
 func TestEditSecretKeepsComments(t *testing.T) {
 	h, dir, path := startForms(t)
 	h.keys("e")
-	h.has("Edit secret api-key of acme", "op read 'op://<vault>/<item>/credential'")
+	h.has("Edit secret api-key of acme", "printf k") // the command of the file, not of the status
 	// The name is fixed (C3): the command has the focus, and q and digits
 	// are text there, not a quit or a view switch.
 	h.keys("ctrl+u")
@@ -279,7 +279,7 @@ func TestAddDatabaseCreatesPostgresBlock(t *testing.T) {
 	}
 }
 
-// The database form fills postgres listen with the current port.
+// The database add form fills postgres listen with the port of the file.
 func TestDatabaseFormFillsListen(t *testing.T) {
 	h, _, _ := startForms(t)
 	h.keys("3", "p")
@@ -383,6 +383,84 @@ func TestEditRefusesEntryGoneFromFile(t *testing.T) {
 	writeNamespace(t, dir, "acme", strings.Split(gone, "\n# the api route")[0]+"\n")
 	h.keys("3", "e", "ctrl+s")
 	h.has("route api is no longer in the file")
+}
+
+// An edit form starts from the file, not from the broker's status, which lags
+// a save in the editor by about 2 s: a save of one field keeps the file's
+// other values, also the shared postgres listen.
+func TestEditFormPrefillsFromFile(t *testing.T) {
+	h, dir, path := startForms(t) // the status stays fixture(): the old values
+	changed := strings.NewReplacer(
+		"user: appuser", "user: reader",
+		"listen: 29620", "listen: 29621",
+		`["printf", "k"]`, `["printf", "k2"]`,
+		"upstream: https://api.example.com", "upstream: https://API.example.com:443/",
+	).Replace(acmeFile)
+	writeNamespace(t, dir, "acme", changed)
+
+	h.keys("e")
+	if got := h.m.form.inputs[1].Value(); got != "printf k2" {
+		t.Fatalf("secret form command %q:\n%s", got, h.screen())
+	}
+	h.keys("esc", "3", "e")
+	if got := h.m.form.inputs[2].Value(); got != "https://API.example.com:443/" { // as the file writes it
+		t.Fatalf("route form upstream %q:\n%s", got, h.screen())
+	}
+	h.keys("esc", "j", "e")
+	want := []string{"main", "127.0.0.1:5432", "appdb", "reader", "db-pass", "", "29621"}
+	for i, in := range h.m.form.inputs {
+		if in.Value() != want[i] {
+			t.Fatalf("database form field %d %q, want %q:\n%s", i, in.Value(), want[i], h.screen())
+		}
+	}
+	h.keys("tab", "ctrl+u") // upstream has the focus; tab goes to dbname
+	h.typeText("otherdb")
+	h.keys("ctrl+s")
+	if h.m.form != nil {
+		t.Fatalf("the form is still open:\n%s", h.screen())
+	}
+	ns := load(t, dir)
+	db := config.Database{Alias: "main", Upstream: "127.0.0.1:5432", DBName: "otherdb", User: "reader", Password: "db-pass"}
+	if ns.Postgres.Listen != 29621 || len(ns.Postgres.Databases) != 1 || ns.Postgres.Databases[0] != db {
+		t.Fatalf("postgres %+v:\n%s", ns.Postgres, read(t, path))
+	}
+	if !reflect.DeepEqual(secretOf(ns, "api-key").Command, []string{"printf", "k2"}) || !strings.Contains(read(t, path), "https://API.example.com:443/") {
+		t.Fatalf("the save changed another entry:\n%s", read(t, path))
+	}
+	h.keepsComments(path)
+}
+
+// A form saves only from the file it read: before the read arrives it shows
+// that it reads and refuses a save.
+func TestSaveRefusedBeforeBaseArrives(t *testing.T) {
+	h, dir, path := startForms(t)
+	_, readFile := h.m.Update(keyPress("a")) // the read of the file does not run yet
+	h.has("reading the file…")
+	h.typeText("new-key")
+	h.keys("tab")
+	h.typeText("printf v")
+	h.keys("enter")
+	if h.m.form == nil || read(t, path) != acmeFile || h.reloads() != 0 {
+		t.Fatalf("a save before the read: form %v, reloads %d:\n%s", h.m.form != nil, h.reloads(), read(t, path))
+	}
+	h.has("reading the file…")
+	h.run(readFile)
+	h.hasNot("reading the file…")
+	h.keys("enter")
+	if h.m.form != nil || secretOf(load(t, dir), "new-key") == nil {
+		t.Fatalf("the save after the read: form %v:\n%s", h.m.form != nil, read(t, path))
+	}
+
+	// An edit form before the read: empty fields, no save.
+	_, readFile = h.m.Update(keyPress("e"))
+	h.keys("ctrl+s")
+	if h.m.form == nil || h.m.form.inputs[1].Value() != "" || h.reloads() != 1 {
+		t.Fatalf("an edit before the read: form %v, reloads %d", h.m.form != nil, h.reloads())
+	}
+	h.run(readFile)
+	if got := h.m.form.inputs[1].Value(); got != "printf k" {
+		t.Fatalf("command %q after the read", got)
+	}
 }
 
 // ctrl+v must not read the system clipboard: it often holds a password, and

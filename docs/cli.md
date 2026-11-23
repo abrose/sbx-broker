@@ -102,7 +102,12 @@ The forms change the namespace file of the namespace on screen. The fields, in o
 |---|---|
 | secret | `name`, `command` (shell words: spaces split, quotes group, a backslash escapes; no expansion, no shell) |
 | HTTP route | `name`, `listen`, `upstream` |
-| database | `alias`, `upstream`, `dbname`, `user`, `password secret`, `require-auth` (`scram-sha-256` or empty), `postgres listen` (filled with the current one) |
+| database | `alias`, `upstream`, `dbname`, `user`, `password secret`, `require-auth` (`scram-sha-256` or empty), `postgres listen` (an add form fills it from the file) |
+
+A form reads the namespace file when it opens, and an edit form fills its fields from that read, as the file writes
+them, not from what the broker loaded (which lags a save in an editor by about 2 s). Until the read arrives the form
+shows `reading the file…` and does not save; when the read fails, or the entry left the file, it shows why and does not
+save.
 
 A name or alias is fixed once it exists: an app's config holds the placeholder made from it. Transforms are not in a
 form; `o` opens the file for them. While a form is open its fields take every key as text, also `q` and the digits;

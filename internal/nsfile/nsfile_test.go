@@ -434,3 +434,54 @@ func TestHas(t *testing.T) {
 		t.Error("a file of comments has entries")
 	}
 }
+
+// The getters give an entry's values as the file writes them (an edit form
+// starts from them), with the edits made so far; a missing entry is
+// ErrNotFound. Source is the bytes Open read.
+func TestGetters(t *testing.T) {
+	text := strings.Replace(commented, "      password: db-pass\n", "      password: db-pass\n      require-auth: scram-sha-256\n", 1)
+	text = strings.Replace(text, "upstream: https://api.example.com", "upstream: https://API.example.com:443/", 1)
+	f, _ := open(t, text)
+	if string(f.Source()) != text {
+		t.Fatalf("Source %q", f.Source())
+	}
+	if cmd, err := f.Secret("db-pass"); err != nil || !reflect.DeepEqual(cmd, []string{"echo", "x"}) {
+		t.Errorf("Secret: %q %v", cmd, err)
+	}
+	if listen, up, err := f.Route("api"); err != nil || listen != "29710" || up != "https://API.example.com:443/" {
+		t.Errorf("Route: %q %q %v", listen, up, err)
+	}
+	want := Database{Alias: "app", Upstream: "127.0.0.1:5432", DBName: "appdb", User: "appuser", Password: "db-pass", RequireAuth: "scram-sha-256"}
+	if d, listen, err := f.Database("app"); err != nil || d != want || listen != "29720" {
+		t.Errorf("Database: %+v %q %v", d, listen, err)
+	}
+	if got := f.PostgresListen(); got != "29720" {
+		t.Errorf("PostgresListen %q", got)
+	}
+
+	must(t, f.SetSecret("other", []string{"printf", "a b"}))
+	if cmd, err := f.Secret("other"); err != nil || !reflect.DeepEqual(cmd, []string{"printf", "a b"}) {
+		t.Errorf("Secret after SetSecret: %q %v", cmd, err)
+	}
+
+	_, err := f.Secret("nope")
+	_, _, rerr := f.Route("nope")
+	_, _, derr := f.Database("nope")
+	for _, err := range []error{err, rerr, derr} {
+		if !errors.Is(err, ErrNotFound) {
+			t.Errorf("a missing entry: %v", err)
+		}
+	}
+	empty, _ := open(t, template)
+	if _, err := empty.Secret("api-key"); !errors.Is(err, ErrNotFound) || empty.PostgresListen() != "" {
+		t.Errorf("a file of comments: %v, listen %q", err, empty.PostgresListen())
+	}
+
+	// A command that is not a list of strings is an error, not an empty command.
+	odd, _ := open(t, "secrets:\n  a:\n    command: printf x\n  b:\n    command: [[\"printf\"]]\n")
+	for _, name := range []string{"a", "b"} {
+		if cmd, err := odd.Secret(name); err == nil || errors.Is(err, ErrNotFound) {
+			t.Errorf("Secret(%q): %q %v", name, cmd, err)
+		}
+	}
+}

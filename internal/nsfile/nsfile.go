@@ -237,6 +237,73 @@ func (f *File) Has(kind Kind, name string) bool {
 	}
 }
 
+// Source returns the bytes on disk the file was read from, or last saved.
+// The caller must not change them.
+func (f *File) Source() []byte { return f.orig }
+
+// Secret returns the command of the secret name, with the edits made so far.
+// A missing secret is ErrNotFound; a command that is not a list of strings
+// is an error.
+func (f *File) Secret(name string) ([]string, error) {
+	entry := get(get(f.root, "secrets"), name)
+	if entry == nil {
+		return nil, fmt.Errorf("secret %q: %w", name, ErrNotFound)
+	}
+	cmd := get(entry, "command")
+	if cmd == nil {
+		return nil, nil
+	}
+	bad := fmt.Errorf("secret %q: the command is not a list of strings", name)
+	if cmd.Kind != yaml.SequenceNode {
+		return nil, bad
+	}
+	argv := make([]string, 0, len(cmd.Content))
+	for _, a := range cmd.Content {
+		if a.Kind != yaml.ScalarNode {
+			return nil, bad
+		}
+		argv = append(argv, a.Value)
+	}
+	return argv, nil
+}
+
+// Route returns listen and upstream of the route name as the file writes
+// them, with the edits made so far. A missing route is ErrNotFound.
+func (f *File) Route(name string) (listen, upstream string, err error) {
+	list := get(f.root, "http")
+	var item *yaml.Node
+	if list != nil && list.Kind == yaml.SequenceNode {
+		item = routeItem(list, name)
+	}
+	if item == nil {
+		return "", "", fmt.Errorf("route %q: %w", name, ErrNotFound)
+	}
+	return scalar(item, "listen"), scalar(item, "upstream"), nil
+}
+
+// Database returns the database alias and postgres.listen as the file writes
+// them, with the edits made so far. A missing database is ErrNotFound.
+func (f *File) Database(alias string) (d Database, listen string, err error) {
+	entry := get(get(get(f.root, "postgres"), "databases"), alias)
+	if entry == nil {
+		return Database{}, "", fmt.Errorf("database %q: %w", alias, ErrNotFound)
+	}
+	d = Database{Alias: alias, Upstream: scalar(entry, "upstream"), DBName: scalar(entry, "dbname"),
+		User: scalar(entry, "user"), Password: scalar(entry, "password"), RequireAuth: scalar(entry, "require-auth")}
+	return d, f.PostgresListen(), nil
+}
+
+// PostgresListen returns postgres.listen as the file writes it, or "".
+func (f *File) PostgresListen() string { return scalar(get(f.root, "postgres"), "listen") }
+
+// scalar returns the text of the scalar value of key in m, or "".
+func scalar(m *yaml.Node, key string) string {
+	if v := get(m, key); v != nil && v.Kind == yaml.ScalarNode {
+		return v.Value
+	}
+	return ""
+}
+
 func (f *File) RemoveSecret(name string) error {
 	return f.removeFromMap("secrets", name)
 }
