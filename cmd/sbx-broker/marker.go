@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/abrose/sbx-broker/internal/placeholder"
 )
@@ -59,11 +60,16 @@ func readMarker(path string) (string, error) {
 	if !fi.Mode().IsRegular() {
 		return "", fmt.Errorf("%s is not a regular file", path)
 	}
-	f, err := os.Open(path)
+	// The sandbox can swap the marker after the Lstat: open with no symlink
+	// follow and no block on a FIFO, then check the open file itself.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return "", fmt.Errorf("%s: cannot read the marker", path)
 	}
 	defer func() { _ = f.Close() }()
+	if ofi, err := f.Stat(); err != nil || !ofi.Mode().IsRegular() || !os.SameFile(fi, ofi) {
+		return "", fmt.Errorf("%s changed while it was read", path)
+	}
 	data, err := io.ReadAll(io.LimitReader(f, maxMarker))
 	if err != nil {
 		return "", fmt.Errorf("%s: cannot read the marker", path)
