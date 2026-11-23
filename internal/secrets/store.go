@@ -194,6 +194,15 @@ func (s *Store) runCommand(ctx context.Context, argv []string) ([]byte, int, err
 
 	var stdout, stderr capBuffer
 	stdout.max, stderr.max = maxStdout+1, maxStderr // +1 for the trailing newline
+	// The buffers hold the value (stderr may too): zero them on every path.
+	// Grown to the cap at once, a buffer never moves, so no earlier copy of
+	// its bytes is left behind unwiped.
+	stdout.buf.Grow(stdout.max)
+	stderr.buf.Grow(stderr.max)
+	defer func() {
+		clear(stdout.buf.Bytes())
+		clear(stderr.buf.Bytes())
+	}()
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Stdin = nil // /dev/null, never the terminal
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
