@@ -438,6 +438,37 @@ func TestPGLoginSwapsPassword(t *testing.T) {
 	noDBValueInLog(t, l)
 }
 
+// The app picks the user and the database of a startup, and Postgres results
+// are not scanned: an app that learned a value can put it there. The log's
+// redactor must catch it in the route and user fields.
+func TestPGAppControlledFieldsAreRedacted(t *testing.T) {
+	fake := startFakePG(t, nil)
+	p, l := newPG(t, pgEntries(fake.addr))
+	l.SetRedactor(func(s string) string { return strings.ReplaceAll(s, dbPass, "[redacted]") })
+	startPG(t, p)
+
+	// A known database, so the login goes through: the user is the value.
+	a := dialPG(t, p)
+	a.startup(dbPass, "app")
+	a.send(&pgproto3.PasswordMessage{Password: "sbxb_t1_db_pass"})
+	if er, ok := a.recv().(*pgproto3.ErrorResponse); !ok || er.Severity != "FATAL" {
+		t.Fatalf("got %#v, want a refusal", er)
+	}
+
+	// An unknown database (check 2): the database is the value.
+	b := dialPG(t, p)
+	b.startup("app", dbPass)
+	b.send(&pgproto3.PasswordMessage{Password: "sbxb_t1_db_pass"})
+	if er, ok := b.recv().(*pgproto3.ErrorResponse); !ok || er.Severity != "FATAL" {
+		t.Fatalf("got %#v, want a refusal", er)
+	}
+
+	if n := len(l.Recent(1000)); n == 0 {
+		t.Fatal("no events")
+	}
+	noDBValueInLog(t, l)
+}
+
 func TestPGLoginProtocol32Client(t *testing.T) {
 	fake := startFakePG(t, nil)
 	p, _ := newPG(t, pgEntries(fake.addr))

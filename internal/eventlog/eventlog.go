@@ -90,14 +90,15 @@ func (l *Log) openFile() error {
 	return nil
 }
 
-// SetRedactor sets the function applied to Message and Path inside Add.
+// SetRedactor sets the function applied to Message, Path, Route and User
+// inside Add.
 func (l *Log) SetRedactor(f func(string) string) {
 	l.mu.Lock()
 	l.redact = f
 	l.mu.Unlock()
 }
 
-// Add records e. It sets Time when zero, redacts Message and Path, then
+// Add records e. It sets Time when zero, redacts Message, Path, Route and User, then
 // stores the event in the ring, appends it to the file and offers it to
 // every subscriber. It never blocks and never fails: a file error is
 // remembered and returned by Close.
@@ -110,6 +111,8 @@ func (l *Log) Add(e Event) {
 	if l.redact != nil {
 		e.Message = l.redact(e.Message)
 		e.Path = l.redact(e.Path)
+		e.Route = l.redact(e.Route)
+		e.User = l.redact(e.User)
 	}
 	l.ring = append(l.ring, e)
 	if len(l.ring) >= 2*l.ringCap { // compact lazily: amortized O(1) per Add

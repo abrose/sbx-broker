@@ -148,6 +148,26 @@ func TestRedactor(t *testing.T) {
 	}
 }
 
+func TestRedactorCoversRouteAndUser(t *testing.T) {
+	l, path := openLog(t, 10, 1<<20)
+	l.SetRedactor(func(s string) string {
+		return strings.ReplaceAll(s, "s3cr3t-value", "[redacted]")
+	})
+	l.Add(Event{Kind: KindError, Route: "db-s3cr3t-value", User: "u-s3cr3t-value"})
+
+	got := l.Recent(1)[0]
+	if got.Route != "db-[redacted]" || got.User != "u-[redacted]" {
+		t.Errorf("ring = %+v", got)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "s3cr3t-value") {
+		t.Errorf("file = %s", data)
+	}
+}
+
 func TestRedactorAppliesToSubscribers(t *testing.T) {
 	l, _ := openLog(t, 10, 1<<20)
 	l.SetRedactor(func(s string) string { return strings.ReplaceAll(s, "s3cr3t-value", "[redacted]") })
