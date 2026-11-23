@@ -156,10 +156,11 @@ func TestEndToEnd(t *testing.T) {
 	harness.AssertProof(t, outcomes, harness.RecordsByCase(harness.Records(t, records)))
 
 	t.Run("policy-log", func(t *testing.T) {
-		// No entry is wanted for the blocked raw TCP port 29695: the policy log
-		// of this sbx version does not list a blocked raw connect, so t2-postgres-closed
-		// proves that block through broker.log alone.
+		// The policy log records the block of the closed Postgres port 29695 once
+		// t2-postgres-closed (which runs before this subtest) sent real logins;
+		// a bare connect leaves no entry.
 		want := map[string]string{
+			fmt.Sprintf("localhost:%d", harness.PortT2PG):  "blocked",
 			fmt.Sprintf("localhost:%d", harness.PortT1API): "allowed",
 			fmt.Sprintf("localhost:%d", harness.PortT1IdP): "allowed",
 			fmt.Sprintf("localhost:%d", harness.PortT2API): "blocked",

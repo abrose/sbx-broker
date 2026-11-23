@@ -53,8 +53,9 @@ test client runs the cases of `test/pgcases` in the sandbox with `-postgres host
 rule `localhost:29694` allows, also for raw TCP, and the same assertions as the integration proof check the outcomes
 and the server's log. The same cases run against the closed port 29695 must all end in a connection error (the sbx
 proxy accepts the connect and then closes it, so a bare connect proves nothing: only real logins would show a
-forward), and `broker.log` must hold no login event of `t2`. The policy log lists `localhost:29694` as allowed, but it
-shows no entry for a blocked raw TCP connect, so the block of 29695 is proved through these two checks alone.
+forward), and `broker.log` must hold no login event of `t2`. The policy log lists `localhost:29694` as allowed and, once
+the client has sent its logins, `localhost:29695` as blocked (a bare TCP connect leaves no entry): the sbx-side proof of
+the block.
 
 ### Prerequisites
 
