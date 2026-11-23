@@ -51,9 +51,10 @@ after a failure.
 The proof covers Postgres too. The real Postgres container binds 127.0.0.1 on the Mac and only the broker dials it. The
 test client runs the cases of `test/pgcases` in the sandbox with `-postgres host.docker.internal:29694`, which the kit
 rule `localhost:29694` allows, also for raw TCP, and the same assertions as the integration proof check the outcomes
-and the server's log. A raw TCP connect from the sandbox to the closed port 29695 must leave no `t2` event in
-`broker.log`. The policy log lists `localhost:29694` as allowed, but it shows no entry for a blocked raw TCP connect, so
-the block of 29695 is proved through `broker.log` alone.
+and the server's log. The same cases run against the closed port 29695 must all end in a connection error (the sbx
+proxy accepts the connect and then closes it, so a bare connect proves nothing: only real logins would show a
+forward), and `broker.log` must hold no login event of `t2`. The policy log lists `localhost:29694` as allowed, but it
+shows no entry for a blocked raw TCP connect, so the block of 29695 is proved through these two checks alone.
 
 ### Prerequisites
 

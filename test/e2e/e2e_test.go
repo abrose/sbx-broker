@@ -109,12 +109,28 @@ func TestEndToEnd(t *testing.T) {
 		harness.AssertPostgres(t, decodeOutcomes[pgcases.Outcome](t, out), harness.WaitUpstreamLog(pgLogs))
 	})
 
-	// A raw TCP connect to the closed port 29695 is cut by the sbx proxy: the
-	// exit code does not matter, only that the broker never saw a login.
+	// The Postgres cases against the closed port 29695 must all end in a
+	// connection error or EOF: a bare connect sends no bytes and the broker
+	// logs nothing for it, so only real logins can show that sbx forwards the
+	// port. A forwarded login would reach the t2 listener (check 1: a
+	// placeholder of another namespace) and log a t2 event.
 	t.Run("t2-postgres-closed", func(t *testing.T) {
-		_, errOut, err := command(ctx, stepWait, dir, nil, "sbx", "exec", sandbox, "--", "bash", "-c",
-			fmt.Sprintf("exec 3<>/dev/tcp/%s/%d", hostAlias, harness.PortT2PG))
-		t.Logf("raw connect to %s:%d from the sandbox: err %v, stderr %q", hostAlias, harness.PortT2PG, err, errOut)
+		closed := fmt.Sprintf("%s:%d", hostAlias, harness.PortT2PG)
+		out, errOut, err := command(ctx, stepWait, dir, nil, "sbx", "exec", sandbox, "--",
+			filepath.Join(ws, clientName), "-postgres", closed, "-placeholders", placeholdersFlag())
+		if err != nil {
+			t.Fatalf("the test client against %s: %v\nstderr:\n%s", closed, err, errOut)
+		}
+		got := decodeOutcomes[pgcases.Outcome](t, out)
+		if len(got) == 0 {
+			t.Fatalf("the test client printed no outcome against %s", closed)
+		}
+		for _, o := range got {
+			t.Logf("case %s against %s: %q", o.Case, closed, o.Message)
+			if o.Code != "" || o.Row != "" {
+				t.Errorf("case %s against %s: got a Postgres answer (code %q, row %q), want a connection error", o.Case, closed, o.Code, o.Row)
+			}
+		}
 		// The reload and fetch events of t2 at its start are no login.
 		for _, e := range brokerEvents(t, state) {
 			switch e.Kind {
