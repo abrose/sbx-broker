@@ -78,7 +78,8 @@ sequenceDiagram
 | HTTP routes, swap and scrub | ready |
 | The CLI (`serve`, `status`, `refresh`, `reload`, `log`) | ready |
 | A Postgres proxy (placeholder as the database password) | ready |
-| A TUI to manage secrets and watch the log, and a launchd agent | coming |
+| A TUI (`sbx-broker`): namespaces, secrets, a secret's details, a confirmed reveal | ready |
+| Edit forms, routes and the live log in the TUI, and a launchd agent | coming |
 
 It is made and tested for macOS.
 
@@ -137,6 +138,17 @@ sbx-broker status
 `sbxb_acme_client_secret` and `sbxb_acme_api_key`. All rules for the file are in
 [docs/configuration.md](docs/configuration.md).
 
+Or open the terminal UI:
+
+```sh
+sbx-broker                # in the project folder it starts on the secrets of acme
+```
+
+It shows each secret's placeholder, command, state, last fetch and swap count, and updates every 2 s. `enter` on a
+secret shows its details: the value's length and the first 8 hex characters of its SHA-256, never the value. To see
+the value once, press `r`, then `y`; the broker logs the reveal, and the next key hides the value again. `f` fetches
+a secret again, `q` quits. The keys are in [docs/cli.md](docs/cli.md#the-tui).
+
 ### 3. Open the ports in the project kit
 
 A sandbox reaches a port on your Mac at `http://host.docker.internal:<port>` only through a network rule. The broker
@@ -193,7 +205,8 @@ of `status` and `log` to see all namespaces.
 
 | Task | Command |
 |---|---|
-| See the secrets and listeners | `sbx-broker status` |
+| See the secrets and listeners | `sbx-broker` (the TUI) or `sbx-broker status` |
+| Compare a value with its source, or show it once | `sbx-broker`, `enter` on the secret; then `r`, `y` to show it |
 | Change the secrets or routes | `sbx-broker edit` |
 | Fetch the secrets again, for example after a rotation or an unlock | `sbx-broker refresh` |
 | Fetch one secret again | `sbx-broker refresh acme client-secret` |
@@ -227,7 +240,7 @@ full list is in [docs/security.md](docs/security.md).
 | Document | What it covers |
 |---|---|
 | [docs/configuration.md](docs/configuration.md) | Namespace files, names, fetch commands, placeholders, environment variables, reloads |
-| [docs/cli.md](docs/cli.md) | Every command, the admin socket, `status`, the log and its event kinds |
+| [docs/cli.md](docs/cli.md) | Every command, the TUI and its keys, the admin socket, `status`, the log and its event kinds |
 | [docs/how-it-works.md](docs/how-it-works.md) | Where the broker swaps, which headers it changes, what the scrub covers, the request limits |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Every answer of the broker, the sbx proxy's 403, common checks |
 | [docs/security.md](docs/security.md) | What the broker protects, what it does not do, the known gaps |

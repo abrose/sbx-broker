@@ -1,6 +1,8 @@
 # The CLI
 
 ```text
+sbx-broker                             the terminal UI (see the TUI below)
+sbx-broker tui                         the same
 sbx-broker serve                       run the broker until SIGINT or SIGTERM
 sbx-broker status [<ns>]               namespaces, listeners and secret states, without values
 sbx-broker refresh [<ns> [<secret>]]   run the fetch commands again
@@ -23,6 +25,7 @@ The file `.sbx-broker` in a project's root folder names the project's namespace.
 - The first line of the file, with spaces trimmed, is the namespace name. It must match `^[a-z0-9]{1,16}$`.
 - A namespace given as an argument wins over the marker.
 - With no argument and no marker, `status` and `log` show all namespaces, and `refresh` and `edit` stop with an error.
+- The TUI starts on the secrets of the marker's namespace, or on the list of namespaces with no marker.
 - The CLI refuses a marker that is a symlink or not a regular file. An error names the marker's path, never its
   content.
 - `serve` never reads a marker. Why the marker holds only a name: see [security.md](security.md#the-project-marker).
@@ -33,6 +36,47 @@ The file `.sbx-broker` in a project's root folder names the project's namespace.
   admin TCP port, and a sandbox cannot reach the socket.
 - One broker per state directory: `serve` holds a lock on `admin.lock`, and a second `serve` refuses with
   `a broker already runs`.
+
+## The TUI
+
+`sbx-broker` with no command, or `sbx-broker tui`, starts the terminal UI. It shows what the broker loaded, asks the
+broker for its status every 2 s, and never starts a broker. When no broker answers at start, it prints this line to
+stderr and exits 1:
+
+```text
+no broker runs (start it with: sbx-broker serve, or as a service with: sbx-broker install)
+```
+
+When the broker goes away later, the header shows the same line and the TUI keeps asking.
+
+| View | Columns or fields |
+|---|---|
+| Namespaces | `NAME`, `LISTENERS`, `SECRETS` (`<ok> of <n> ok`), `ERROR` |
+| Secrets | `NAME`, `PLACEHOLDER`, `COMMAND` (cut to fit with `…`), `STATE` (`fetching` while a refresh runs), `FETCHED`, `SWAPS` |
+| Inspect | name, placeholder, the whole command, state, fetch time, exit code and error line of a failed fetch, length, `sha256 <first 8 hex>`, swaps, and `value: hidden (r to reveal)` |
+| Routes, Log | not built yet |
+
+`SWAPS` counts the `swap` events that name the secret since the broker started. A command shows as shell words: an
+argument with a character other than `A-Za-z0-9_@%+=:,./-` is in single quotes.
+
+| Where | Key | Action |
+|---|---|---|
+| all | `1` `2` `3` `4`, `tab` | Namespaces, Secrets, Routes, Log; next view |
+| all | `q`, `ctrl+c` | quit |
+| lists | `up`/`k`, `down`/`j` | move |
+| Namespaces | `enter` | select the namespace, open Secrets |
+| Secrets | `enter` | Inspect |
+| Secrets | `f`, `F` | refresh the secret, refresh all of the namespace |
+| Inspect | `r`, then `y` | reveal; any other key after `r` cancels |
+| Inspect | `esc` | back to Secrets |
+
+### Reveal
+
+`r` asks `Reveal the value of <name>? The broker logs it. (y/n)`. With `y` the broker sends the value, only of a secret
+in state `ok`, and logs a `reveal` event. The TUI shows `value: <value>   (any key hides it)` and holds the value only
+while it shows it: it overwrites the value with zeros and drops it at the next key, at a view switch, 30 s after it
+appeared, and when the TUI quits. A status update does not hide it. The TUI runs in the terminal's alternate screen, so
+no value stays in the scrollback. No CLI command reveals a value.
 
 ## `status`
 
@@ -75,7 +119,7 @@ The broker loads the template as an empty namespace. Fill it with `sbx-broker ed
 - The log keeps the last 10,000 events in memory and appends JSON lines to `broker.log` in the state directory
   (mode 0600, rotated to `broker.log.1` at 10 MiB).
 - No event holds a value or a query string.
-- `log` and `status` print control characters escaped, so a sandboxed app cannot inject terminal escapes or fake lines
+- `log`, `status` and the TUI print control characters escaped, so a sandboxed app cannot inject terminal escapes or fake lines
   through a path, a method or an upstream message.
 
 | Kind | Meaning |
@@ -89,6 +133,7 @@ The broker loads the template as an empty namespace. Fill it with `sbx-broker ed
 | `reload` | a namespace was loaded, reloaded or stopped |
 | `error` | a request that could not be scanned (a 400), a namespace file with an error, a listener that did not start |
 | `close` | a Postgres session ended, with its duration |
+| `reveal` | the owner showed a secret's value in the TUI; names the secret |
 | `info` | other notes |
 
 A Postgres event shows `<user>@<alias>` in the route column, for example `app@app`.

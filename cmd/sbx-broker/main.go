@@ -23,11 +23,14 @@ import (
 	"github.com/abrose/sbx-broker/internal/eventlog"
 	"github.com/abrose/sbx-broker/internal/secrets"
 	"github.com/abrose/sbx-broker/internal/server"
+	"github.com/abrose/sbx-broker/internal/tui"
 )
 
-const usage = `usage: sbx-broker <command>
+const usage = `usage: sbx-broker [<command>]
 
 commands:
+  tui                        the terminal UI, also with no command: namespaces,
+                             secrets, a secret's details and a confirmed reveal
   serve                      run the broker until SIGINT or SIGTERM
   status [<ns>]              namespaces, listeners and secret states, without values
   refresh [<ns> [<secret>]]  run the fetch commands again
@@ -50,7 +53,7 @@ const (
 	exitOK    = 0
 	exitFail  = 1
 	exitUsage = 2
-	noBroker  = "no broker runs (start it with: sbx-broker serve)"
+	noBroker  = tui.NoBroker
 )
 
 func main() {
@@ -59,18 +62,19 @@ func main() {
 
 // run runs one command and returns the exit code.
 func run(args []string, getenv func(string) string, stdout, stderr io.Writer) int {
-	c := &command{getenv: getenv, getwd: os.Getwd, runEditor: runTerminal, stdout: stdout, stderr: stderr}
+	c := &command{getenv: getenv, getwd: os.Getwd, runEditor: runTerminal, tui: tui.Run, stdout: stdout, stderr: stderr}
 	return c.run(args)
 }
 
 // run runs one command with c's environment and returns the exit code.
 func (c *command) run(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprint(c.stderr, usage)
-		return exitUsage
+		return c.startTUI()
 	}
 	cmd, rest := args[0], args[1:]
 	switch {
+	case cmd == "tui" && len(rest) == 0:
+		return c.startTUI()
 	case cmd == "help" || cmd == "-h" || cmd == "--help":
 		fmt.Fprint(c.stdout, usage)
 		return exitOK
@@ -109,14 +113,41 @@ func logArgs(args []string) (follow bool, ns string, ok bool) {
 	return follow, ns, true
 }
 
-// command runs one CLI command with its environment and output. getwd and
-// runEditor are fields so that tests never use the real current folder or
-// start an editor.
+// command runs one CLI command with its environment and output. getwd,
+// runEditor and tui are fields so that tests never use the real current
+// folder, start an editor or take over the terminal.
 type command struct {
 	getenv         func(string) string
 	getwd          func() (string, error)
 	runEditor      func(dir string, argv []string) error
+	tui            func(cl tui.Client, opt tui.Options) error
 	stdout, stderr io.Writer
+}
+
+// startTUI runs the TUI on the namespace of the project marker, if any. It
+// asks the broker for its status first: with no broker it prints the
+// no-broker line and exits 1, and it never starts one.
+func (c *command) startTUI() int {
+	cfg, err := c.configDir()
+	if err != nil {
+		return c.fail(err)
+	}
+	state, err := c.stateDir()
+	if err != nil {
+		return c.fail(err)
+	}
+	ns, _, err := c.namespace(nil)
+	if err != nil && !errors.Is(err, errNoMarker) {
+		return c.fail(err)
+	}
+	cl := tui.NewSocketClient(state)
+	if _, err := cl.Status(""); err != nil {
+		return c.fail(err)
+	}
+	if err := c.tui(cl, tui.Options{ConfigDir: cfg, Namespace: ns, Editor: c.runEditor}); err != nil {
+		return c.fail(err)
+	}
+	return exitOK
 }
 
 // namespace returns args[0] when given, else the namespace of the project

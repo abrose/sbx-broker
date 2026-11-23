@@ -16,6 +16,7 @@ import (
 	"github.com/abrose/sbx-broker/internal/eventlog"
 	"github.com/abrose/sbx-broker/internal/secrets"
 	"github.com/abrose/sbx-broker/internal/server"
+	"github.com/abrose/sbx-broker/internal/tui"
 )
 
 // noProject is an empty folder with no marker in it: the current folder of
@@ -39,11 +40,17 @@ func cli(env map[string]string, args ...string) (int, string, string) {
 
 // cliIn runs the CLI with dir as the current folder.
 func cliIn(dir string, env map[string]string, args ...string) (int, string, string) {
+	return cliTUI(dir, env, func(tui.Client, tui.Options) error { return errors.New("no TUI in tests") }, args...)
+}
+
+// cliTUI is cliIn with run as the TUI.
+func cliTUI(dir string, env map[string]string, run func(tui.Client, tui.Options) error, args ...string) (int, string, string) {
 	var out, errOut bytes.Buffer
 	c := &command{
 		getenv:    func(k string) string { return env[k] },
 		getwd:     func() (string, error) { return dir, nil },
 		runEditor: func(string, []string) error { return errors.New("no editor in tests") },
+		tui:       run,
 		stdout:    &out,
 		stderr:    &errOut,
 	}
@@ -110,10 +117,56 @@ func broker(t *testing.T) (map[string]string, int) {
 	return env, port
 }
 
-func TestNoArgumentPrintsUsage(t *testing.T) {
-	code, out, errOut := cli(nil)
-	if code != 2 || out != "" || !strings.Contains(errOut, "usage: sbx-broker") {
-		t.Fatalf("code %d, out %q, err %q", code, out, errOut)
+func TestNoArgumentStartsTUI(t *testing.T) {
+	env, _ := broker(t)
+	dir := project(t, "t1")
+	for _, args := range [][]string{nil, {"tui"}} {
+		var got *tui.Options
+		var nss []admin.NamespaceStatus
+		code, out, errOut := cliTUI(dir, env, func(cl tui.Client, opt tui.Options) error {
+			got = &opt
+			var err error
+			nss, err = cl.Status("")
+			return err
+		}, args...)
+		if code != 0 || out != "" || errOut != "" || got == nil {
+			t.Fatalf("%q: code %d, out %q, err %q, ran %v", args, code, out, errOut, got != nil)
+		}
+		if got.Namespace != "t1" || got.ConfigDir != env["SBX_BROKER_CONFIG_DIR"] || got.Editor == nil {
+			t.Fatalf("%q: options %+v", args, *got)
+		}
+		if len(nss) != 1 || nss[0].Name != "t1" {
+			t.Fatalf("%q: the client did not reach the broker: %+v", args, nss)
+		}
+	}
+}
+
+func TestTUIWithoutMarker(t *testing.T) {
+	env, _ := broker(t)
+	var got *tui.Options
+	code, _, errOut := cliTUI(noProject, env, func(_ tui.Client, opt tui.Options) error { got = &opt; return nil })
+	if code != 0 || got == nil || got.Namespace != "" {
+		t.Fatalf("code %d, err %q, options %+v", code, errOut, got)
+	}
+}
+
+func TestTUINoBrokerOneLine(t *testing.T) {
+	env := map[string]string{"SBX_BROKER_STATE_DIR": stateDir(t)}
+	ran := false
+	code, out, errOut := cliTUI(noProject, env, func(tui.Client, tui.Options) error { ran = true; return nil })
+	if code != 1 || out != "" || errOut != noBroker+"\n" || ran {
+		t.Fatalf("code %d, out %q, err %q, ran %v", code, out, errOut, ran)
+	}
+	if noBroker != "no broker runs (start it with: sbx-broker serve, or as a service with: sbx-broker install)" {
+		t.Fatalf("noBroker %q", noBroker)
+	}
+}
+
+func TestTUIErrorFails(t *testing.T) {
+	env, _ := broker(t)
+	code, _, errOut := cliTUI(noProject, env, func(tui.Client, tui.Options) error { return errors.New("no tty") })
+	if code != 1 || errOut != "sbx-broker: no tty\n" {
+		t.Fatalf("code %d, err %q", code, errOut)
 	}
 }
 
@@ -125,7 +178,7 @@ func TestHelp(t *testing.T) {
 }
 
 func TestUsageErrors(t *testing.T) {
-	for _, args := range [][]string{{"nope"}, {"refresh"}, {"status", "a", "b"}, {"reload", "x"}, {"log", "-x"}, {"serve", "x"}} {
+	for _, args := range [][]string{{"nope"}, {"refresh"}, {"status", "a", "b"}, {"reload", "x"}, {"log", "-x"}, {"serve", "x"}, {"tui", "x"}} {
 		if code, _, errOut := cli(nil, args...); code != 2 || !strings.Contains(errOut, "usage: sbx-broker") {
 			t.Errorf("%v: code %d", args, code)
 		}
@@ -135,7 +188,7 @@ func TestUsageErrors(t *testing.T) {
 func TestNoBroker(t *testing.T) {
 	env := map[string]string{"SBX_BROKER_STATE_DIR": stateDir(t)}
 	code, _, errOut := cli(env, "status")
-	if code != 1 || !strings.Contains(errOut, "no broker runs (start it with: sbx-broker serve)") {
+	if code != 1 || errOut != "no broker runs (start it with: sbx-broker serve, or as a service with: sbx-broker install)\n" {
 		t.Fatalf("code %d, err %q", code, errOut)
 	}
 }
