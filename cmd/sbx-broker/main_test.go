@@ -43,7 +43,7 @@ func cliIn(dir string, env map[string]string, args ...string) (int, string, stri
 	c := &command{
 		getenv:    func(k string) string { return env[k] },
 		getwd:     func() (string, error) { return dir, nil },
-		runEditor: func([]string) error { return errors.New("no editor in tests") },
+		runEditor: func(string, []string) error { return errors.New("no editor in tests") },
 		stdout:    &out,
 		stderr:    &errOut,
 	}

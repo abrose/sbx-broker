@@ -115,7 +115,7 @@ func logArgs(args []string) (follow bool, ns string, ok bool) {
 type command struct {
 	getenv         func(string) string
 	getwd          func() (string, error)
-	runEditor      func(argv []string) error
+	runEditor      func(dir string, argv []string) error
 	stdout, stderr io.Writer
 }
 

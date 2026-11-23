@@ -16,6 +16,7 @@ type editRun struct {
 	code        int
 	out, errOut string
 	argv        []string // nil when no editor ran
+	dir         string   // the editor's working folder
 }
 
 func cliEdit(dir string, env map[string]string, args ...string) editRun {
@@ -24,7 +25,7 @@ func cliEdit(dir string, env map[string]string, args ...string) editRun {
 	c := &command{
 		getenv:    func(k string) string { return env[k] },
 		getwd:     func() (string, error) { return dir, nil },
-		runEditor: func(argv []string) error { r.argv = argv; return nil },
+		runEditor: func(dir string, argv []string) error { r.dir, r.argv = dir, argv; return nil },
 		stdout:    &out,
 		stderr:    &errOut,
 	}
@@ -62,6 +63,17 @@ func TestEditUsesMarker(t *testing.T) {
 	r := cliEdit(project(t, "acme"), env, "edit")
 	if want := []string{"vi", filepath.Join(cfg, "acme.yaml")}; r.code != 0 || !reflect.DeepEqual(r.argv, want) {
 		t.Fatalf("code %d, argv %q, err %q", r.code, r.argv, r.errOut)
+	}
+}
+
+// The editor must not run in the project folder: the agent can write it, and
+// some editors load config (and run commands) from their working folder.
+func TestEditRunsInConfigFolder(t *testing.T) {
+	env, cfg := configEnv(t)
+	writeFile(t, filepath.Join(cfg, "acme.yaml"), "", 0o600)
+	r := cliEdit(project(t, "acme"), env, "edit")
+	if r.code != 0 || r.dir != cfg {
+		t.Fatalf("code %d, editor folder %q, want %q", r.code, r.dir, cfg)
 	}
 }
 

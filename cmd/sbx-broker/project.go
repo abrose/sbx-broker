@@ -53,7 +53,9 @@ func (c *command) edit(args []string) int {
 	} else if err != nil {
 		return c.fail(err)
 	}
-	if err := c.runEditor(editorArgv(c.getenv, path)); err != nil {
+	// The editor runs in the config folder, never in the project folder: the
+	// agent can write that one, and some editors load config from it.
+	if err := c.runEditor(cfg, editorArgv(c.getenv, path)); err != nil {
 		return c.fail(err)
 	}
 	return exitOK
@@ -141,9 +143,10 @@ func editorArgv(getenv func(string) string, file string) []string {
 	return []string{"vi", file}
 }
 
-// runTerminal runs argv on the terminal of the CLI.
-func runTerminal(argv []string) error {
+// runTerminal runs argv in dir, on the terminal of the CLI.
+func runTerminal(dir string, argv []string) error {
 	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Dir = dir
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	return cmd.Run()
 }

@@ -22,8 +22,10 @@ So the marker `.sbx-broker` holds only a namespace name:
 - The CLI maps the name to `<config folder>/<name>.yaml`, and it accepts only `^[a-z0-9]{1,16}$`, so the path stays in
   the config folder.
 - The CLI refuses a marker that is a symlink or not a regular file, also when the agent swaps it during the read.
-- No error prints the marker's content, and every path the CLI prints is escaped, so a folder name cannot inject
-  terminal escapes.
+- No error prints the marker's content, and every path from the project folder that the CLI prints is escaped, so a
+  folder name cannot inject terminal escapes.
+- `sbx-broker edit` runs your editor in the config folder, not in the project folder. Some editors load config from
+  their working folder, and that config can run commands; the agent could plant it in the project folder.
 
 The agent can still change the name to another namespace of yours. Then `status` shows that namespace (names,
 placeholders and states, never values), and `edit` opens that file, which your editor shows by its path.
