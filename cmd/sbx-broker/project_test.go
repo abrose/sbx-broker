@@ -77,6 +77,28 @@ func TestEditRunsInConfigFolder(t *testing.T) {
 	}
 }
 
+// A relative config folder is taken from the current folder, so the editor,
+// which runs in the config folder, gets an absolute path.
+func TestEditRelativeConfigDir(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "ns")
+	writeFile(t, filepath.Join(cfg, "acme.yaml"), "", 0o600)
+	r := cliEdit(dir, map[string]string{"SBX_BROKER_CONFIG_DIR": "ns"}, "edit", "acme")
+	if want := []string{"vi", filepath.Join(cfg, "acme.yaml")}; r.code != 0 || r.dir != cfg || !reflect.DeepEqual(r.argv, want) {
+		t.Fatalf("code %d, dir %q, argv %q, err %q", r.code, r.dir, r.argv, r.errOut)
+	}
+}
+
+func TestRunTerminalDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := runTerminal(dir, []string{"touch", "made-here"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "made-here")); err != nil {
+		t.Fatalf("the command did not run in %s: %v", dir, err)
+	}
+}
+
 func TestEditArgument(t *testing.T) {
 	env, cfg := configEnv(t)
 	writeFile(t, filepath.Join(cfg, "acme.yaml"), "", 0o600)

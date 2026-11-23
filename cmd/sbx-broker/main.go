@@ -168,8 +168,18 @@ func (c *command) stateDir() (string, error) {
 	return c.dir("SBX_BROKER_STATE_DIR", ".local", "state", "sbx-broker")
 }
 
+// configDir is absolute: edit runs the editor in it, so a relative path
+// would point the editor at the wrong file.
 func (c *command) configDir() (string, error) {
-	return c.dir("SBX_BROKER_CONFIG_DIR", ".config", "sbx-broker", "namespaces")
+	cfg, err := c.dir("SBX_BROKER_CONFIG_DIR", ".config", "sbx-broker", "namespaces")
+	if err != nil || filepath.IsAbs(cfg) {
+		return cfg, err
+	}
+	wd, err := c.getwd()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(wd, cfg), nil
 }
 
 func (c *command) serve() int {
