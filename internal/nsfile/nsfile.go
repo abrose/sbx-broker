@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -131,6 +132,11 @@ func (f *File) Save(check func(data []byte) error) error {
 		}
 	}
 	tmp := filepath.Join(filepath.Dir(f.path), "."+filepath.Base(f.path)+".tmp")
+	// A crash can leave a stale tmp. Remove it (a symlink itself, never its
+	// target) so it cannot block every later save.
+	if err := os.Remove(tmp); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
 	if err := writeTmp(tmp, data); err != nil {
 		return err
 	}
@@ -139,7 +145,19 @@ func (f *File) Save(check func(data []byte) error) error {
 		return err
 	}
 	f.orig = data
-	return nil
+	return syncDir(filepath.Dir(f.path))
+}
+
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	err = d.Sync()
+	if cerr := d.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 func writeTmp(tmp string, data []byte) (err error) {

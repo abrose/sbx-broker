@@ -316,6 +316,31 @@ func TestSaveWritesMode0600AtomicNoTmpLeft(t *testing.T) {
 	}
 }
 
+func TestSaveReplacesStaleTmp(t *testing.T) {
+	for _, symlink := range []bool{false, true} {
+		f, dir := open(t, template)
+		tmp := filepath.Join(dir, ".acme.yaml.tmp")
+		outside := filepath.Join(t.TempDir(), "outside")
+		must(t, os.WriteFile(outside, []byte("keep me"), 0o600))
+		if symlink {
+			must(t, os.Symlink(outside, tmp))
+		} else {
+			must(t, os.WriteFile(tmp, []byte("stale"), 0o600))
+		}
+		must(t, f.SetSecret("k", []string{"echo", "x"}))
+		if err := f.Save(func([]byte) error { return nil }); err != nil {
+			t.Fatalf("symlink=%v: %v", symlink, err)
+		}
+		if got, _ := os.ReadFile(filepath.Join(dir, "acme.yaml")); !strings.Contains(string(got), "k:") {
+			t.Errorf("symlink=%v: file = %q", symlink, got)
+		}
+		if got, _ := os.ReadFile(outside); string(got) != "keep me" {
+			t.Errorf("symlink=%v: outside file = %q", symlink, got)
+		}
+		assertOnlyFile(t, dir, "acme.yaml")
+	}
+}
+
 func TestOpenRefusesSymlinkAndGroupWritable(t *testing.T) {
 	dir := newDir(t)
 	real := writeNS(t, dir, "real", template)
