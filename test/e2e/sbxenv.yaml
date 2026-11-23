@@ -1,0 +1,10 @@
+schemaVersion: "1"
+agent: sbx-kit-claude
+kits:
+  - docker.io/docker/sbx-kit-claude:latest
+  - ./kit
+sandboxOptions:
+  template: sbx-stack-base:0
+  pullPolicy: never
+  skills: "off"
+workspace: ./ws

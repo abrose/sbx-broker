@@ -1,4 +1,5 @@
 scratchpad/
-test/e2e/ws/
+test/e2e/ws/*
+!test/e2e/ws/.keep
 /sbx-broker
 .superpowers/

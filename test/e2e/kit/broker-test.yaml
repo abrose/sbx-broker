@@ -1,0 +1,15 @@
+# syntax=docker/sandbox-kit:3
+schemaVersion: "3"
+displayName: sbx-broker test
+description: Opens the broker ports of the test namespace t1 for the end-to-end proof of sbx-broker. Of use only in that proof
+kind: mixin
+version: "0.1.0"
+
+# The rules a project kit needs for its own namespace: one runtime rule per
+# listener port. The port of t2 (29693) stays closed on purpose.
+capabilities:
+  - type: com.docker.sandbox/network-policy@2
+    config:
+      runtime:
+        allow:
+          - hosts: ["localhost:29691", "localhost:29692"]
