@@ -88,6 +88,8 @@ func StartPostgres(t *testing.T) (upstream string, logs func() string) {
 // PGExpect is what one case of pgcases must give.
 type PGExpect struct {
 	Code       string // the SQLSTATE; "" when the login works
+	Message    string // the exact message of the error
+	Violation  string // the message of the violation event the case also logs, if any
 	Row        string // the login query's row, "" for no row
 	Kind       eventlog.Kind
 	Route      string // the alias, or the app's database for an unknown one
@@ -99,14 +101,20 @@ type PGExpect struct {
 
 // PGExpects maps each case of pgcases to what it must give.
 var PGExpects = map[string]PGExpect{
-	"pg-login":             {Row: "app appdb true", Kind: eventlog.KindSwap, Route: "app", User: "app", Secrets: []string{"db-pass"}, Authorized: true},
-	"pg-cancel":            {Code: "57014", Kind: eventlog.KindSwap, Route: "app", User: "app", Secrets: []string{"db-pass"}, Authorized: true, Cancelled: true},
-	"pg-other-namespace":   {Code: "28000", Kind: eventlog.KindRefuse, Route: "app", User: "app"},
-	"pg-failed":            {Code: "57P03", Kind: eventlog.KindRefuse, Route: "down", User: "app", Secrets: []string{"broken"}},
-	"pg-wrong-placeholder": {Code: "28P01", Kind: eventlog.KindRefuse, Route: "app", User: "app"},
-	"pg-unknown-db":        {Code: "3D000", Kind: eventlog.KindRefuse, Route: "nope", User: "app"},
-	"pg-wrong-user":        {Code: "28000", Kind: eventlog.KindRefuse, Route: "app", User: "intruder"},
-	"pg-upstream-refused":  {Code: "28P01", Kind: eventlog.KindUpstream, Route: "stale", User: "app", Secrets: []string{"old-secret"}},
+	"pg-login":  {Row: "app appdb true", Kind: eventlog.KindSwap, Route: "app", User: "app", Secrets: []string{"db-pass"}, Authorized: true},
+	"pg-cancel": {Code: "57014", Message: "canceling statement due to user request", Kind: eventlog.KindSwap, Route: "app", User: "app", Secrets: []string{"db-pass"}, Authorized: true, Cancelled: true},
+	"pg-other-namespace": {Code: "28000", Message: "placeholder of another namespace", Violation: "placeholder of namespace t2",
+		Kind: eventlog.KindRefuse, Route: "app", User: "app"},
+	"pg-failed": {Code: "57P03", Message: "secret not loaded: broken (failed)", Kind: eventlog.KindRefuse, Route: "down", User: "app", Secrets: []string{"broken"}},
+	"pg-wrong-placeholder": {Code: "28P01", Message: `password is not the placeholder of database "app"`,
+		Kind: eventlog.KindRefuse, Route: "app", User: "app"},
+	"pg-unknown-db": {Code: "3D000", Message: `database "nope" is not configured in namespace t1`, Kind: eventlog.KindRefuse, Route: "nope", User: "app"},
+	"pg-wrong-user": {Code: "28000", Message: `user "intruder" may not use database "app"`, Kind: eventlog.KindRefuse, Route: "app", User: "intruder"},
+	"pg-upstream-refused": {Code: "28P01", Message: `upstream: password authentication failed for user "app"`,
+		Kind: eventlog.KindUpstream, Route: "stale", User: "app", Secrets: []string{"old-secret"}},
+	// The sentinel runs after every refused case and must reach the upstream,
+	// so its log line proves the log is complete before the negatives are read.
+	"pg-sentinel": {Row: "app appdb true", Kind: eventlog.KindSwap, Route: "app", User: "app", Secrets: []string{"db-pass"}, Authorized: true},
 }
 
 // maxCancelMS is how long the cancelled query may take: the query sleeps 30 s.
@@ -139,6 +147,9 @@ func AssertPostgres(t *testing.T, outcomes []pgcases.Outcome, upstreamLog string
 		}
 		if o.Code != want.Code {
 			t.Errorf("case %s: code %q, want %q (message %q)", name, o.Code, want.Code, o.Message)
+		}
+		if o.Message != want.Message {
+			t.Errorf("case %s: message %q, want %q", name, o.Message, want.Message)
 		}
 		if o.Row != want.Row {
 			t.Errorf("case %s: row %q, want %q", name, o.Row, want.Row)
@@ -192,46 +203,43 @@ func WaitUpstreamLog(logs func() string) string {
 	}
 }
 
-// IsPGEvent reports whether e is the swap, refuse or upstream event of a
-// Postgres login (it names the app's user).
+// IsPGEvent reports whether e is the swap, refuse, upstream or violation
+// event of a Postgres login (it names the app's user).
 func IsPGEvent(e eventlog.Event) bool {
 	switch e.Kind {
-	case eventlog.KindSwap, eventlog.KindRefuse, eventlog.KindUpstream:
+	case eventlog.KindSwap, eventlog.KindRefuse, eventlog.KindUpstream, eventlog.KindViolation:
 		return e.User != ""
 	}
 	return false
 }
 
 // PGEventKey is the comparable form of a Postgres event: kind, namespace,
-// route, user, secrets and the code at the start of the message.
+// user, route, secrets and the whole message.
 func PGEventKey(e eventlog.Event) string {
-	code, _, _ := strings.Cut(e.Message, " ")
-	if e.Kind == eventlog.KindSwap {
-		code = ""
-	}
-	return pgKey(e.Kind, e.Namespace, e.Route, e.User, e.Secrets, code)
+	return pgKey(e.Kind, e.Namespace, e.Route, e.User, e.Secrets, e.Message)
 }
 
-// PGWantEvents returns the keys of the events the cases must give, sorted.
+// PGWantEvents returns the keys of the events the cases must give, sorted: the
+// swap, refuse or upstream event of each case, and the violation event of a
+// case that logs one.
 func PGWantEvents() []string {
 	var out []string
 	for _, w := range PGExpects {
-		out = append(out, pgKey(w.Kind, "t1", w.Route, w.User, w.Secrets, wantEventCode(w)))
+		msg := "login"
+		if w.Kind != eventlog.KindSwap {
+			msg = w.Code + " " + w.Message
+		}
+		out = append(out, pgKey(w.Kind, "t1", w.Route, w.User, w.Secrets, msg))
+		if w.Violation != "" {
+			out = append(out, pgKey(eventlog.KindViolation, "t1", w.Route, w.User, nil, w.Violation))
+		}
 	}
 	sort.Strings(out)
 	return out
 }
 
-// wantEventCode is the code in the message of the event: a swap says "login".
-func wantEventCode(w PGExpect) string {
-	if w.Kind == eventlog.KindSwap {
-		return ""
-	}
-	return w.Code
-}
-
-func pgKey(kind eventlog.Kind, ns, route, user string, secrets []string, code string) string {
+func pgKey(kind eventlog.Kind, ns, route, user string, secrets []string, msg string) string {
 	s := slices.Clone(secrets)
 	sort.Strings(s)
-	return fmt.Sprintf("%s %s %s@%s %v %s", kind, ns, user, route, s, code)
+	return fmt.Sprintf("%s %s %s@%s %v %s", kind, ns, user, route, s, msg)
 }

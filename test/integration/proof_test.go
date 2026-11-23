@@ -147,7 +147,7 @@ func waitForCaseEvents(t *testing.T, state string, n int) []eventlog.Event {
 func httpEvents(events []eventlog.Event) []eventlog.Event {
 	var out []eventlog.Event
 	for _, e := range events {
-		if e.User == "" && (e.Route == "api" || e.Route == "idp") {
+		if e.User == "" && (e.Kind == eventlog.KindSwap || e.Kind == eventlog.KindRefuse) && (e.Route == "api" || e.Route == "idp") {
 			out = append(out, e)
 		}
 	}
@@ -166,7 +166,7 @@ func caseEvents(t *testing.T, state string) []eventlog.Event {
 		if err := json.Unmarshal([]byte(line), &e); err != nil {
 			t.Fatalf("broker.log: %v", err)
 		}
-		if e.Kind == eventlog.KindSwap || e.Kind == eventlog.KindRefuse || e.Kind == eventlog.KindUpstream {
+		if e.Kind == eventlog.KindSwap || e.Kind == eventlog.KindRefuse || e.Kind == eventlog.KindUpstream || e.Kind == eventlog.KindViolation {
 			out = append(out, e)
 		}
 	}

@@ -56,6 +56,9 @@ var all = []login{
 	{"pg-unknown-db", "nope", "app", DBPass, nil},
 	{"pg-wrong-user", "app", "intruder", DBPass, nil},
 	{"pg-upstream-refused", "stale", "app", cases.OldSecret, nil},
+	// The sentinel is last: the upstream's log line of this login comes after
+	// the lines of any refused case that wrongly reached the upstream.
+	{"pg-sentinel", "app", "app", DBPass, queryRow},
 }
 
 // Run connects to the proxy at addr once per case, one after the other, and
