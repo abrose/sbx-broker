@@ -207,6 +207,12 @@ func (p *Postgres) serve(app net.Conn) {
 	if l.db == "" {
 		l.db = l.user // as PostgreSQL does
 	}
+	// A replication connection streams the WAL of the whole cluster, past
+	// the entry's dbname and the table grants.
+	if _, ok := st.Params["replication"]; ok {
+		p.refuse(app, l, &pgRefusal{Code: "0A000", Message: "replication connections are not supported", Kind: eventlog.KindRefuse})
+		return
+	}
 	password, err := readPassword(app)
 	if err != nil {
 		p.protocolError(app, &l, err)

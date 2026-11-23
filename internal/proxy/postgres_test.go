@@ -767,6 +767,27 @@ func TestPGProtocolErrors(t *testing.T) {
 	})
 }
 
+// TestPGRefusesReplication: a replication connection would stream the WAL of
+// the whole cluster, past the entry's dbname and the table grants.
+func TestPGRefusesReplication(t *testing.T) {
+	fake := startFakePG(t, nil)
+	p, l := newPG(t, pgEntries(fake.addr))
+	startPG(t, p)
+	a := dialPG(t, p)
+	a.send(&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersion30,
+		Parameters: map[string]string{"user": "app", "database": "app", "replication": "database"}})
+	a.wantFatal("0A000", "replication connections are not supported")
+	if n := fake.connCount(); n != 0 {
+		t.Errorf("the fake got %d connections", n)
+	}
+	events := l.Recent(1000)
+	if len(events) != 1 {
+		t.Fatalf("events %+v", events)
+	}
+	wantEvent(t, events[0], eventlog.Event{Kind: eventlog.KindRefuse, Route: "app", User: "app",
+		Message: "0A000 replication connections are not supported"})
+}
+
 // TestPGCancelCloses: until cancels are forwarded, a cancel request ends the
 // connection with no answer and no event.
 func TestPGCancelCloses(t *testing.T) {
