@@ -21,8 +21,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/abrose/sbx-broker/internal/eventlog"
 	"github.com/abrose/sbx-broker/test/cases"
 	"github.com/abrose/sbx-broker/test/harness"
+	"github.com/abrose/sbx-broker/test/pgcases"
 )
 
 const (
@@ -69,9 +71,10 @@ func TestEndToEnd(t *testing.T) {
 	run(t, ctx, stepWait, dir, nil, "sbx", "kit", "validate", filepath.Join(dir, "kit"))
 
 	base, records := harness.StartRecorder(t)
-	// The e2e proof runs no Postgres case: the broker only needs a valid
-	// upstream address, and connects to it only on a login.
-	harness.StartBroker(t, harness.ProofNamespaces(base, "127.0.0.1:5432"))
+	// The Postgres binds 127.0.0.1 on this Mac; the broker dials it, the
+	// sandbox never reaches it directly.
+	pgUpstream, pgLogs := harness.StartPostgres(t)
+	_, state := harness.StartBroker(t, harness.ProofNamespaces(base, pgUpstream))
 	harness.ClearRecords(t, records)
 
 	// Registered first: a failed removal of a leftover stops the test, and
@@ -92,7 +95,36 @@ func TestEndToEnd(t *testing.T) {
 	out := run(t, ctx, stepWait, dir, nil, "sbx", "exec", sandbox, "--",
 		filepath.Join(ws, clientName), "-routes", routesFlag(), "-placeholders", placeholdersFlag())
 	t.Logf("ran the cases in the sandbox in %v", since(start))
-	outcomes := harness.OutcomesByCase(t, decodeOutcomes(t, out))
+	outcomes := harness.OutcomesByCase(t, decodeOutcomes[cases.Outcome](t, out))
+
+	// The sandbox reaches the Mac's loopback at host.docker.internal also for
+	// raw TCP, through the kit rule localhost:29694. The cancel case opens a
+	// second connection to the same host:port, so it needs no other rule.
+	start = time.Now()
+	pgAddr := fmt.Sprintf("%s:%d", hostAlias, harness.PortT1PG)
+	out = run(t, ctx, stepWait, dir, nil, "sbx", "exec", sandbox, "--",
+		filepath.Join(ws, clientName), "-postgres", pgAddr, "-placeholders", placeholdersFlag())
+	t.Logf("ran the Postgres cases in the sandbox in %v", since(start))
+	t.Run("8-postgres", func(t *testing.T) {
+		harness.AssertPostgres(t, decodeOutcomes[pgcases.Outcome](t, out), harness.WaitUpstreamLog(pgLogs))
+	})
+
+	// A raw TCP connect to the closed port 29695 is cut by the sbx proxy: the
+	// exit code does not matter, only that the broker never saw a login.
+	t.Run("t2-postgres-closed", func(t *testing.T) {
+		_, errOut, err := command(ctx, stepWait, dir, nil, "sbx", "exec", sandbox, "--", "bash", "-c",
+			fmt.Sprintf("exec 3<>/dev/tcp/%s/%d", hostAlias, harness.PortT2PG))
+		t.Logf("raw connect to %s:%d from the sandbox: err %v, stderr %q", hostAlias, harness.PortT2PG, err, errOut)
+		// The reload and fetch events of t2 at its start are no login.
+		for _, e := range brokerEvents(t, state) {
+			switch e.Kind {
+			case eventlog.KindSwap, eventlog.KindRefuse, eventlog.KindUpstream, eventlog.KindViolation, eventlog.KindClose:
+				if e.Namespace == "t2" {
+					t.Errorf("broker.log has a login event of namespace t2: %+v", e)
+				}
+			}
+		}
+	})
 
 	t.Run("t2-port-closed", func(t *testing.T) {
 		url := fmt.Sprintf("http://%s:%d/echo", hostAlias, harness.PortT2API)
@@ -108,10 +140,14 @@ func TestEndToEnd(t *testing.T) {
 	harness.AssertProof(t, outcomes, harness.RecordsByCase(harness.Records(t, records)))
 
 	t.Run("policy-log", func(t *testing.T) {
+		// No entry is wanted for the blocked raw TCP port 29695: the policy log
+		// of this sbx version does not list a blocked raw connect, so t2-postgres-closed
+		// proves that block through broker.log alone.
 		want := map[string]string{
 			fmt.Sprintf("localhost:%d", harness.PortT1API): "allowed",
 			fmt.Sprintf("localhost:%d", harness.PortT1IdP): "allowed",
 			fmt.Sprintf("localhost:%d", harness.PortT2API): "blocked",
+			fmt.Sprintf("localhost:%d", harness.PortT1PG):  "allowed",
 		}
 		var missing []string
 		deadline := time.Now().Add(policyWait)
@@ -225,17 +261,35 @@ func placeholdersFlag() string {
 	return strings.Join(pairs, ",")
 }
 
-// decodeOutcomes reads one JSON outcome per line.
-func decodeOutcomes(t *testing.T, out string) []cases.Outcome {
+// brokerEvents reads every event of the broker's log.
+func brokerEvents(t *testing.T, state string) []eventlog.Event {
 	t.Helper()
-	var list []cases.Outcome
+	data, err := os.ReadFile(filepath.Join(state, "broker.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var list []eventlog.Event
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var e eventlog.Event
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("broker.log: %v", err)
+		}
+		list = append(list, e)
+	}
+	return list
+}
+
+// decodeOutcomes reads one JSON outcome per line.
+func decodeOutcomes[T any](t *testing.T, out string) []T {
+	t.Helper()
+	var list []T
 	sc := bufio.NewScanner(strings.NewReader(out))
 	sc.Buffer(nil, 1<<20)
 	for sc.Scan() {
 		if strings.TrimSpace(sc.Text()) == "" {
 			continue
 		}
-		var o cases.Outcome
+		var o T
 		if err := json.Unmarshal(sc.Bytes(), &o); err != nil {
 			t.Fatalf("the test client printed a line that is no outcome: %q: %v", sc.Text(), err)
 		}

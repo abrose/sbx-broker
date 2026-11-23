@@ -2,9 +2,12 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"maps"
 	"strings"
 	"testing"
+
+	"github.com/abrose/sbx-broker/test/pgcases"
 )
 
 const goodRoutes = "api=http://host.docker.internal:29691,idp=http://host.docker.internal:29692"
@@ -17,6 +20,29 @@ func TestPairs(t *testing.T) {
 	want := map[string]string{"api": "http://host.docker.internal:29691", "idp": "http://host.docker.internal:29692"}
 	if !maps.Equal(got, want) {
 		t.Errorf("pairs: %v, want %v", got, want)
+	}
+}
+
+// TestPostgresMode: -postgres with -placeholders is accepted and prints one
+// outcome per Postgres case, each with a connection error, and exits 0.
+func TestPostgresMode(t *testing.T) {
+	var out, errOut bytes.Buffer
+	// A closed loopback port: the connection is refused at once.
+	if code := run([]string{"-postgres", "127.0.0.1:1", "-placeholders", "a=b"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit %d, want 0 (stderr %q)", code, errOut.String())
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 9 {
+		t.Fatalf("%d outcome lines, want 9:\n%s", len(lines), out.String())
+	}
+	for _, l := range lines {
+		var o pgcases.Outcome
+		if err := json.Unmarshal([]byte(l), &o); err != nil {
+			t.Fatalf("line %q is no outcome: %v", l, err)
+		}
+		if o.Case == "" || o.Message == "" || o.Code != "" || o.Row != "" {
+			t.Errorf("outcome %+v: want a case and a connection error without code or row", o)
+		}
 	}
 }
 
@@ -33,8 +59,11 @@ func TestBadFlags(t *testing.T) {
 		{"empty value", []string{"-routes", goodRoutes, "-placeholders", "pass="}, `entry "pass=" is not key=value`},
 		{"empty key", []string{"-routes", "=http://a:1", "-placeholders", "pass=sbxb_t1_pass"}, `entry "=http://a:1" is not key=value`},
 		{"stray argument", []string{"-routes", goodRoutes, "-placeholders", "pass=sbxb_t1_pass", "extra"}, `unexpected argument "extra"`},
-		{"no placeholders", []string{"-routes", goodRoutes}, "both -routes and -placeholders are required"},
+		{"no placeholders", []string{"-routes", goodRoutes}, "-placeholders is required"},
 		{"unknown flag", []string{"-nope"}, "flag provided but not defined: -nope"},
+		{"routes and postgres", []string{"-routes", goodRoutes, "-postgres", "h:1", "-placeholders", "a=b"}, "exactly one of -routes and -postgres"},
+		{"neither routes nor postgres", []string{"-placeholders", "a=b"}, "exactly one of -routes and -postgres"},
+		{"postgres without placeholders", []string{"-postgres", "h:1"}, "-placeholders is required"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

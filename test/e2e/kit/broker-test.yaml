@@ -6,10 +6,11 @@ kind: mixin
 version: "0.1.0"
 
 # The rules a project kit needs for its own namespace: one runtime rule per
-# listener port. The port of t2 (29693) stays closed on purpose.
+# listener port. The ports of t2 (29693 HTTP, 29695 Postgres) stay closed on
+# purpose.
 capabilities:
   - type: com.docker.sandbox/network-policy@2
     config:
       runtime:
         allow:
-          - hosts: ["localhost:29691", "localhost:29692"]
+          - hosts: ["localhost:29691", "localhost:29692", "localhost:29694"]

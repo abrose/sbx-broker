@@ -48,6 +48,13 @@ sandbox `check-broker`. The test kit in `test/e2e/kit` opens only the ports of `
 29693 gets the sbx proxy's 403 and shows as blocked in `sbx policy log`. The test removes the sandbox at the end, also
 after a failure.
 
+The proof covers Postgres too. The real Postgres container binds 127.0.0.1 on the Mac and only the broker dials it. The
+test client runs the cases of `test/pgcases` in the sandbox with `-postgres host.docker.internal:29694`, which the kit
+rule `localhost:29694` allows, also for raw TCP, and the same assertions as the integration proof check the outcomes
+and the server's log. A raw TCP connect from the sandbox to the closed port 29695 must leave no `t2` event in
+`broker.log`. The policy log lists `localhost:29694` as allowed, but it shows no entry for a blocked raw TCP connect, so
+the block of 29695 is proved through `broker.log` alone.
+
 ### Prerequisites
 
 - The test runs sbx only in the instance `check`. Plain `sbx` must be the wrapper of sbx-instances, which picks the
