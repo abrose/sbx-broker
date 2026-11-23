@@ -7,6 +7,7 @@ The broker is proved at three levels:
 | Unit | `go test ./...` | Go |
 | Integration | `go test -tags integration ./test/integration/` | Docker; the fixed ports 29691 to 29695 free |
 | End to end | `go test -tags e2e -timeout 20m ./test/e2e/` | sbx; the `sbx-instance` wrapper of sbx-instances in `PATH`, with the instance `check` selected for this folder; the template `sbx-stack-base:0` in that instance |
+| launchd | `go test -tags launchd -run TestLaunchdAgent -v ./internal/launchd` | macOS, a logged-in GUI session (the `gui/<uid>` domain) |
 
 Go caches a passing result and then prints `(cached)` without running the proof. Add `-count=1` to run it again, for
 example after an sbx update.
@@ -69,3 +70,27 @@ the block.
 Each run leaves a pending network approval for `localhost:29693` in the instance, because the port stays closed on
 purpose. The test never approves it. You can review these requests with `sbx policy approval ls` and reject or dismiss
 them; do not grant them.
+
+## launchd
+
+```sh
+go test -tags launchd -run TestLaunchdAgent -v ./internal/launchd
+```
+
+The proof builds `sbx-broker` into a temp dir and runs it as a real launchd agent with the label
+`io.github.abrose.sbx-broker.test`. The plist and the config dir are in temp dirs, the state dir is under `/tmp`, so the
+proof never touches your own agent `io.github.abrose.sbx-broker`, its plist or its dirs. The test namespace's fetch
+command `fake-fetch` lives only in a temp bin dir that the plist's `PATH` names, so a secret in state `ok` proves that
+the agent uses the captured `PATH`. The test asserts:
+
+- the secret is `ok` within 75 s;
+- after `Uninstall`, `launchctl print gui/<uid>/io.github.abrose.sbx-broker.test` fails, the plist is gone, and no
+  process holds the state dir's lock.
+
+The test boots out a test agent left by an interrupted run before it starts, and its cleanup boots the agent out after
+a failure. To check by hand that nothing is left:
+
+```sh
+launchctl print gui/$(id -u)/io.github.abrose.sbx-broker.test   # must fail
+launchctl bootout gui/$(id -u)/io.github.abrose.sbx-broker.test # only if it did not
+```

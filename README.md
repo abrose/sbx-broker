@@ -79,7 +79,8 @@ sequenceDiagram
 | The CLI (`serve`, `status`, `refresh`, `reload`, `log`) | ready |
 | A Postgres proxy (placeholder as the database password) | ready |
 | A TUI (`sbx-broker`): namespaces, secrets, a secret's details, a confirmed reveal | ready |
-| Edit forms, routes and the live log in the TUI, and a launchd agent | coming |
+| Edit forms, routes and the live log in the TUI | ready |
+| A launchd agent (`install`, `uninstall`) | ready |
 
 It is made and tested for macOS.
 
@@ -91,10 +92,16 @@ You need macOS, Go 1.27, Docker Sandboxes, and a command-line tool for your secr
 
 ```sh
 go install ./cmd/sbx-broker      # from a clone of this repo; or: go build ./cmd/sbx-broker
-sbx-broker serve
+sbx-broker install
 ```
 
-Keep `serve` running, for example in its own terminal tab. A launchd agent that starts it at login is coming.
+`install` runs `sbx-broker serve` as a launchd agent: it starts now, at each login, and again after a crash. Run it
+from a shell whose `PATH` finds your secrets tool (`op`, `gopass`, ...): the agent keeps that `PATH`. It prints
+`the broker answers on <socket>` when the broker is up; its output goes to `serve.log` in the state directory. Run
+`install` again after you move the binary or change `PATH`, and `sbx-broker uninstall` to remove the agent. See
+[the CLI](docs/cli.md#install-and-uninstall).
+
+To run the broker in a terminal instead, for example to watch it, run `sbx-broker serve` and keep it running.
 
 ### 2. Describe the project's secrets and services
 

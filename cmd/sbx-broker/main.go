@@ -20,6 +20,7 @@ import (
 
 	"github.com/abrose/sbx-broker/internal/admin"
 	"github.com/abrose/sbx-broker/internal/eventlog"
+	"github.com/abrose/sbx-broker/internal/launchd"
 	"github.com/abrose/sbx-broker/internal/secrets"
 	"github.com/abrose/sbx-broker/internal/server"
 	"github.com/abrose/sbx-broker/internal/tui"
@@ -38,13 +39,17 @@ commands:
   log [-f] [<ns>]            the last 100 events; -f follows new ones
   edit [<ns>]                open the namespace file in $VISUAL or $EDITOR
   init <ns>                  mark this folder as a project of <ns> and create its namespace file
+  install                    run serve as a launchd agent: at login and again after a
+                             crash, with the PATH and SBX_BROKER_* of this shell
+  uninstall                  stop the launchd agent and remove it
   help                       this text
 
 <ns> defaults to the name in a .sbx-broker file in this folder or above.
 
 environment:
   SBX_BROKER_CONFIG_DIR      the namespace files (default ~/.config/sbx-broker/namespaces)
-  SBX_BROKER_STATE_DIR       admin.sock, admin.lock and broker.log (default ~/.local/state/sbx-broker)
+  SBX_BROKER_STATE_DIR       admin.sock, admin.lock, broker.log and the launchd agent's serve.log
+                             (default ~/.local/state/sbx-broker)
   SBX_BROKER_FETCH_TIMEOUT   the timeout of a fetch command, a Go duration (default 60s)
 `
 
@@ -61,7 +66,8 @@ func main() {
 
 // run runs one command and returns the exit code.
 func run(args []string, getenv func(string) string, stdout, stderr io.Writer) int {
-	c := &command{getenv: getenv, getwd: os.Getwd, runEditor: runTerminal, tui: tui.Run, stdout: stdout, stderr: stderr}
+	c := &command{getenv: getenv, getwd: os.Getwd, home: os.UserHomeDir, runEditor: runTerminal, tui: tui.Run,
+		launchctl: launchd.Real, agentWait: agentWait, stdout: stdout, stderr: stderr}
 	return c.run(args)
 }
 
@@ -89,6 +95,10 @@ func (c *command) run(args []string) int {
 		return c.edit(rest)
 	case cmd == "init" && len(rest) == 1:
 		return c.initProject(rest[0])
+	case cmd == "install" && len(rest) == 0:
+		return c.install()
+	case cmd == "uninstall" && len(rest) == 0:
+		return c.uninstall()
 	case cmd == "log":
 		if follow, ns, ok := logArgs(rest); ok {
 			return c.log(follow, ns)
@@ -112,14 +122,18 @@ func logArgs(args []string) (follow bool, ns string, ok bool) {
 	return follow, ns, true
 }
 
-// command runs one CLI command with its environment and output. getwd,
-// runEditor and tui are fields so that tests never use the real current
-// folder, start an editor or take over the terminal.
+// command runs one CLI command with its environment and output. getwd, home,
+// runEditor, tui and launchctl are fields so that tests never use the real
+// current folder or home dir, start an editor, take over the terminal or
+// touch the owner's launchd agent.
 type command struct {
 	getenv         func(string) string
 	getwd          func() (string, error)
+	home           func() (string, error)
 	runEditor      func(dir string, argv []string) error
 	tui            func(cl tui.Client, opt tui.Options) error
+	launchctl      launchd.Launchctl
+	agentWait      time.Duration // how long install waits for the agent's broker to answer
 	stdout, stderr io.Writer
 }
 
@@ -187,7 +201,7 @@ func (c *command) dir(key string, def ...string) (string, error) {
 	if v := c.getenv(key); v != "" {
 		return v, nil
 	}
-	home, err := os.UserHomeDir()
+	home, err := c.home()
 	if err != nil {
 		return "", fmt.Errorf("%s is not set and %w", key, err)
 	}
@@ -202,14 +216,35 @@ func (c *command) stateDir() (string, error) {
 // would point the editor at the wrong file.
 func (c *command) configDir() (string, error) {
 	cfg, err := c.dir("SBX_BROKER_CONFIG_DIR", ".config", "sbx-broker", "namespaces")
-	if err != nil || filepath.IsAbs(cfg) {
-		return cfg, err
+	if err != nil {
+		return "", err
+	}
+	return c.abs(cfg)
+}
+
+// abs returns path joined to the current folder when it is relative.
+func (c *command) abs(path string) (string, error) {
+	if filepath.IsAbs(path) {
+		return path, nil
 	}
 	wd, err := c.getwd()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(wd, cfg), nil
+	return filepath.Join(wd, path), nil
+}
+
+// fetchTimeout returns SBX_BROKER_FETCH_TIMEOUT, or 0 when it is not set.
+func (c *command) fetchTimeout() (time.Duration, error) {
+	v := c.getenv("SBX_BROKER_FETCH_TIMEOUT")
+	if v == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("SBX_BROKER_FETCH_TIMEOUT %q is not a positive Go duration", v)
+	}
+	return d, nil
 }
 
 func (c *command) serve() int {
@@ -221,14 +256,11 @@ func (c *command) serve() int {
 	if err != nil {
 		return c.fail(err)
 	}
-	opt := server.Options{ConfigDir: cfg, StateDir: state}
-	if v := c.getenv("SBX_BROKER_FETCH_TIMEOUT"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil || d <= 0 {
-			return c.fail(fmt.Errorf("SBX_BROKER_FETCH_TIMEOUT %q is not a positive Go duration", v))
-		}
-		opt.FetchTimeout = d
+	timeout, err := c.fetchTimeout()
+	if err != nil {
+		return c.fail(err)
 	}
+	opt := server.Options{ConfigDir: cfg, StateDir: state, FetchTimeout: timeout}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := server.Run(ctx, opt); err != nil {
@@ -330,6 +362,114 @@ func (c *command) reload() int {
 	}
 	fmt.Fprintln(c.stdout, "reloaded")
 	return exitOK
+}
+
+const (
+	agentLabel = "io.github.abrose.sbx-broker"
+	// agentWait is the 60 s default fetch timeout plus a margin.
+	agentWait = 75 * time.Second
+	agentPoll = 250 * time.Millisecond
+)
+
+// install runs serve as the launchd agent and waits for its broker to
+// answer. It refuses while a broker that is not the agent answers (C8): two
+// brokers would fight over the lock, and KeepAlive would restart the loser.
+func (c *command) install() int {
+	a, err := c.agent()
+	if err != nil {
+		return c.fail(err)
+	}
+	state := filepath.Dir(a.LogPath)
+	if answers(state) && !launchd.Loaded(c.launchctl, a.Label) {
+		return c.fail(fmt.Errorf("a broker already runs on %s, not as the launchd agent: stop it, then run sbx-broker install again",
+			admin.SocketPath(state)))
+	}
+	if err := launchd.Install(a, c.launchctl); err != nil {
+		return c.fail(err)
+	}
+	for deadline := time.Now().Add(c.agentWait); !answers(state); time.Sleep(agentPoll) {
+		if time.Now().After(deadline) {
+			fmt.Fprintf(c.stderr, "installed %s, but the broker does not answer; see %s\n", a.PlistPath, a.LogPath)
+			return exitFail
+		}
+	}
+	fmt.Fprintf(c.stdout, "installed %s\nthe broker answers on %s\n", a.PlistPath, admin.SocketPath(state))
+	return exitOK
+}
+
+func (c *command) uninstall() int {
+	plist, err := c.plistPath()
+	if err != nil {
+		return c.fail(err)
+	}
+	removed, err := launchd.Uninstall(launchd.Agent{Label: agentLabel, PlistPath: plist}, c.launchctl)
+	if err != nil {
+		return c.fail(err)
+	}
+	if removed {
+		fmt.Fprintf(c.stdout, "removed %s\n", plist)
+	} else {
+		fmt.Fprintln(c.stdout, "not installed")
+	}
+	return exitOK
+}
+
+func (c *command) plistPath() (string, error) {
+	home, err := c.home()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "Library", "LaunchAgents", agentLabel+".plist"), nil
+}
+
+// agent is the launchd agent of this shell: the running binary, the shell's
+// PATH, and the SBX_BROKER_* variables that are set, the dirs made absolute.
+// No other variable reaches the agent. Its log is serve.log in the state dir.
+func (c *command) agent() (launchd.Agent, error) {
+	plist, err := c.plistPath()
+	if err != nil {
+		return launchd.Agent{}, err
+	}
+	state, err := c.stateDir()
+	if err == nil {
+		state, err = c.abs(state)
+	}
+	if err != nil {
+		return launchd.Agent{}, err
+	}
+	if _, err := c.fetchTimeout(); err != nil {
+		return launchd.Agent{}, err
+	}
+	env := map[string]string{}
+	for _, k := range []string{"PATH", "SBX_BROKER_CONFIG_DIR", "SBX_BROKER_STATE_DIR", "SBX_BROKER_FETCH_TIMEOUT"} {
+		v := c.getenv(k)
+		if v == "" {
+			continue
+		}
+		if strings.HasSuffix(k, "_DIR") {
+			if v, err = c.abs(v); err != nil {
+				return launchd.Agent{}, err
+			}
+		}
+		env[k] = v
+	}
+	exe, err := os.Executable()
+	if err == nil {
+		exe, err = filepath.EvalSymlinks(exe)
+	}
+	if err != nil {
+		return launchd.Agent{}, fmt.Errorf("the path of this binary: %w", err)
+	}
+	return launchd.Agent{Label: agentLabel, PlistPath: plist, Program: exe, Env: env, LogPath: filepath.Join(state, "serve.log")}, nil
+}
+
+// answers reports whether a broker answers status on the socket in state.
+func answers(state string) bool {
+	cl, err := admin.Dial(state)
+	if err != nil {
+		return false
+	}
+	return cl.Do(admin.Request{Op: "status"}, func(admin.Response) error { return nil }) == nil
 }
 
 // log shows the events of one namespace (the argument or the marker's) or,

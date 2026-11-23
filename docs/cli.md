@@ -11,6 +11,9 @@ sbx-broker reload                      read the namespace files again now and re
 sbx-broker log [-f] [<ns>]             the last 100 events; -f follows new ones
 sbx-broker edit [<ns>]                 open the namespace file in $VISUAL or $EDITOR
 sbx-broker init <ns>                   mark this folder as a project of <ns> and create its namespace file
+sbx-broker install                     run serve as a launchd agent: at login and again after a crash,
+                                       with the PATH and SBX_BROKER_* of this shell
+sbx-broker uninstall                   stop the launchd agent and remove it
 sbx-broker help                        the usage
 ```
 
@@ -149,6 +152,38 @@ file within about 2 s. For a namespace with no file, `edit` names `sbx-broker in
 3. It creates `<ns>.yaml` with mode 0600 from a template of comments. It never overwrites a namespace file.
 
 The broker loads the template as an empty namespace. Fill it with `sbx-broker edit`.
+
+## `install` and `uninstall`
+
+`install` makes `serve` a per-user launchd agent, so the broker starts at login and starts again after a crash.
+
+1. It writes `~/Library/LaunchAgents/io.github.abrose.sbx-broker.plist` (mode 0644; it holds no secret). The agent runs
+   the absolute path of this `sbx-broker` binary with `serve`, with `RunAtLoad` and `KeepAlive` `{SuccessfulExit: false}`:
+   launchd starts it again when it exits with an error, not after a clean stop.
+2. The agent gets `PATH` of the shell that runs `install`, so a fetch command such as `op` or `gopass` in
+   `/opt/homebrew/bin` is found. It also gets `SBX_BROKER_CONFIG_DIR`, `SBX_BROKER_STATE_DIR` and
+   `SBX_BROKER_FETCH_TIMEOUT` when they are set, the two dirs as absolute paths. No other variable reaches it.
+3. Its stdout and stderr go to `serve.log` in the state directory.
+4. It loads the agent in the `gui/<uid>` domain, which starts it, and waits up to 75 s (the 60 s fetch timeout plus a
+   margin) for the broker to answer:
+
+```text
+installed /Users/<you>/Library/LaunchAgents/io.github.abrose.sbx-broker.plist
+the broker answers on /Users/<you>/.local/state/sbx-broker/admin.sock
+```
+
+With no answer in 75 s it prints `installed <plist>, but the broker does not answer; see <state>/serve.log` and exits 1.
+
+`install` again replaces the agent: it stops the running agent and starts it with the new plist. Run it again after you
+move the binary or change `PATH`. It refuses while a broker that is not the agent answers on the socket, for example a
+`serve` in a terminal, because two brokers would fight over the state directory's lock:
+
+```text
+sbx-broker: a broker already runs on <state>/admin.sock, not as the launchd agent: stop it, then run sbx-broker install again
+```
+
+`uninstall` stops the agent and removes the plist. It prints `removed <plist>`, or `not installed` when there was
+neither.
 
 ## `log`
 

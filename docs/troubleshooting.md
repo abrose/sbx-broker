@@ -52,6 +52,14 @@ Do not approve the request by hand.
 - **The broker does not start:** `a broker already runs` means another `serve` holds the state directory. A refused
   namespace file is not owned by your user, is group- or world-writable, or is a symlink (see
   [configuration.md](configuration.md#file-ownership)).
+- **The launchd agent does not start:** `install` says `the broker does not answer; see <state>/serve.log`. That file
+  holds the agent's stdout and stderr, for example a refused namespace file or `a broker already runs`. `launchctl print
+  gui/$(id -u)/io.github.abrose.sbx-broker` shows whether launchd knows the agent and its last exit code.
+- **A fetch command is not found under launchd:** the agent has the `PATH` of the shell that ran `install`, not the
+  `PATH` of a later shell. Run `sbx-broker install` again from a shell whose `PATH` finds the command
+  (`command -v op`).
+- **`install` refuses: `a broker already runs on <socket>, not as the launchd agent`:** a `serve` runs, for example in
+  a terminal tab. Stop it, then run `sbx-broker install` again.
 - **A port did not open:** another process used it. Free it, then run `sbx-broker reload`.
 - **A placeholder reached the upstream unchanged:** the body was not scanned. Check the log for `unscanned` and the
   [request limits](how-it-works.md#request-limits).

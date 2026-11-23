@@ -8,12 +8,14 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/abrose/sbx-broker/internal/admin"
 	"github.com/abrose/sbx-broker/internal/eventlog"
+	"github.com/abrose/sbx-broker/internal/launchd"
 	"github.com/abrose/sbx-broker/internal/secrets"
 	"github.com/abrose/sbx-broker/internal/server"
 	"github.com/abrose/sbx-broker/internal/tui"
@@ -21,16 +23,23 @@ import (
 
 // noProject is an empty folder with no marker in it: the current folder of
 // cli, so that a marker above the real current folder never changes a test.
-var noProject string
+// fakeHome is the home dir of cli, so that no test reads or writes the
+// owner's real dirs or ~/Library/LaunchAgents.
+var noProject, fakeHome string
 
 func TestMain(m *testing.M) {
 	dir, err := os.MkdirTemp("", "sbxb-noproject")
 	if err != nil {
 		panic(err)
 	}
-	noProject = dir
+	home, err := os.MkdirTemp("", "sbxb-home")
+	if err != nil {
+		panic(err)
+	}
+	noProject, fakeHome = dir, home
 	code := m.Run()
 	_ = os.RemoveAll(dir)
+	_ = os.RemoveAll(home)
 	os.Exit(code)
 }
 
@@ -45,17 +54,206 @@ func cliIn(dir string, env map[string]string, args ...string) (int, string, stri
 
 // cliTUI is cliIn with run as the TUI.
 func cliTUI(dir string, env map[string]string, run func(tui.Client, tui.Options) error, args ...string) (int, string, string) {
-	var out, errOut bytes.Buffer
-	c := &command{
-		getenv:    func(k string) string { return env[k] },
-		getwd:     func() (string, error) { return dir, nil },
-		runEditor: func(string, []string) error { return errors.New("no editor in tests") },
-		tui:       run,
-		stdout:    &out,
-		stderr:    &errOut,
-	}
+	c, out, errOut := testCommand(dir, env)
+	c.tui = run
 	code := c.run(args)
 	return code, out.String(), errOut.String()
+}
+
+// testCommand returns a command with dir as the current folder, fakeHome as
+// the home dir, and no editor, TUI or launchctl.
+func testCommand(dir string, env map[string]string) (c *command, out, errOut *bytes.Buffer) {
+	out, errOut = &bytes.Buffer{}, &bytes.Buffer{}
+	c = &command{
+		getenv:    func(k string) string { return env[k] },
+		getwd:     func() (string, error) { return dir, nil },
+		home:      func() (string, error) { return fakeHome, nil },
+		runEditor: func(string, []string) error { return errors.New("no editor in tests") },
+		tui:       func(tui.Client, tui.Options) error { return errors.New("no TUI in tests") },
+		launchctl: func(...string) ([]byte, error) { return nil, errors.New("no launchctl in tests") },
+		agentWait: time.Second,
+		stdout:    out,
+		stderr:    errOut,
+	}
+	return c, out, errOut
+}
+
+// fakeLaunchctl knows one agent: print succeeds while it is loaded,
+// bootstrap loads it and bootout unloads it.
+type fakeLaunchctl struct {
+	loaded bool
+	calls  []string
+}
+
+func (f *fakeLaunchctl) run(args ...string) ([]byte, error) {
+	f.calls = append(f.calls, args[0])
+	switch args[0] {
+	case "print":
+		if !f.loaded {
+			return nil, errors.New("exit status 113")
+		}
+	case "bootstrap":
+		f.loaded = true
+	case "bootout":
+		f.loaded = false
+	}
+	return nil, nil
+}
+
+// agentCLI runs install or uninstall with f as launchctl, home as the home
+// dir and dir as the current folder. It returns the plist path too.
+func agentCLI(t *testing.T, dir, home string, env map[string]string, f *fakeLaunchctl, args ...string) (code int, out, errOut, plist string) {
+	t.Helper()
+	c, o, e := testCommand(dir, env)
+	c.home = func() (string, error) { return home, nil }
+	c.launchctl = f.run
+	c.agentWait = 300 * time.Millisecond
+	code = c.run(args)
+	return code, o.String(), e.String(), filepath.Join(home, "Library", "LaunchAgents", "io.github.abrose.sbx-broker.plist")
+}
+
+func TestInstallRefusesTerminalBroker(t *testing.T) {
+	env, _ := broker(t)
+	f := &fakeLaunchctl{}
+	code, out, errOut, plist := agentCLI(t, noProject, t.TempDir(), env, f, "install")
+	sock := filepath.Join(env["SBX_BROKER_STATE_DIR"], "admin.sock")
+	want := "sbx-broker: a broker already runs on " + sock + ", not as the launchd agent: stop it, then run sbx-broker install again\n"
+	if code != 1 || out != "" || errOut != want {
+		t.Fatalf("code %d, out %q, err %q", code, out, errOut)
+	}
+	if _, err := os.Stat(plist); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a plist was written: %v", err)
+	}
+	if !slices.Equal(f.calls, []string{"print"}) {
+		t.Fatalf("calls %q", f.calls)
+	}
+}
+
+func TestInstallCapturesShellEnv(t *testing.T) {
+	wd := stateDir(t)
+	home := t.TempDir()
+	env := map[string]string{
+		"PATH":                     "/opt/homebrew/bin:/usr/bin:/bin",
+		"SBX_BROKER_STATE_DIR":     "s",
+		"SBX_BROKER_CONFIG_DIR":    "cfg",
+		"SBX_BROKER_FETCH_TIMEOUT": "90s",
+		"PGPASSWORD":               "not-captured",
+		"HOME":                     "/not/captured",
+	}
+	f := &fakeLaunchctl{}
+	code, out, errOut, plist := agentCLI(t, wd, home, env, f, "install")
+	state := filepath.Join(wd, "s")
+	if want := "installed " + plist + ", but the broker does not answer; see " + filepath.Join(state, "serve.log") + "\n"; code != 1 || out != "" || errOut != want {
+		t.Fatalf("code %d, out %q, err %q", code, out, errOut)
+	}
+	if !slices.Equal(f.calls, []string{"print", "bootstrap"}) {
+		t.Fatalf("calls %q", f.calls)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exe, err = filepath.EvalSymlinks(exe); err != nil {
+		t.Fatal(err)
+	}
+	want := launchd.Agent{
+		Label:     "io.github.abrose.sbx-broker",
+		PlistPath: plist,
+		Program:   exe,
+		Env: map[string]string{
+			"PATH":                     "/opt/homebrew/bin:/usr/bin:/bin",
+			"SBX_BROKER_STATE_DIR":     state,
+			"SBX_BROKER_CONFIG_DIR":    filepath.Join(wd, "cfg"),
+			"SBX_BROKER_FETCH_TIMEOUT": "90s",
+		},
+		LogPath: filepath.Join(state, "serve.log"),
+	}.Plist()
+	got, err := os.ReadFile(plist)
+	if err != nil || string(got) != string(want) {
+		t.Fatalf("plist %v:\n%s\nwant\n%s", err, got, want)
+	}
+}
+
+// With no SBX_BROKER_* set, the plist names no dirs and the log goes to the
+// default state dir under the home dir.
+func TestInstallDefaultDirs(t *testing.T) {
+	home := t.TempDir()
+	f := &fakeLaunchctl{}
+	code, _, errOut, plist := agentCLI(t, noProject, home, map[string]string{"PATH": "/usr/bin:/bin"}, f, "install")
+	log := filepath.Join(home, ".local", "state", "sbx-broker", "serve.log")
+	if code != 1 || !strings.HasSuffix(errOut, "see "+log+"\n") {
+		t.Fatalf("code %d, err %q", code, errOut)
+	}
+	got, err := os.ReadFile(plist)
+	if err != nil || strings.Contains(string(got), "SBX_BROKER_") || !strings.Contains(string(got), "<string>"+log+"</string>") {
+		t.Fatalf("plist %v:\n%s", err, got)
+	}
+}
+
+// A loaded agent that answers is replaced: booted out and bootstrapped again.
+func TestInstallReplacesLoadedAgent(t *testing.T) {
+	env, _ := broker(t)
+	f := &fakeLaunchctl{loaded: true}
+	code, out, errOut, plist := agentCLI(t, noProject, t.TempDir(), env, f, "install")
+	sock := filepath.Join(env["SBX_BROKER_STATE_DIR"], "admin.sock")
+	if want := "installed " + plist + "\nthe broker answers on " + sock + "\n"; code != 0 || out != want || errOut != "" {
+		t.Fatalf("code %d, out %q, err %q", code, out, errOut)
+	}
+	if want := []string{"print", "print", "bootout", "bootstrap"}; !slices.Equal(f.calls, want) {
+		t.Fatalf("calls %q, want %q", f.calls, want)
+	}
+}
+
+// A bad fetch timeout would make the agent's serve exit at once, again and
+// again: install refuses it before it writes a plist.
+func TestInstallRefusesBadFetchTimeout(t *testing.T) {
+	f := &fakeLaunchctl{}
+	env := map[string]string{"SBX_BROKER_STATE_DIR": stateDir(t), "SBX_BROKER_FETCH_TIMEOUT": "soon"}
+	code, _, errOut, plist := agentCLI(t, noProject, t.TempDir(), env, f, "install")
+	if code != 1 || errOut != "sbx-broker: SBX_BROKER_FETCH_TIMEOUT \"soon\" is not a positive Go duration\n" {
+		t.Fatalf("code %d, err %q", code, errOut)
+	}
+	if _, err := os.Stat(plist); !errors.Is(err, os.ErrNotExist) || len(f.calls) != 0 {
+		t.Fatalf("plist %v, calls %q", err, f.calls)
+	}
+}
+
+func TestInstallLaunchctlFails(t *testing.T) {
+	f := func(args ...string) ([]byte, error) {
+		if args[0] == "bootstrap" {
+			return []byte("Bootstrap failed: 5: Input/output error\n"), errors.New("exit status 5")
+		}
+		return nil, errors.New("exit status 113")
+	}
+	c, out, errOut := testCommand(noProject, map[string]string{"SBX_BROKER_STATE_DIR": stateDir(t)})
+	c.home = func() (string, error) { return t.TempDir(), nil }
+	c.launchctl = f
+	if code := c.run([]string{"install"}); code != 1 || out.String() != "" || !strings.Contains(errOut.String(), "Bootstrap failed: 5") {
+		t.Fatalf("code %d, out %q, err %q", code, out, errOut)
+	}
+}
+
+func TestUninstallOutput(t *testing.T) {
+	home := t.TempDir()
+	env := map[string]string{"SBX_BROKER_STATE_DIR": stateDir(t)}
+	f := &fakeLaunchctl{}
+	if code, out, errOut, _ := agentCLI(t, noProject, home, env, f, "uninstall"); code != 0 || out != "not installed\n" || errOut != "" {
+		t.Fatalf("code %d, out %q, err %q", code, out, errOut)
+	}
+	if code, _, _, _ := agentCLI(t, noProject, home, env, f, "install"); code != 1 {
+		t.Fatalf("install: code %d", code)
+	}
+	f.calls = nil
+	code, out, errOut, plist := agentCLI(t, noProject, home, env, f, "uninstall")
+	if code != 0 || out != "removed "+plist+"\n" || errOut != "" {
+		t.Fatalf("code %d, out %q, err %q", code, out, errOut)
+	}
+	if want := []string{"print", "bootout"}; !slices.Equal(f.calls, want) || f.loaded {
+		t.Fatalf("calls %q, want %q", f.calls, want)
+	}
+	if _, err := os.Stat(plist); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the plist is still there: %v", err)
+	}
 }
 
 // project returns a folder with a marker that names ns.
@@ -179,7 +377,7 @@ func TestHelp(t *testing.T) {
 }
 
 func TestUsageErrors(t *testing.T) {
-	for _, args := range [][]string{{"nope"}, {"refresh"}, {"status", "a", "b"}, {"reload", "x"}, {"log", "-x"}, {"serve", "x"}, {"tui", "x"}} {
+	for _, args := range [][]string{{"nope"}, {"refresh"}, {"status", "a", "b"}, {"reload", "x"}, {"log", "-x"}, {"serve", "x"}, {"tui", "x"}, {"install", "x"}, {"uninstall", "x"}} {
 		if code, _, errOut := cli(nil, args...); code != 2 || !strings.Contains(errOut, "usage: sbx-broker") {
 			t.Errorf("%v: code %d", args, code)
 		}

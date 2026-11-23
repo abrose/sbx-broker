@@ -112,6 +112,9 @@ postgres:
 | `SBX_BROKER_STATE_DIR` | `~/.local/state/sbx-broker` (`admin.sock`, `admin.lock`, `broker.log`) |
 | `SBX_BROKER_FETCH_TIMEOUT` | `60s` (a Go duration) |
 
+The launchd agent of `sbx-broker install` keeps the values these variables have in the shell that runs `install`, and
+writes its output to `serve.log` in the state directory.
+
 ## Reloads
 
 - `serve` checks the config directory every 1 s. A change counts once two checks in a row saw it, so a changed, new or
