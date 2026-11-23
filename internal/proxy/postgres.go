@@ -28,6 +28,11 @@ import (
 // password, logs in to the entry's upstream with the real value, hands the
 // upstream's session state to the app, and then copies bytes both ways.
 
+// requireAuthFailed is the text of pgconn's refusal of a login method that
+// the entry's require-auth does not allow. TestUpstreamRequireAuthErrorText
+// pins it.
+const requireAuthFailed = "require_auth check failed"
+
 const (
 	pgLoginTimeout = 10 * time.Second
 	pgDialTimeout  = 10 * time.Second
@@ -286,6 +291,13 @@ func (p *Postgres) login(entry config.Database, value []byte, params map[string]
 			return nil, &pgRefusal{Code: pgErr.Code, Message: "upstream: " + p.scrub(pgErr.Message),
 				Kind: eventlog.KindUpstream, Secret: entry.Password}
 		}
+		// pgconn gives no sentinel for this refusal, so match its text.
+		// Any other error stays 08006: it is fail-closed too.
+		if entry.RequireAuth != "" && strings.Contains(err.Error(), requireAuthFailed) {
+			return nil, &pgRefusal{Code: "28000", Kind: eventlog.KindUpstream, Secret: entry.Password,
+				Message: fmt.Sprintf("upstream: database %q requires %s, the server asked for another method",
+					entry.Alias, entry.RequireAuth)}
+		}
 		return nil, unreachable
 	}
 	if err := conn.SyncConn(ctx); err != nil {
@@ -334,7 +346,7 @@ func upstreamConfig(db config.Database, password string, params map[string]strin
 	cfg.MinProtocolVersion, cfg.MaxProtocolVersion = "3.0", "3.0"
 	cfg.SSLCertMode, cfg.SSLNegotiation = "disable", "postgres"
 	cfg.ValidateConnect = nil
-	cfg.ChannelBinding, cfg.RequireAuth = "prefer", ""
+	cfg.ChannelBinding, cfg.RequireAuth = "prefer", db.RequireAuth
 	return cfg, nil
 }
 

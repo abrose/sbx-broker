@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -21,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 
 	"github.com/abrose/sbx-broker/internal/config"
@@ -41,6 +43,11 @@ type fakePG struct {
 	addr    string
 	authErr *pgproto3.ErrorResponse
 	noTLS   bool // answer an SSLRequest with N and go on in plain text
+	// authMode is the login the fake asks for: "" cleartext, "md5", or "none"
+	// (AuthenticationOk at once).
+	authMode string
+	// gone, when set, gets one value each time a connection of the fake ends.
+	gone chan struct{}
 
 	mu        sync.Mutex
 	conns     int
@@ -89,7 +96,12 @@ func startFake(t *testing.T, f *fakePG) *fakePG {
 }
 
 func (f *fakePG) serve(c net.Conn, tlsConf *tls.Config) {
-	defer c.Close()
+	defer func() {
+		c.Close()
+		if f.gone != nil {
+			f.gone <- struct{}{}
+		}
+	}()
 	var conn net.Conn = c
 	be := pgproto3.NewBackend(conn, conn)
 	msg, err := be.ReceiveStartupMessage()
@@ -129,9 +141,21 @@ func (f *fakePG) serve(c net.Conn, tlsConf *tls.Config) {
 	f.mu.Lock()
 	f.startups = append(f.startups, maps.Clone(st.Parameters))
 	f.mu.Unlock()
-	be.Send(&pgproto3.AuthenticationCleartextPassword{})
-	if be.Flush() != nil || be.SetAuthType(pgproto3.AuthTypeCleartextPassword) != nil {
+	switch f.authMode {
+	case "none": // AuthenticationOk with no authentication at all
+		be.Send(&pgproto3.AuthenticationOk{})
+		_ = be.Flush()
 		return
+	case "md5":
+		be.Send(&pgproto3.AuthenticationMD5Password{Salt: [4]byte{1, 2, 3, 4}})
+		if be.Flush() != nil || be.SetAuthType(pgproto3.AuthTypeMD5Password) != nil {
+			return
+		}
+	default:
+		be.Send(&pgproto3.AuthenticationCleartextPassword{})
+		if be.Flush() != nil || be.SetAuthType(pgproto3.AuthTypeCleartextPassword) != nil {
+			return
+		}
 	}
 	msg, err = be.Receive()
 	if err != nil {
@@ -140,6 +164,9 @@ func (f *fakePG) serve(c net.Conn, tlsConf *tls.Config) {
 	pw, ok := msg.(*pgproto3.PasswordMessage)
 	if !ok {
 		return
+	}
+	if f.authMode == "md5" { // the hash is of the password: record it as one
+		pw.Password = "md5:" + pw.Password
 	}
 	f.mu.Lock()
 	f.passwords = append(f.passwords, pw.Password)
@@ -811,5 +838,97 @@ func TestPGCancelCloses(t *testing.T) {
 	a.wantEOF()
 	if events := l.Recent(1000); len(events) != 0 {
 		t.Fatalf("events %+v", events)
+	}
+}
+
+const scramOnly = "scram-sha-256"
+
+// scramEntries is pgEntries with require-auth on the app entry.
+func scramEntries(upstream string) config.Postgres {
+	pg := pgEntries(upstream)
+	pg.Databases[0].RequireAuth = scramOnly
+	return pg
+}
+
+func TestUpstreamConfigRequireAuth(t *testing.T) {
+	db := config.Database{Alias: "app", Upstream: "127.0.0.1:6543", DBName: "appdb", User: "app", Password: "db-pass"}
+	cfg, err := upstreamConfig(db, "pw", nil)
+	if err != nil || cfg.RequireAuth != "" {
+		t.Fatalf("without the key: %q, %v", cfg.RequireAuth, err)
+	}
+	db.RequireAuth = scramOnly
+	cfg, err = upstreamConfig(db, "pw", nil)
+	if err != nil || cfg.RequireAuth != scramOnly {
+		t.Fatalf("with the key: %q, %v", cfg.RequireAuth, err)
+	}
+}
+
+// TestUpstreamRequireAuthErrorText pins the text of pgconn's refusal, which
+// the listener matches: a pgx update that changes it must fail here.
+func TestUpstreamRequireAuthErrorText(t *testing.T) {
+	fake := startFake(t, &fakePG{authMode: "md5"})
+	db := config.Database{Alias: "app", Upstream: fake.addr, DBName: "appdb", User: "app", Password: "db-pass", RequireAuth: scramOnly}
+	cfg, err := upstreamConfig(db, dbPass, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = pgconn.ConnectConfig(ctx, cfg)
+	var pgErr *pgconn.PgError
+	if err == nil || errors.As(err, &pgErr) || !strings.Contains(err.Error(), requireAuthFailed) {
+		t.Fatalf("err = %v, want a connect error with %q", err, requireAuthFailed)
+	}
+}
+
+// wantRequireAuthRefusal runs a login against a fake with the given mode and
+// checks the answer, the event, and that no password reached the fake.
+func wantRequireAuthRefusal(t *testing.T, mode string) {
+	t.Helper()
+	fake := startFake(t, &fakePG{authMode: mode, gone: make(chan struct{}, 4)})
+	p, l := newPG(t, scramEntries(fake.addr))
+	startPG(t, p)
+	a := dialPG(t, p)
+	a.startup("app", "app")
+	a.send(&pgproto3.PasswordMessage{Password: "sbxb_t1_db_pass"})
+	msg := `upstream: database "app" requires scram-sha-256, the server asked for another method`
+	a.wantFatal("28000", msg)
+	select { // the fake's side of the login is over
+	case <-fake.gone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the fake's connection did not end")
+	}
+	fake.mu.Lock()
+	passwords := len(fake.passwords)
+	fake.mu.Unlock()
+	if passwords != 0 {
+		t.Errorf("the fake got %d password messages", passwords)
+	}
+	events := l.Recent(1000)
+	if len(events) != 1 {
+		t.Fatalf("events %+v", events)
+	}
+	wantEvent(t, events[0], eventlog.Event{Kind: eventlog.KindUpstream, Route: "app", User: "app",
+		Secrets: []string{"db-pass"}, Message: "28000 " + msg})
+	noDBValueInLog(t, l)
+}
+
+func TestPGRequireAuthRefusesCleartext(t *testing.T) { wantRequireAuthRefusal(t, "") }
+func TestPGRequireAuthRefusesMD5(t *testing.T)       { wantRequireAuthRefusal(t, "md5") }
+func TestPGRequireAuthRefusesNoAuth(t *testing.T)    { wantRequireAuthRefusal(t, "none") }
+
+func TestPGNoRequireAuthKeepsCleartext(t *testing.T) {
+	fake := startFakePG(t, nil)
+	p, _ := newPG(t, pgEntries(fake.addr))
+	startPG(t, p)
+	a := dialPG(t, p)
+	a.startup("app", "app")
+	a.send(&pgproto3.PasswordMessage{Password: "sbxb_t1_db_pass"})
+	a.wantLogin()
+	fake.mu.Lock()
+	passwords := slices.Clone(fake.passwords)
+	fake.mu.Unlock()
+	if len(passwords) != 1 || passwords[0] != dbPass {
+		t.Error("the fake did not get the real password")
 	}
 }

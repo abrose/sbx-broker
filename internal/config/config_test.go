@@ -104,6 +104,37 @@ func TestLoadGood(t *testing.T) {
 	}
 }
 
+func TestLoadRequireAuth(t *testing.T) {
+	pg := func(extra string) string {
+		return "secrets:\n  pw:\n    command: [\"x\"]\npostgres:\n  listen: 29620\n  databases:\n    app:\n      upstream: 127.0.0.1:1\n      dbname: d\n      user: u\n      password: pw\n" + extra
+	}
+	load := func(content string) (map[string]*Namespace, map[string]error) {
+		dir := newDir(t)
+		writeFile(t, dir, "acme.yaml", content)
+		ok, bad, err := LoadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ok, bad
+	}
+	for content, want := range map[string]string{pg(""): "", pg("      require-auth: scram-sha-256\n"): "scram-sha-256"} {
+		ok, bad := load(content)
+		if len(bad) != 0 || ok["acme"] == nil {
+			t.Fatalf("bad: %v", bad)
+		}
+		if got := ok["acme"].Postgres.Databases[0].RequireAuth; got != want {
+			t.Errorf("RequireAuth %q, want %q", got, want)
+		}
+	}
+	for _, v := range []string{"md5", "SCRAM-SHA-256", "none", `""`} {
+		ok, bad := load(pg("      require-auth: " + v + "\n"))
+		e := bad["acme.yaml"]
+		if len(ok) != 0 || e == nil || !strings.Contains(e.Error(), `"app"`) || !strings.Contains(e.Error(), "require-auth") {
+			t.Errorf("value %s: ok=%v err=%v", v, ok, e)
+		}
+	}
+}
+
 func TestLoadTransformForms(t *testing.T) {
 	dir := newDir(t)
 	writeFile(t, dir, "acme.yaml", `

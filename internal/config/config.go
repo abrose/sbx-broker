@@ -47,7 +47,12 @@ type Route struct {
 }
 
 // Database is one Postgres entry. Password is the name of a secret.
-type Database struct{ Alias, Upstream, DBName, User, Password string }
+// RequireAuth is "" or RequireAuthSCRAM: the only login method the upstream
+// may ask for.
+type Database struct{ Alias, Upstream, DBName, User, Password, RequireAuth string }
+
+// RequireAuthSCRAM is the one value of the require-auth key.
+const RequireAuthSCRAM = "scram-sha-256"
 
 type Postgres struct {
 	Listen    int
@@ -103,6 +108,8 @@ type rawDatabase struct {
 	DBName   string `yaml:"dbname"`
 	User     string `yaml:"user"`
 	Password string `yaml:"password"`
+	// RequireAuth is a pointer so that an empty value is not "absent".
+	RequireAuth *string `yaml:"require-auth"`
 }
 
 // LoadDir reads every *.yaml in dir. ok holds the valid namespaces. bad maps a
@@ -350,8 +357,16 @@ func buildPostgres(rp *rawPostgres, secrets []Secret) (*Postgres, error) {
 		if !defined[rd.Password] {
 			return nil, fmt.Errorf("postgres database %q: password names the undefined secret %q", alias, rd.Password)
 		}
+		requireAuth := ""
+		if rd.RequireAuth != nil {
+			if *rd.RequireAuth != RequireAuthSCRAM {
+				return nil, fmt.Errorf("postgres database %q: require-auth %q must be %q", alias, *rd.RequireAuth, RequireAuthSCRAM)
+			}
+			requireAuth = *rd.RequireAuth
+		}
 		pg.Databases = append(pg.Databases, Database{
 			Alias: alias, Upstream: rd.Upstream, DBName: rd.DBName, User: rd.User, Password: rd.Password,
+			RequireAuth: requireAuth,
 		})
 	}
 	sort.Slice(pg.Databases, func(i, j int) bool { return pg.Databases[i].Alias < pg.Databases[j].Alias })
