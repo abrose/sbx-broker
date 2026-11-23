@@ -635,11 +635,14 @@ func TestSocketClientNoBroker(t *testing.T) {
 }
 
 // TEA_TRACE makes Bubble Tea append every frame to the file it names, a
-// shown value included: Run clears it before the program starts.
+// shown value included; UV_DEBUG would do the same in its renderer library,
+// and TEA_DEBUG writes a panic log into the current folder, often a project
+// folder the sandbox reads. Run clears all three before the program starts.
 func TestRunClearsTeaTrace(t *testing.T) {
 	trace := filepath.Join(t.TempDir(), "trace.log")
 	t.Setenv("TEA_TRACE", trace)
 	t.Setenv("UV_DEBUG", filepath.Join(t.TempDir(), "uv.log"))
+	t.Setenv("TEA_DEBUG", "1") // a panic would write bubbletea-panic-<unix>.log into the current folder
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	out := &bytes.Buffer{}
@@ -651,7 +654,7 @@ func TestRunClearsTeaTrace(t *testing.T) {
 	if data, err := os.ReadFile(trace); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("Bubble Tea wrote a trace (%v):\n%s", err, data)
 	}
-	for _, k := range []string{"TEA_TRACE", "UV_DEBUG"} {
+	for _, k := range []string{"TEA_TRACE", "TEA_DEBUG", "UV_DEBUG"} {
 		if v, ok := os.LookupEnv(k); ok {
 			t.Fatalf("%s is still set: %q", k, v)
 		}

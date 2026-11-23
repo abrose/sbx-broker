@@ -146,17 +146,25 @@ func New(cl Client, opt Options) *Model {
 }
 
 // Run shows the TUI in the alternate screen until the owner quits. It clears
-// TEA_TRACE and UV_DEBUG first: either would log every frame to a file.
+// TEA_TRACE, TEA_DEBUG and UV_DEBUG first (see debugLogs).
 func Run(cl Client, opt Options) error { return run(cl, opt) }
 
-// frameLogs are the variables that make Bubble Tea (TEA_TRACE) or its
-// renderer library (UV_DEBUG, not reached by bubbletea v2.1.2) append every
-// frame to a file: a shown value would reach the disk.
-var frameLogs = []string{"TEA_TRACE", "UV_DEBUG"}
+// debugLogs are the variables that make the terminal libraries write a file,
+// cleared before the program starts. Re-check them at every bump of
+// bubbletea or ultraviolet. In bubbletea v2.1.2 and ultraviolet
+// v0.0.0-20261008173134-6b8d4baf91b4:
+//   - TEA_TRACE (tea.go:664, 1059-1062; cursed_renderer.go:272-273, 645-646)
+//     appends every frame, a shown value included, to the file it names;
+//   - TEA_DEBUG (tea.go:1407-1415, 1432-1440) writes bubbletea-panic-<unix>.log
+//     with the panic and its stack into the current folder, often a project
+//     folder the sandbox reads;
+//   - UV_DEBUG (ultraviolet terminal_screen.go:70-74) logs the renderer's
+//     output to the file it names; bubbletea v2.1.2 does not reach it.
+var debugLogs = []string{"TEA_TRACE", "TEA_DEBUG", "UV_DEBUG"}
 
 // run is Run with options for the program; tests run it without a terminal.
 func run(cl Client, opt Options, popts ...tea.ProgramOption) error {
-	for _, k := range frameLogs {
+	for _, k := range debugLogs {
 		if err := os.Unsetenv(k); err != nil {
 			return err
 		}
