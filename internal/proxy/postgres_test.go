@@ -52,7 +52,7 @@ type fakePG struct {
 	// instead of the same key for every login.
 	sessionKey func(n int) []byte
 
-	mu       sync.Mutex
+	mu        sync.Mutex
 	conns     int
 	startups  []map[string]string
 	passwords []string

@@ -41,9 +41,12 @@ const (
 
 	// upstreamSettings is the keyword string of the upstream login. It
 	// gives every setting that a PG* variable or a file in the home folder
-	// (.pgpass, .postgresql/*) could set, so none of them applies, and
-	// none can make ParseConfig fail. upstreamConfig then sets the fields
-	// of the entry by hand.
+	// (.pgpass, .postgresql/*) could set, so none of them applies.
+	// upstreamConfig then sets the fields of the entry by hand. The string
+	// cannot turn off every PG* variable (PGSERVICE can still make
+	// ParseConfig fail, see TestUpstreamConfigFailsWithPGService): that
+	// guarantee rests on server.Run's dropPGEnv, which removes every PG*
+	// variable from the process before any listener starts.
 	upstreamSettings = "host=127.0.0.1 port=5432 user=broker dbname=broker passfile='' " +
 		"sslmode=require sslrootcert='' sslcert='' sslkey='' sslcertmode=disable sslpassword='' " +
 		"sslsni=1 sslnegotiation=postgres connect_timeout=10 target_session_attrs=any " +
@@ -363,8 +366,9 @@ func (p *Postgres) login(entry config.Database, value []byte, params map[string]
 }
 
 // upstreamConfig is the login to db's upstream with password. params are
-// the app's startup parameters without user, database and _pq_.*. No PG*
-// variable of the broker's environment changes the result.
+// the app's startup parameters without user, database and _pq_.*. The result
+// does not depend on the broker's environment because server.Run's dropPGEnv
+// removes every PG* variable from the process before any listener starts.
 func upstreamConfig(db config.Database, password string, params map[string]string) (*pgconn.Config, error) {
 	host, portText, err := net.SplitHostPort(db.Upstream)
 	if err != nil {
