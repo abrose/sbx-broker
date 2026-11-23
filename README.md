@@ -11,6 +11,41 @@ long-lived credential.
 placeholder for the real value on the way out and takes the value out of what comes back. The sandbox only ever sees
 placeholders.
 
+## Why not the secrets built into sbx?
+
+sbx has its own credential swap. A kit or a project file declares a secret, the VM sees a placeholder, and the sbx
+proxy puts the real value into one request header on the hosts you name. For a token in a header, such as a forge
+token or a plain API key header, that is enough, and you should use it.
+
+Many real calls put the credential somewhere else, and there the built-in swap does not help:
+
+| Where the credential goes | sbx built-in swap | sbx-broker |
+|---|---|---|
+| A header, as plain text (`X-API-Key: <key>`, `Bearer <token>`) | yes | yes |
+| A header in Base64 (`Authorization: Basic <base64 of user:secret>`, a Base64 API key) | no: it swaps only the literal text | yes |
+| A form or JSON body, such as the `client_secret` of an OAuth token request | no: it swaps only in headers | yes |
+| The path or the query of the URL | no: it swaps only in headers | yes |
+| A Postgres login | no: the login is not HTTP | coming |
+| An answer that echoes the secret, such as an IdP error page that quotes the rejected client secret | no: the real value reaches the sandbox | yes: the broker scrubs it |
+
+The last row matters even for header tokens. The sbx proxy does not scrub answers. An upstream that echoes a request
+header or body sends the real value straight into the sandbox. The broker scrubs every answer, in
+[many encoded forms](docs/how-it-works.md#the-forms-the-scrub-covers).
+
+Often you cannot move the credential to a plain header. An app may have no setting for it, and the OAuth method
+(`client_secret_post`) or the API may not allow it. The broker needs no change to the app beyond its base URL.
+
+The broker also adds what a project with many services needs:
+
+- **One namespace per project.** The port decides the namespace, so one project's sandbox cannot use another
+  project's secrets.
+- **A log of every use:** each swap and refusal, with the secret names.
+- **Clear refusals:** a missing or failed secret gives a JSON 503 that names the secret, and the request does not
+  reach the upstream.
+
+These facts about sbx come from probes with sbx v0.53 (see
+[Facts this design builds on](docs/specs/2026-11-22-sbx-broker-design.md#facts-this-design-builds-on) in the design).
+
 ## How it works
 
 ```mermaid
