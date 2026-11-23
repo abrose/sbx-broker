@@ -934,6 +934,33 @@ func TestPGCancelForwarded(t *testing.T) {
 	}
 }
 
+// A host name can resolve to several servers: the cancel must go to the one the
+// session is connected to, so it is stored as the address of the connection.
+func TestPGCancelDialsConnectedAddress(t *testing.T) {
+	fake := startFakePG(t, nil)
+	_, port, err := net.SplitHostPort(fake.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, _ := newPG(t, pgEntries("localhost:"+port))
+	startPG(t, p)
+	a := dialPG(t, p)
+	a.startup("app", "app")
+	a.send(&pgproto3.PasswordMessage{Password: "sbxb_t1_db_pass"})
+	a.wantLogin()
+	p.mu.Lock()
+	var got []string
+	for _, s := range p.sessions {
+		got = append(got, s.upstream)
+	}
+	p.mu.Unlock()
+	if !slices.Equal(got, []string{fake.addr}) {
+		t.Errorf("session upstreams %v, want the connected address %s", got, fake.addr)
+	}
+	cancelFrom(t, p, 42, []byte{9, 9, 9, 9})
+	waitUntil(t, "the fake records the cancel", func() bool { return fake.cancelCount() == 1 })
+}
+
 func TestPGCancelUnknownKey(t *testing.T) {
 	cases := map[string]struct {
 		pid uint32

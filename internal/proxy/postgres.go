@@ -428,7 +428,9 @@ func (p *Postgres) session(app net.Conn, hj *pgconn.HijackedConn, l pgLogin, ent
 	up := hj.Conn
 	defer p.untrack(up)
 	key := pgKey{pid: hj.PID, key: string(hj.SecretKey)}
-	s := &pgSession{app: app, up: up, upstream: entry.Upstream}
+	// The address of the connection, not the entry's: a host name can resolve
+	// to several servers, and the cancel must reach the one of this session.
+	s := &pgSession{app: app, up: up, upstream: up.RemoteAddr().String()}
 	p.mu.Lock()
 	p.sessions[key] = s
 	p.mu.Unlock()
