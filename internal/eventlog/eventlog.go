@@ -24,7 +24,8 @@ const (
 	KindUpstream   Kind = "upstream"
 	KindError      Kind = "error"
 	KindInfo       Kind = "info"
-	KindClose      Kind = "close" // a Postgres session ended
+	KindClose      Kind = "close"  // a Postgres session ended
+	KindReveal     Kind = "reveal" // the owner showed a value through the admin socket
 	subscriberSize      = 256
 	fileMode            = 0o600
 )
@@ -58,13 +59,14 @@ type Log struct {
 	fileErr  error // first file error; returned by Close
 	subs     map[int]chan Event
 	nextSub  int
+	swaps    map[string]map[string]int // swap events since Open: namespace, secret
 }
 
 // Open opens (or creates) the log file in append mode with mode 0600. The
 // ring keeps the last ring events; the file rotates to path+".1" before a
 // write that would pass maxBytes.
 func Open(path string, ring int, maxBytes int64) (*Log, error) {
-	l := &Log{path: path, maxBytes: maxBytes, ringCap: ring, subs: map[int]chan Event{}}
+	l := &Log{path: path, maxBytes: maxBytes, ringCap: ring, subs: map[int]chan Event{}, swaps: map[string]map[string]int{}}
 	if err := l.openFile(); err != nil {
 		return nil, err
 	}
@@ -113,6 +115,16 @@ func (l *Log) Add(e Event) {
 		e.Path = l.redact(e.Path)
 		e.Route = l.redact(e.Route)
 		e.User = l.redact(e.User)
+	}
+	if e.Kind == KindSwap {
+		per := l.swaps[e.Namespace]
+		if per == nil {
+			per = map[string]int{}
+			l.swaps[e.Namespace] = per
+		}
+		for _, s := range e.Secrets {
+			per[s]++
+		}
 	}
 	l.ring = append(l.ring, e)
 	if len(l.ring) >= 2*l.ringCap { // compact lazily: amortized O(1) per Add
@@ -176,6 +188,14 @@ func (l *Log) Recent(n int) []Event {
 		return nil
 	}
 	return append([]Event(nil), l.ring[len(l.ring)-n:]...)
+}
+
+// SwapCount returns how many swap events since Open name secret in
+// namespace ns. It counts every event, not only those still in the ring.
+func (l *Log) SwapCount(ns, secret string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.swaps[ns][secret]
 }
 
 // Subscribe returns a channel (buffer 256) of new events and a cancel

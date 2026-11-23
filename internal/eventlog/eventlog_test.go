@@ -64,6 +64,23 @@ func TestRingKeepsLastN(t *testing.T) {
 	}
 }
 
+func TestSwapCountCountsSwapEventsPerSecret(t *testing.T) {
+	l, _ := openLog(t, 3, 1<<20)
+	l.Add(Event{Kind: KindSwap, Namespace: "acme", Secrets: []string{"a", "b"}})
+	l.Add(Event{Kind: KindSwap, Namespace: "acme", Secrets: []string{"a"}})
+	l.Add(Event{Kind: KindSwap, Namespace: "other", Secrets: []string{"a"}})
+	l.Add(Event{Kind: KindRefuse, Namespace: "acme", Secrets: []string{"a"}})
+	// The ring holds 3 events, yet the count covers every swap since Open.
+	for _, tc := range []struct {
+		ns, secret string
+		want       int
+	}{{"acme", "a", 2}, {"acme", "b", 1}, {"other", "a", 1}, {"acme", "c", 0}} {
+		if got := l.SwapCount(tc.ns, tc.secret); got != tc.want {
+			t.Errorf("SwapCount(%s, %s) = %d, want %d", tc.ns, tc.secret, got, tc.want)
+		}
+	}
+}
+
 func TestFileIsJSONLines(t *testing.T) {
 	l, path := openLog(t, 10, 1<<20)
 	l.Add(Event{Kind: KindSwap, Namespace: "t1", Secrets: []string{"api-key"}})

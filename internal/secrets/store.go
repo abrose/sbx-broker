@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -47,7 +48,9 @@ type Status struct {
 	ExitCode          int
 	Err               string // one line, never stdout
 	Length            int
-	Fingerprint       string // the first 8 hex characters of the SHA-256 of the value
+	Fingerprint       string   // the first 8 hex characters of the SHA-256 of the value
+	Command           []string // the argv of the definition; the store fills it
+	Swaps             int      // swap events that name the secret; the server fills it
 }
 
 type entry struct {
@@ -80,6 +83,7 @@ func NewStore(ns string, defs []config.Secret, timeout time.Duration, log *event
 	for _, d := range defs {
 		s.entries[d.Name] = &entry{def: d, state: Status{
 			Name: d.Name, Placeholder: placeholder.Format(ns, d.Name), State: StatePending,
+			Command: slices.Clone(d.Command),
 		}}
 	}
 	return s

@@ -8,6 +8,7 @@ package admin
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,7 +46,8 @@ var (
 	ErrNoBroker = errors.New("no broker runs")
 )
 
-// Request is one request line. Ops: "status", "refresh", "reload", "log".
+// Request is one request line. Ops: "status", "refresh", "reload", "log",
+// "reveal".
 type Request struct {
 	Op        string `json:"op"`
 	Namespace string `json:"ns,omitempty"`
@@ -53,20 +55,49 @@ type Request struct {
 	Follow    bool   `json:"follow,omitempty"`
 }
 
+// RouteInfo is one HTTP route as the broker loaded it.
+type RouteInfo struct {
+	Name       string   `json:"name"`
+	Listen     int      `json:"listen"`
+	Upstream   string   `json:"upstream"`
+	Transforms []string `json:"transforms"`
+}
+
+// DatabaseInfo is one Postgres entry as the broker loaded it. Password is the
+// name of a secret.
+type DatabaseInfo struct {
+	Alias       string `json:"alias"`
+	Upstream    string `json:"upstream"`
+	DBName      string `json:"dbname"`
+	User        string `json:"user"`
+	Password    string `json:"password"`
+	RequireAuth string `json:"require_auth,omitempty"`
+}
+
+// PostgresInfo is the postgres block of a namespace as the broker loaded it.
+type PostgresInfo struct {
+	Listen    int            `json:"listen"`
+	Databases []DatabaseInfo `json:"databases"`
+}
+
 // NamespaceStatus describes one namespace. It holds no value.
 type NamespaceStatus struct {
 	Name      string           `json:"name"`
 	Listeners []string         `json:"listeners"`
 	Secrets   []secrets.Status `json:"secrets"`
+	HTTP      []RouteInfo      `json:"http,omitempty"`
+	Postgres  *PostgresInfo    `json:"postgres,omitempty"`
 	Error     string           `json:"error,omitempty"`
 }
 
-// Response is one response line.
+// Response is one response line. Value is set by "reveal" only: it is the
+// one place a secret value crosses the socket.
 type Response struct {
 	OK         bool              `json:"ok"`
 	Error      string            `json:"error,omitempty"`
 	Namespaces []NamespaceStatus `json:"namespaces,omitempty"`
 	Event      *eventlog.Event   `json:"event,omitempty"`
+	Value      []byte            `json:"value,omitempty"`
 }
 
 // Backend is what the socket asks of the broker.
@@ -76,6 +107,9 @@ type Backend interface {
 	// Refresh fetches one secret of ns again, or every secret when secret
 	// is empty, and returns the status of ns after the fetch.
 	Refresh(ctx context.Context, ns, secret string) ([]NamespaceStatus, error)
+	// Reveal returns a copy of the value of one secret of ns, and logs the
+	// reveal. The caller owns the copy and wipes it.
+	Reveal(ns, secret string) ([]byte, error)
 	// Reload scans the config dir now, without waiting for a change to
 	// settle, and also loads again every file that was refused (a port
 	// clash, or an error that may be gone) and every namespace with a
@@ -266,10 +300,10 @@ func (s *Server) handle(conn net.Conn) {
 		_, _ = io.Copy(io.Discard, r)
 		cancel()
 	}()
-	s.do(ctx, req, enc)
+	s.do(ctx, req, enc, conn)
 }
 
-func (s *Server) do(ctx context.Context, req Request, enc *json.Encoder) {
+func (s *Server) do(ctx context.Context, req Request, enc *json.Encoder, w io.Writer) {
 	reply := func(nss []NamespaceStatus, err error) {
 		if err != nil {
 			_ = enc.Encode(Response{Error: err.Error()})
@@ -290,9 +324,31 @@ func (s *Server) do(ctx context.Context, req Request, enc *json.Encoder) {
 		reply(nil, s.b.Reload(ctx))
 	case "log":
 		s.logOp(ctx, req, enc)
+	case "reveal":
+		s.revealOp(req, enc, w)
 	default:
 		reply(nil, fmt.Errorf("unknown op %s", req.Op))
 	}
+}
+
+// revealOp sends the value of one secret in one response line. It writes the
+// line itself instead of encoding a Response, so the one copy of the value
+// that the broker makes besides the backend's, the encoded line, is the one
+// it wipes.
+func (s *Server) revealOp(req Request, enc *json.Encoder, w io.Writer) {
+	value, err := s.b.Reveal(req.Namespace, req.Secret)
+	defer clear(value)
+	if err != nil {
+		_ = enc.Encode(Response{Error: err.Error()})
+		return
+	}
+	const head, tail = `{"ok":true,"value":"`, "\"}\n"
+	line := make([]byte, 0, len(head)+base64.StdEncoding.EncodedLen(len(value))+len(tail))
+	defer func() { clear(line[:cap(line)]) }()
+	line = append(line, head...)
+	line = base64.StdEncoding.AppendEncode(line, value)
+	line = append(line, tail...)
+	_, _ = w.Write(line)
 }
 
 // logOp sends the last 100 events (of req.Namespace, when set), then with

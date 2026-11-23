@@ -30,6 +30,17 @@ So the marker `.sbx-broker` holds only a namespace name:
 The agent can still change the name to another namespace of yours. Then `status` shows that namespace (names,
 placeholders and states, never values), and `edit` opens that file, which your editor shows by its path.
 
+## Reveal
+
+The admin socket has a `reveal` op: it answers the value of one secret that is loaded (state `ok`), for the TUI to show
+on a key press and a confirmation. The socket has mode `0600` in a state dir of mode `0700`, so only your user (and
+root) can connect. Each answered reveal logs one event, `reveal`, with the namespace and the secret's name and the
+message `revealed`; the event never holds the value. A secret that is not loaded, or unknown, is refused with an error
+and no event. No CLI command reveals.
+
+This adds no new reader. Any process of yours can run the fetch command of a secret itself and get the same value, and
+the admin socket gives no more than that. What it adds is the log line, which tells you when the broker showed a value.
+
 ## What it does not do
 
 - It does not choose the rights of a credential. It passes on the credentials you configure; choosing a role with the

@@ -40,6 +40,13 @@ func (f *fakeBackend) Refresh(_ context.Context, ns, secret string) ([]Namespace
 	return f.Status(ns)
 }
 
+func (f *fakeBackend) Reveal(ns, secret string) ([]byte, error) {
+	if secret == "broken" {
+		return nil, fmt.Errorf("secret not loaded: broken (failed)")
+	}
+	return []byte("real-api-key-1"), nil
+}
+
 func (f *fakeBackend) Reload(context.Context) error {
 	f.mu.Lock()
 	f.reloads++
@@ -118,6 +125,47 @@ func TestRefreshOneSecret(t *testing.T) {
 	defer b.mu.Unlock()
 	if len(b.refreshed) != 1 || b.refreshed[0] != "t1/api-key" {
 		t.Fatalf("refreshed %v", b.refreshed)
+	}
+}
+
+func TestRevealAnswersValue(t *testing.T) {
+	state, _, _, _ := serve(t)
+	resps, err := do(t, state, Request{Op: "reveal", Namespace: "acme", Secret: "api-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resps) != 1 || !resps[0].OK || string(resps[0].Value) != "real-api-key-1" {
+		t.Fatalf("got %+v", resps)
+	}
+}
+
+func TestRevealErrorHasNoValue(t *testing.T) {
+	state, _, _, _ := serve(t)
+	c, err := Dial(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []Response
+	err = c.Do(Request{Op: "reveal", Namespace: "acme", Secret: "broken"}, func(r Response) error {
+		got = append(got, r)
+		return nil
+	})
+	if err == nil || err.Error() != "secret not loaded: broken (failed)" || len(got) != 0 {
+		t.Fatalf("err %v, responses %+v", err, got)
+	}
+	// The raw line: not ok, an error, no value.
+	conn, err := net.Dial("unix", SocketPath(state))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte(`{"op":"reveal","ns":"acme","secret":"broken"}` + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4096)
+	n, _ := conn.Read(buf)
+	if string(buf[:n]) != `{"ok":false,"error":"secret not loaded: broken (failed)"}`+"\n" {
+		t.Fatalf("line %q", buf[:n])
 	}
 }
 

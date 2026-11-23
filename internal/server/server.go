@@ -178,12 +178,33 @@ func (st *nsState) defines(secret string) bool {
 	return false
 }
 
-func (st *nsState) status() admin.NamespaceStatus {
+// status describes the namespace as loaded; log gives each secret's swap count.
+func (st *nsState) status(log *eventlog.Log) admin.NamespaceStatus {
 	addrs := make([]string, 0, len(st.listeners))
 	for _, h := range st.listeners {
 		addrs = append(addrs, h.Addr())
 	}
-	return admin.NamespaceStatus{Name: st.cfg.Name, Listeners: addrs, Secrets: st.store.Statuses(), Error: strings.Join(st.errs, "; ")}
+	secs := st.store.Statuses()
+	for i := range secs {
+		secs[i].Swaps = log.SwapCount(st.cfg.Name, secs[i].Name)
+	}
+	out := admin.NamespaceStatus{Name: st.cfg.Name, Listeners: addrs, Secrets: secs, Error: strings.Join(st.errs, "; ")}
+	for _, r := range st.cfg.HTTP {
+		ri := admin.RouteInfo{Name: r.Name, Listen: r.Listen, Upstream: r.Upstream.String(), Transforms: []string{}}
+		for _, tr := range r.Transforms {
+			ri.Transforms = append(ri.Transforms, tr.Name)
+		}
+		out.HTTP = append(out.HTTP, ri)
+	}
+	if pg := st.cfg.Postgres; pg != nil {
+		pi := &admin.PostgresInfo{Listen: pg.Listen, Databases: []admin.DatabaseInfo{}}
+		for _, d := range pg.Databases {
+			pi.Databases = append(pi.Databases, admin.DatabaseInfo{Alias: d.Alias, Upstream: d.Upstream, DBName: d.DBName,
+				User: d.User, Password: d.Password, RequireAuth: d.RequireAuth})
+		}
+		out.Postgres = pi
+	}
+	return out
 }
 
 type broker struct {
@@ -566,11 +587,11 @@ func (b *broker) Status(ns string) ([]admin.NamespaceStatus, error) {
 		if st == nil {
 			return nil, fmt.Errorf("unknown namespace %s", ns)
 		}
-		return []admin.NamespaceStatus{st.status()}, nil
+		return []admin.NamespaceStatus{st.status(b.log)}, nil
 	}
 	out := make([]admin.NamespaceStatus, 0, len(b.nss))
 	for _, name := range slices.Sorted(mapKeys(b.nss)) {
-		out = append(out, b.nss[name].status())
+		out = append(out, b.nss[name].status(b.log))
 	}
 	return out, nil
 }
@@ -594,6 +615,26 @@ func (b *broker) Refresh(_ context.Context, ns, secret string) ([]admin.Namespac
 		_ = st.store.Fetch(st.ctx, secret) // the outcome is in the status
 	}
 	return b.Status(ns)
+}
+
+// Reveal implements admin.Backend. It answers a copy of the value of a secret
+// that is ok, and logs the reveal after the copy, with the name only.
+func (b *broker) Reveal(ns, secret string) ([]byte, error) {
+	b.mu.Lock()
+	st := b.nss[ns]
+	b.mu.Unlock()
+	if st == nil {
+		return nil, fmt.Errorf("unknown namespace %s", ns)
+	}
+	if !st.defines(secret) {
+		return nil, fmt.Errorf("unknown secret %s in namespace %s", secret, ns)
+	}
+	value, state := st.store.Lookup(secret)
+	if state != secrets.StateOK {
+		return nil, fmt.Errorf("secret not loaded: %s (%s)", secret, state)
+	}
+	b.log.Add(eventlog.Event{Kind: eventlog.KindReveal, Namespace: ns, Secrets: []string{secret}, Message: "revealed"})
+	return value, nil
 }
 
 // Reload implements admin.Backend: the watch scans the config dir now.

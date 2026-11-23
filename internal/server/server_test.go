@@ -1288,6 +1288,155 @@ func TestServeShutdownLogsOpenRequests(t *testing.T) {
 	}
 }
 
+// revealNS has one secret that loads and one that fails.
+func revealNS() string {
+	return nsYAML([]string{
+		secretYAML("api-key", "printf", "%s", apiKey),
+		secretYAML("broken", "false"),
+	}, nil)
+}
+
+func startReveal(t *testing.T) (state string) {
+	t.Helper()
+	cfg, state := dirs(t)
+	writeNS(t, cfg, "t1", revealNS())
+	start(t, cfg, state)
+	waitOK(t, state, "t1", "api-key")
+	waitFor(t, 5*time.Second, "secret broken failed", func() bool {
+		return secretState(t, state, "t1", "broken") == secrets.StateFailed
+	})
+	return state
+}
+
+func TestRevealLogsEventWithoutValue(t *testing.T) {
+	t.Parallel()
+	state := startReveal(t)
+	resps, err := do(t, state, admin.Request{Op: "reveal", Namespace: "t1", Secret: "api-key"})
+	if err != nil || len(resps) != 1 || string(resps[0].Value) != apiKey {
+		t.Fatalf("got %+v, %v", resps, err)
+	}
+	logged, err := do(t, state, admin.Request{Op: "log", Namespace: "t1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reveals []eventlog.Event
+	for _, r := range logged {
+		if r.Event != nil && r.Event.Kind == eventlog.KindReveal {
+			reveals = append(reveals, *r.Event)
+		}
+	}
+	if len(reveals) != 1 || reveals[0].Namespace != "t1" || !slices.Equal(reveals[0].Secrets, []string{"api-key"}) || reveals[0].Message != "revealed" {
+		t.Fatalf("reveal events %+v", reveals)
+	}
+	if !hasEvent(readLog(t, state), func(e eventlog.Event) bool { return e.Kind == eventlog.KindReveal }) {
+		t.Fatal("broker.log has no reveal event")
+	}
+	noValues(t, state, allValues...)
+}
+
+func TestRevealRefusesSecretNotLoaded(t *testing.T) {
+	t.Parallel()
+	state := startReveal(t)
+	_, err := do(t, state, admin.Request{Op: "reveal", Namespace: "t1", Secret: "broken"})
+	if err == nil || err.Error() != "secret not loaded: broken (failed)" {
+		t.Fatalf("got %v", err)
+	}
+	if hasEvent(readLog(t, state), func(e eventlog.Event) bool { return e.Kind == eventlog.KindReveal }) {
+		t.Fatal("a refused reveal was logged as a reveal")
+	}
+}
+
+func TestRevealUnknownSecret(t *testing.T) {
+	t.Parallel()
+	state := startReveal(t)
+	for _, tc := range []struct {
+		req  admin.Request
+		want string
+	}{
+		{admin.Request{Op: "reveal", Namespace: "t1", Secret: "nope"}, "unknown secret nope in namespace t1"},
+		{admin.Request{Op: "reveal", Namespace: "t9", Secret: "api-key"}, "unknown namespace t9"},
+	} {
+		if _, err := do(t, state, tc.req); err == nil || err.Error() != tc.want {
+			t.Errorf("%+v: got %v", tc.req, err)
+		}
+	}
+	if hasEvent(readLog(t, state), func(e eventlog.Event) bool { return e.Kind == eventlog.KindReveal }) {
+		t.Fatal("a refused reveal was logged as a reveal")
+	}
+}
+
+func TestStatusCarriesCommandRoutesAndSwaps(t *testing.T) {
+	t.Parallel()
+	cfg, state := dirs(t)
+	up := newUpstream(t)
+	port, pgPort, pgUp := freePort(t), freePort(t), freePort(t)
+	writeNS(t, cfg, "t1", nsYAML(
+		[]string{secretYAML("api-key", "printf", "%s", apiKey)},
+		[]string{routeYAML("api", port, up.URL)}))
+	writeNS(t, cfg, "t2", pgNS(pgPort, pgUp))
+	start(t, cfg, state)
+	waitOK(t, state, "t1", "api-key")
+	waitOK(t, state, "t2", "db-pass")
+	if code, _, err := get(port, "/v1", "sbxb_t1_api_key"); err != nil || code != http.StatusOK {
+		t.Fatalf("get: %d %v", code, err)
+	}
+	waitFor(t, 3*time.Second, "one swap counted", func() bool {
+		n, ok := status(t, state, "t1")
+		return ok && n.Secrets[0].Swaps == 1
+	})
+	n, _ := status(t, state, "t1")
+	if want := []string{"printf", "%s", apiKey}; !slices.Equal(n.Secrets[0].Command, want) {
+		t.Errorf("command %v, want %v", n.Secrets[0].Command, want)
+	}
+	wantHTTP := []admin.RouteInfo{{Name: "api", Listen: port, Upstream: up.URL, Transforms: []string{"swap"}}}
+	if !slices.EqualFunc(n.HTTP, wantHTTP, func(a, b admin.RouteInfo) bool {
+		return a.Name == b.Name && a.Listen == b.Listen && a.Upstream == b.Upstream && slices.Equal(a.Transforms, b.Transforms)
+	}) {
+		t.Errorf("http %+v, want %+v", n.HTTP, wantHTTP)
+	}
+	if n.Postgres != nil {
+		t.Errorf("t1 has no postgres block: %+v", n.Postgres)
+	}
+	n2, _ := status(t, state, "t2")
+	wantDB := admin.DatabaseInfo{Alias: "app", Upstream: fmt.Sprintf("127.0.0.1:%d", pgUp), DBName: "appdb", User: "app", Password: "db-pass"}
+	if n2.Postgres == nil || n2.Postgres.Listen != pgPort || len(n2.Postgres.Databases) != 1 || n2.Postgres.Databases[0] != wantDB {
+		t.Errorf("postgres %+v, want %+v", n2.Postgres, wantDB)
+	}
+	if n2.Secrets[0].Swaps != 0 {
+		t.Errorf("t2 swaps %d", n2.Secrets[0].Swaps)
+	}
+}
+
+func TestSwapCountSurvivesReload(t *testing.T) {
+	t.Parallel()
+	cfg, state := dirs(t)
+	up := newUpstream(t)
+	port := freePort(t)
+	route := []string{routeYAML("api", port, up.URL)}
+	writeNS(t, cfg, "t1", nsYAML([]string{secretYAML("api-key", "printf", "%s", apiKey)}, route))
+	start(t, cfg, state)
+	waitOK(t, state, "t1", "api-key")
+	if code, _, err := get(port, "/v1", "sbxb_t1_api_key"); err != nil || code != http.StatusOK {
+		t.Fatalf("get: %d %v", code, err)
+	}
+	swaps := func() int {
+		n, ok := status(t, state, "t1")
+		if !ok || len(n.Secrets) == 0 {
+			return -1
+		}
+		return n.Secrets[0].Swaps
+	}
+	waitFor(t, 3*time.Second, "one swap counted", func() bool { return swaps() == 1 })
+	writeNS(t, cfg, "t1", nsYAML([]string{secretYAML("api-key", "printf", "%s", newKey)}, route))
+	waitFor(t, 5*time.Second, "the reload", func() bool {
+		return hasEvent(readLog(t, state), func(e eventlog.Event) bool { return e.Kind == eventlog.KindReload && e.Message == "reloaded" })
+	})
+	waitOK(t, state, "t1", "api-key")
+	if got := swaps(); got != 1 {
+		t.Fatalf("swaps after reload %d, want 1", got)
+	}
+}
+
 func TestServeAdminErrors(t *testing.T) {
 	t.Parallel()
 	cfg, state := dirs(t)
