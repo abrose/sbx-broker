@@ -31,14 +31,16 @@ const (
 	clientName = "sbx-broker-testclient"
 	hostAlias  = "host.docker.internal"
 
-	// cleanupWait is kept free before the test's deadline, so the sandbox
-	// is removed also when a step runs out of time: a go test timeout
-	// would skip every cleanup.
-	cleanupWait = 4 * time.Minute
-	removeWait  = 3 * time.Minute
-	createWait  = 12 * time.Minute
-	stepWait    = 2 * time.Minute
-	policyWait  = 30 * time.Second
+	// deadlineMargin is kept free before the test's deadline, so the
+	// cleanups (the sandbox within cleanupWait, then the broker and the
+	// recorder) finish also when a step runs out of time: the panic of a
+	// go test timeout would skip every cleanup.
+	deadlineMargin = 5 * time.Minute
+	cleanupWait    = 4 * time.Minute
+	removeWait     = 3 * time.Minute
+	createWait     = 12 * time.Minute
+	stepWait       = 2 * time.Minute
+	policyWait     = 30 * time.Second
 )
 
 func TestEndToEnd(t *testing.T) {
@@ -50,6 +52,13 @@ func TestEndToEnd(t *testing.T) {
 	ws := filepath.Join(dir, "ws")
 	ctx := runContext(t)
 
+	// Plain sbx is the wrapper of sbx-instances: it picks the instance from
+	// the marker file .sbx-instance above this dir. Without it, sbx would
+	// reach the default instance, which this test must never touch.
+	if _, err := exec.LookPath("sbx-instance"); err != nil {
+		t.Fatalf("sbx-instance is not in PATH (%v): the test runs sbx only in the instance %q, "+
+			"which the sbx-instances wrapper selects; install the wrapper first", err, instance)
+	}
 	if out := run(t, ctx, stepWait, dir, nil, "sbx-instance", "which"); firstLine(out) != instance {
 		t.Fatalf("sbx-instance which says %q, want %q", firstLine(out), instance)
 	}
@@ -63,11 +72,13 @@ func TestEndToEnd(t *testing.T) {
 	harness.StartBroker(t, harness.ProofNamespaces(base))
 	harness.ClearRecords(t, records)
 
+	// Registered first: a failed removal of a leftover stops the test, and
+	// the cleanup then tries the remove again.
+	t.Cleanup(func() { removeSandbox(t, dir, envFile) })
 	if listed(t, ctx, dir) {
 		t.Logf("a sandbox %s is left from an earlier run: removing it", sandbox)
 		run(t, ctx, removeWait, dir, nil, "sbx", "env", "rm", "--force", "--no-input", "--name", sandbox, envFile)
 	}
-	t.Cleanup(func() { removeSandbox(t, dir, envFile) })
 
 	// sbx keeps the policy log of a removed sandbox under its name: only
 	// entries seen after this moment count.
@@ -126,12 +137,12 @@ func TestEndToEnd(t *testing.T) {
 	})
 }
 
-// runContext ends cleanupWait before the test's deadline.
+// runContext ends deadlineMargin before the test's deadline.
 func runContext(t *testing.T) context.Context {
 	t.Helper()
 	end := time.Now().Add(15 * time.Minute)
 	if d, ok := t.Deadline(); ok {
-		end = d.Add(-cleanupWait)
+		end = d.Add(-deadlineMargin)
 	}
 	ctx, cancel := context.WithDeadline(context.Background(), end)
 	t.Cleanup(cancel)
