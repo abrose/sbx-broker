@@ -24,6 +24,7 @@ const (
 	KindUpstream   Kind = "upstream"
 	KindError      Kind = "error"
 	KindInfo       Kind = "info"
+	KindClose      Kind = "close" // a Postgres session ended
 	subscriberSize      = 256
 	fileMode            = 0o600
 )
@@ -34,6 +35,7 @@ type Event struct {
 	Kind       Kind      `json:"kind"`
 	Namespace  string    `json:"ns,omitempty"`
 	Route      string    `json:"route,omitempty"`
+	User       string    `json:"user,omitempty"` // the app's Postgres user
 	Method     string    `json:"method,omitempty"`
 	Path       string    `json:"path,omitempty"` // never the query
 	Secrets    []string  `json:"secrets,omitempty"`

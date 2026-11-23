@@ -266,3 +266,16 @@ func TestOpenAppendsToExistingFile(t *testing.T) {
 		t.Errorf("lines = %d, want 2", n)
 	}
 }
+
+func TestEventUserField(t *testing.T) {
+	data, err := json.Marshal(Event{Kind: KindClose, User: "app"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"user":"app"`) || !strings.Contains(string(data), `"kind":"close"`) {
+		t.Fatalf("got %s", data)
+	}
+	if data, _ := json.Marshal(Event{Kind: KindInfo}); strings.Contains(string(data), `"user"`) {
+		t.Fatalf("empty user in %s", data)
+	}
+}
