@@ -54,7 +54,11 @@ When the broker goes away later, the header shows the same line and the TUI keep
 | Namespaces | `NAME`, `LISTENERS`, `SECRETS` (`<ok> of <n> ok`), `ERROR` |
 | Secrets | `NAME`, `PLACEHOLDER`, `COMMAND` (cut to fit with `…`), `STATE` (`fetching` while a refresh runs), `FETCHED`, `SWAPS` |
 | Inspect | name, placeholder, the whole command, state, fetch time, exit code and error line of a failed fetch, length, `sha256 <first 8 hex>`, swaps, and `value: hidden (r to reveal)` |
-| Routes, Log | not built yet |
+| Routes | not built yet |
+| Log | the header `log · ns <filter> · kind <filter>`, then the newest 1,000 events, newest last, one line each, the same line `sbx-broker log` prints |
+
+The Log view follows the broker's log from the start of the TUI, also while another view shows. When the broker goes away
+the log stays on screen; when it answers again the TUI follows again and adds only the events it has not got.
 
 `SWAPS` counts the `swap` events that name the secret since the broker started. A command shows as shell words: an
 argument with a character other than `A-Za-z0-9_@%+=:,./-` is in single quotes.
@@ -69,6 +73,11 @@ argument with a character other than `A-Za-z0-9_@%+=:,./-` is in single quotes.
 | Secrets | `f`, `F` | refresh the secret, refresh all of the namespace |
 | Inspect | `r`, then `y` | reveal; any other key after `r` cancels |
 | Inspect | `esc` | back to Secrets |
+| Log | `n` | next namespace filter: `all`, then each namespace in order |
+| Log | `t` | next kind filter: `all`, then each kind (`swap`, `refuse`, `fetch`, `reload`, `violation`, `unscanned`, `upstream`, `error`, `info`, `close`, `reveal`) |
+| Log | `c` | clear both filters |
+| Log | `up`/`k`, `down`/`j` | scroll back, scroll forward |
+| Log | `G` | back to the newest |
 
 ### Reveal
 

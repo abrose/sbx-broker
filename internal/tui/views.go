@@ -44,7 +44,7 @@ func (m *Model) viewBody() string {
 	case viewRoutes:
 		return "Routes\n\nnot in this version yet"
 	default:
-		return "Log\n\nnot in this version yet"
+		return m.logBody()
 	}
 }
 

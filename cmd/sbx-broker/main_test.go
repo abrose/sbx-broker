@@ -257,12 +257,12 @@ func TestFormatStatus(t *testing.T) {
 
 func TestFormatLogLine(t *testing.T) {
 	at := time.Date(2026, 11, 22, 13, 2, 11, 0, time.Local)
-	got := logLine(eventlog.Event{Time: at, Kind: eventlog.KindSwap, Namespace: "t1", Route: "api", Method: "GET", Path: "/v1",
+	got := eventlog.Line(eventlog.Event{Time: at, Kind: eventlog.KindSwap, Namespace: "t1", Route: "api", Method: "GET", Path: "/v1",
 		Status: 200, Secrets: []string{"api-key", "other"}})
 	if want := "13:02:11 swap t1 api GET /v1 200 api-key,other -"; got != want {
 		t.Fatalf("got %q", got)
 	}
-	got = logLine(eventlog.Event{Time: at, Kind: eventlog.KindFetch, Namespace: "t1", Secrets: []string{"slow"}, Message: "failed: exit 3"})
+	got = eventlog.Line(eventlog.Event{Time: at, Kind: eventlog.KindFetch, Namespace: "t1", Secrets: []string{"slow"}, Message: "failed: exit 3"})
 	if want := "13:02:11 fetch t1 - - - - slow failed: exit 3"; got != want {
 		t.Fatalf("got %q", got)
 	}
@@ -270,12 +270,12 @@ func TestFormatLogLine(t *testing.T) {
 
 func TestLogLineShowsPostgresUser(t *testing.T) {
 	at := time.Date(2026, 11, 22, 13, 2, 11, 0, time.Local)
-	got := logLine(eventlog.Event{Time: at, Kind: eventlog.KindSwap, Namespace: "t1", Route: "app", User: "app",
+	got := eventlog.Line(eventlog.Event{Time: at, Kind: eventlog.KindSwap, Namespace: "t1", Route: "app", User: "app",
 		Secrets: []string{"db-pass"}, Message: "login"})
 	if want := "13:02:11 swap t1 app@app - - - db-pass login"; got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
-	got = logLine(eventlog.Event{Time: at, Kind: eventlog.KindSwap, Namespace: "t1", Route: "app", Method: "GET", Path: "/"})
+	got = eventlog.Line(eventlog.Event{Time: at, Kind: eventlog.KindSwap, Namespace: "t1", Route: "app", Method: "GET", Path: "/"})
 	if want := "13:02:11 swap t1 app GET / - - -"; got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}

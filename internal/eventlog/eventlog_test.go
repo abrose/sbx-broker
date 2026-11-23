@@ -11,6 +11,37 @@ import (
 	"time"
 )
 
+// TestLogLineIsShared pins Line to the line `sbx-broker log` printed before
+// the TUI shared it, escapes included.
+func TestLogLineIsShared(t *testing.T) {
+	at := time.Date(2026, 11, 22, 13, 2, 11, 0, time.Local)
+	for _, tc := range []struct {
+		name string
+		e    Event
+		want string
+	}{
+		{"swap", Event{Time: at, Kind: KindSwap, Namespace: "t1", Route: "api", Method: "GET", Path: "/v1",
+			Status: 200, Secrets: []string{"api-key", "other"}}, "13:02:11 swap t1 api GET /v1 200 api-key,other -"},
+		{"postgres refuse", Event{Time: at, Kind: KindRefuse, Namespace: "t1", Route: "app", User: "app",
+			Message: "login refused"}, "13:02:11 refuse t1 app@app - - - - login refused"},
+		{"fetch", Event{Time: at, Kind: KindFetch, Namespace: "t1", Secrets: []string{"slow"}, Message: "failed: exit 3"},
+			"13:02:11 fetch t1 - - - - slow failed: exit 3"},
+		{"escapes", Event{Time: at, Kind: KindSwap, Namespace: "t1", Route: "api", Method: "GE\x1bT x",
+			Path: "/a b\x1b[2J\n13:00:00 swap", Status: 200, Message: "msg \x9b31m\x1b[2J\nforged"},
+			`13:02:11 swap t1 api GE\x1bT%20x /a%20b\x1b[2J\x0a13:00:00%20swap 200 - msg \x9b31m\x1b[2J\x0aforged`},
+	} {
+		if got := Line(tc.e); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestKindsInDeclarationOrder(t *testing.T) {
+	if len(Kinds) != 11 || Kinds[0] != KindSwap || Kinds[1] != KindRefuse || Kinds[10] != KindReveal {
+		t.Fatalf("Kinds %v", Kinds)
+	}
+}
+
 func openLog(t *testing.T, ring int, maxBytes int64) (*Log, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "broker.log")

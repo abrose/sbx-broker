@@ -84,11 +84,13 @@ type (
 // Model is the TUI's state. Bubble Tea calls Update and View from one
 // goroutine; the commands it runs elsewhere touch only the Client.
 type Model struct {
-	cl    Client
-	opt   Options
-	keys  keyMap
-	help  help.Model
-	width int // 0 until the first tea.WindowSizeMsg: no command is cut
+	cl     Client
+	opt    Options
+	keys   keyMap
+	help   help.Model
+	width  int // 0 until the first tea.WindowSizeMsg: no command is cut
+	height int
+	log    logView
 	// after returns a command that sends msg after d; tests replace it.
 	after func(d time.Duration, msg tea.Msg) tea.Cmd
 
@@ -135,6 +137,7 @@ func Run(cl Client, opt Options) error {
 	m := New(cl, opt)
 	_, err := tea.NewProgram(m).Run()
 	m.hide() // the model hid it on quit already; this covers a crash of the program
+	m.stopFollow()
 	return err
 }
 
@@ -152,18 +155,25 @@ func (m *Model) View() tea.View {
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		m.width = msg.Width
+		m.width, m.height = msg.Width, msg.Height
 		m.help.SetWidth(msg.Width)
 	case tea.KeyPressMsg:
 		return m, m.key(msg)
 	case tea.InterruptMsg:
-		m.hide()
-		return m, tea.Quit
+		return m, m.quit()
 	case pollMsg:
 		return m, m.statusCmd()
 	case statusMsg:
 		m.gotStatus(msg)
-		return m, m.after(pollEvery, pollMsg{})
+		cmds := []tea.Cmd{m.after(pollEvery, pollMsg{})}
+		if !m.gone && m.statusErr == "" {
+			cmds = append(cmds, m.followCmd()) // the broker answers: follow its log if no follow runs
+		}
+		return m, tea.Batch(cmds...)
+	case followMsg:
+		return m, m.after(logEvery, logTickMsg{})
+	case logTickMsg:
+		return m, m.logTick()
 	case refreshMsg:
 		m.gotRefresh(msg)
 	case revealMsg:
@@ -178,8 +188,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *Model) key(k tea.KeyPressMsg) tea.Cmd {
 	if key.Matches(k, m.keys.forceQuit) {
-		m.hide()
-		return tea.Quit
+		return m.quit()
 	}
 	if m.confirm {
 		m.confirm = false
@@ -194,7 +203,7 @@ func (m *Model) key(k tea.KeyPressMsg) tea.Cmd {
 	m.note = ""
 	switch {
 	case key.Matches(k, m.keys.quit):
-		return tea.Quit
+		return m.quit()
 	case key.Matches(k, m.keys.next):
 		m.view = tabs[(int(m.view.tab())+1)%len(tabs)].v
 		return nil
@@ -212,8 +221,17 @@ func (m *Model) key(k tea.KeyPressMsg) tea.Cmd {
 		return m.secretsKey(k)
 	case viewInspect:
 		m.inspectKey(k)
+	case viewLog:
+		m.logKey(k)
 	}
 	return nil
+}
+
+// quit hides a shown value, cancels the log follow and ends the program.
+func (m *Model) quit() tea.Cmd {
+	m.hide()
+	m.stopFollow()
+	return tea.Quit
 }
 
 func (m *Model) namespacesKey(k tea.KeyPressMsg) {
@@ -388,6 +406,9 @@ type keyMap struct {
 	refresh, refreshAll key.Binding
 	reveal, confirm     key.Binding
 	back, viewsHelp     key.Binding
+	nsFilter            key.Binding // the Log view
+	kindFilter, clear   key.Binding
+	newest              key.Binding
 }
 
 func newKeyMap() keyMap {
@@ -412,6 +433,10 @@ func newKeyMap() keyMap {
 		reveal:     b([]string{"r"}, "r", "reveal"),
 		confirm:    b([]string{"y"}, "y", "yes"),
 		back:       b([]string{"esc"}, "esc", "back"),
+		nsFilter:   b([]string{"n"}, "n", "namespace filter"),
+		kindFilter: b([]string{"t"}, "t", "kind filter"),
+		clear:      b([]string{"c"}, "c", "clear filters"),
+		newest:     b([]string{"G"}, "G", "newest"),
 		viewsHelp:  b([]string{"1", "2", "3", "4", "tab"}, "1-4/tab", "views"), // for the footer only
 	}
 }
@@ -427,6 +452,8 @@ func (m *Model) footerKeys() []key.Binding {
 		own = []key.Binding{k.up, k.down, k.inspect, k.refresh, k.refreshAll}
 	case viewInspect:
 		own = []key.Binding{k.reveal, k.back}
+	case viewLog:
+		own = []key.Binding{k.up, k.down, k.newest, k.nsFilter, k.kindFilter, k.clear}
 	}
 	return append(own, k.viewsHelp, k.quit)
 }

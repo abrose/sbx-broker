@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -410,35 +409,6 @@ func failure(s secrets.Status) string {
 
 // printEvent writes one event as one line.
 func printEvent(w io.Writer, e eventlog.Event) error {
-	_, err := fmt.Fprintln(w, logLine(e))
+	_, err := fmt.Fprintln(w, eventlog.Line(e))
 	return err
-}
-
-// logLine is one event: time, kind, namespace, route, method, path,
-// status, secret names, message. An empty field is "-". Every field is
-// escaped (eventlog.Printable): the path, the method and the message come
-// from a sandboxed app. The fields before the message have no space.
-func logLine(e eventlog.Event) string {
-	status := ""
-	if e.Status != 0 {
-		status = strconv.Itoa(e.Status)
-	}
-	route := e.Route
-	if e.User != "" {
-		route = e.User + "@" + e.Route // a Postgres event: the app's user and the alias
-	}
-	fields := []string{e.Time.Local().Format(time.TimeOnly), string(e.Kind), e.Namespace, route, e.Method, e.Path,
-		status, strings.Join(e.Secrets, ","), e.Message}
-	last := len(fields) - 1
-	for i, f := range fields {
-		switch {
-		case f == "":
-			fields[i] = "-"
-		case i == last:
-			fields[i] = eventlog.Printable(f)
-		default:
-			fields[i] = eventlog.PrintableField(f)
-		}
-	}
-	return strings.Join(fields, " ")
 }

@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -29,6 +31,40 @@ const (
 	subscriberSize      = 256
 	fileMode            = 0o600
 )
+
+// Kinds lists every Kind in declaration order.
+var Kinds = []Kind{KindSwap, KindRefuse, KindFetch, KindReload, KindViolation, KindUnscanned, KindUpstream,
+	KindError, KindInfo, KindClose, KindReveal}
+
+// Line is one event as the CLI log and the TUI print it: time, kind,
+// namespace, route, method, path, status, secret names, message. An empty
+// field is "-". Every field is escaped (Printable): the path, the method and
+// the message come from a sandboxed app. The fields before the message have
+// no space.
+func Line(e Event) string {
+	status := ""
+	if e.Status != 0 {
+		status = strconv.Itoa(e.Status)
+	}
+	route := e.Route
+	if e.User != "" {
+		route = e.User + "@" + e.Route // a Postgres event: the app's user and the alias
+	}
+	fields := []string{e.Time.Local().Format(time.TimeOnly), string(e.Kind), e.Namespace, route, e.Method, e.Path,
+		status, strings.Join(e.Secrets, ","), e.Message}
+	last := len(fields) - 1
+	for i, f := range fields {
+		switch {
+		case f == "":
+			fields[i] = "-"
+		case i == last:
+			fields[i] = Printable(f)
+		default:
+			fields[i] = PrintableField(f)
+		}
+	}
+	return strings.Join(fields, " ")
+}
 
 // Event is one thing the broker did. Secrets holds names only.
 type Event struct {

@@ -30,6 +30,8 @@ type fakeClient struct {
 	reveals   []string // "ns/secret"
 	values    [][]byte // every slice Reveal returned, to check the wipe
 	statuses  int
+	script    []followStep // one per Follow call; later calls just wait
+	follows   int
 }
 
 func (f *fakeClient) Status(ns string) ([]admin.NamespaceStatus, error) {
@@ -68,9 +70,35 @@ func (f *fakeClient) Reveal(ns, secret string) ([]byte, error) {
 	return v, nil
 }
 
+// followStep is what one Follow call does: send events, then fail with err,
+// or (err nil) wait for the context.
+type followStep struct {
+	events []eventlog.Event
+	err    error
+}
+
 func (f *fakeClient) Follow(ctx context.Context, each func(eventlog.Event)) error {
+	f.mu.Lock()
+	f.follows++
+	var step followStep
+	if len(f.script) > 0 {
+		step, f.script = f.script[0], f.script[1:]
+	}
+	f.mu.Unlock()
+	for _, e := range step.events {
+		each(e)
+	}
+	if step.err != nil {
+		return step.err
+	}
 	<-ctx.Done()
 	return nil
+}
+
+func (f *fakeClient) followCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.follows
 }
 
 var fetched = time.Date(2026, 11, 23, 15, 4, 5, 0, time.Local)
@@ -118,6 +146,7 @@ func newHarness(t *testing.T, cl Client, opt Options) *harness {
 		h.timers = append(h.timers, timer{d, msg})
 		return nil
 	}
+	t.Cleanup(h.m.stopFollow)
 	h.run(h.m.Init())
 	return h
 }
