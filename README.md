@@ -18,7 +18,7 @@ The design is in [docs/specs/2026-11-22-sbx-broker-design.md](docs/specs/2026-11
 - Swaps placeholders in the request: in header values (as text, and inside a Base64 token such as
   `Authorization: Basic ...` or a Base64 `X-API-Key`), in the path, in the query, and in a form, JSON or `text/*`
   body.
-- Scrubs the values out of every answer: headers and body, streamed, for every content type.
+- Scrubs the values out of every answer: header values and body, streamed, for every content type.
 - Keeps the namespaces apart: the listener port decides the namespace, and a request may use only the secrets of
   that namespace.
 - Logs every swap and refusal, with secret names only.
@@ -137,7 +137,12 @@ The upstream gets the real values in their place. The placeholder may also be Ba
 
 The broker sets `Host` to the upstream's host and adds no header that names it. It removes the app's
 `Accept-Encoding`, because the scrub needs the plain bytes of the answer. An upstream that compresses anyway with
-`gzip` or `deflate` is decoded and scrubbed, and the app gets the plain answer with no `Content-Encoding`.
+`gzip` or `deflate` is decoded and scrubbed, and the app gets the plain answer with no `Content-Encoding`. It also
+removes the app's `Range` and `If-Range`: with ranges an app could read a value an upstream stored in pieces that the
+scrub does not recognize, so the upstream always sends the whole answer.
+
+Informational answers (1xx) of the upstream never pass through the scrub, so the broker drops every one except
+`100 Continue`, which it forwards with no headers.
 
 ### Postgres (coming in plan 4b)
 
@@ -188,8 +193,8 @@ approve it by hand.
 
 ## What the scrub covers
 
-The broker takes each value of the namespace out of every answer header and body, for every content type, in these
-forms, each replaced by the same form of its placeholder:
+The broker takes each value of the namespace out of every answer header value and body, for every content type, in
+these forms, each replaced by the same form of its placeholder (header names are not scrubbed):
 
 - the raw value;
 - Base64, standard and URL-safe, of the whole value, and embedded in a longer Base64 text (such as an echoed
@@ -198,7 +203,14 @@ forms, each replaced by the same form of its placeholder:
 - the JSON string escape, without and with HTML escaping (`&`, `<`, `>`), and with `/` as `\/`;
 - the `encodeURIComponent` form;
 - the lowercase-hex versions of the percent-encoded forms (`%2f` for `%2F`);
-- the values that went into this request, also when a `refresh` changed or dropped them since.
+- the HTML entity forms, as an HTML error page quotes a value: `&`, `<`, `>` as `&amp;`, `&lt;`, `&gt;`, and `"` and
+  `'` each as is or as `&#34;` / `&quot;` and `&#39;` / `&#x27;` / `&#039;`.
+
+The values are the current `ok` values of the namespace, the values that went into this request, and every value the
+namespace held since the broker started but no longer serves: one that a `refresh` changed or dropped (a failed
+fetch), one that a reload of the namespace file replaced, and the last value of a secret removed from the file. An
+upstream may have stored such a value. The broker keeps these retired values until the namespace file is removed or
+the broker stops.
 
 Other re-encodings are **not** covered: a hash, a split value, another Base64 alphabet, the plain hex of a value,
 double encoding, or any other transformation an upstream makes before it echoes a value.
@@ -213,6 +225,10 @@ These are accepted in the design:
 
 - An upstream that transforms a value before it echoes it (hashes, splits or re-encodes it other than the forms
   above) defeats the scrub.
+- The scrub knows only the values this broker process has seen. After a broker start or restart, before the first
+  successful fetch of a secret, the broker has never seen its value, so a copy an upstream stored earlier reaches the
+  app unscrubbed. The same holds for a value retired before the namespace file was removed or the broker stopped:
+  the broker forgets it then.
 - The hop from the sandbox to the broker is plain HTTP on the Mac. Any process on the Mac can connect to a listener.
 - The broker runs as your user, not isolated.
 - A sandbox can use every secret of its namespace against the upstreams of its namespace. That is the purpose; it
