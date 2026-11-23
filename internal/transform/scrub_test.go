@@ -391,6 +391,24 @@ func TestScrubUsesRequestValues(t *testing.T) {
 	}
 }
 
+// A value that left the ok state (here: the secret failed) is still
+// scrubbed from the answer, as its placeholder (finding C1).
+func TestScrubUsesRetiredValues(t *testing.T) {
+	store := t1()
+	store["api-key"] = fakeSecret{state: secrets.StateFailed}
+	sec := withRetired{store, map[string]string{"api-key": apiKey, "gone": "removed-value-77"}}
+	tr, _ := New(config.TransformSpec{Name: "swap"})
+	resp := newResp(strings.NewReader("a " + apiKey + " b " + b64("u:"+apiKey) + " c removed-value-77"))
+	if err := tr.Response(resp, "t1", sec, nil, (&doneRec{}).done); err != nil {
+		t.Fatal(err)
+	}
+	got := readBody(t, resp)
+	noLeak(t, "body", got)
+	if !strings.HasPrefix(got, "a sbxb_t1_api_key b ") || !strings.HasSuffix(got, " c sbxb_t1_gone") {
+		t.Errorf("retired values not scrubbed to their placeholders: %s", show(strings.ReplaceAll(got, "removed-value-77", "<gone>")))
+	}
+}
+
 func TestSwapRefusalUsesNothing(t *testing.T) {
 	r := get("http://api.test/x")
 	r.Header.Set("A", "sbxb_t1_api_key")
@@ -770,7 +788,7 @@ func FuzzScrubSplit(f *testing.F) {
 	f.Add([]byte(b64(apiKey)), []byte{5, 1, 1})
 	f.Add([]byte(b64("user:"+pass)), []byte{9, 1})
 	f.Add([]byte("abcabcabcab bca"), []byte{1, 2, 3})
-	pats := append(responsePatterns("t1", valueSets(nil, t1().Values())),
+	pats := append(responsePatterns("t1", valueSets(nil, t1().Values(), nil)),
 		pattern{from: "ab", to: "X", tag: "s"}, pattern{from: "abc", to: "Y", tag: "s"},
 		pattern{from: "abcab", to: "Z", tag: "s"}, pattern{from: "bca", to: "W", tag: "s"})
 	m := newMatcher(pats)

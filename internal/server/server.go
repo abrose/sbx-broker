@@ -425,7 +425,9 @@ func (b *broker) remove(name string) {
 }
 
 // stop cancels the fetches of st and closes its listeners. Its values stay
-// in the redactor until the namespace is removed.
+// in the redactor, by secret name, until the namespace is removed: the next
+// state of the namespace scrubs them from its answers, also when a secret
+// is gone from the file.
 func (b *broker) stop(st *nsState) {
 	name := st.cfg.Name
 	b.red.retire(name, st.store.Values()) // before the cancel, which may wipe them
@@ -442,17 +444,20 @@ func (b *broker) stop(st *nsState) {
 // background. A listener that does not start is logged and shown in status;
 // the others run.
 func (b *broker) start(cfg *config.Namespace, verb string, held map[int]bool) *nsState {
+	// A refresh that fails or changes a value retires the old one first.
+	retire := func(name string, v []byte) { b.red.retireOne(cfg.Name, name, v) }
 	st := &nsState{
 		cfg:     cfg,
-		store:   secrets.NewStore(cfg.Name, cfg.Secrets, b.opt.FetchTimeout, b.log),
+		store:   secrets.NewStore(cfg.Name, cfg.Secrets, b.opt.FetchTimeout, b.log, retire),
 		ports:   map[int]bool{},
 		fetched: make(chan struct{}),
 	}
 	st.ctx, st.cancel = context.WithCancel(b.fetchCtx)
 	b.red.set(cfg.Name, st.store)
 	b.log.Add(eventlog.Event{Kind: eventlog.KindReload, Namespace: cfg.Name, Message: verb})
+	sec := nsSecrets{Store: st.store, ns: cfg.Name, red: b.red}
 	for _, r := range cfg.HTTP {
-		h, err := b.listen(cfg.Name, r, st.store, held[r.Listen])
+		h, err := b.listen(cfg.Name, r, sec, held[r.Listen])
 		if err != nil {
 			st.errs = append(st.errs, err.Error())
 			b.log.Add(eventlog.Event{Kind: eventlog.KindError, Namespace: cfg.Name, Route: r.Name, Message: err.Error()})
@@ -477,7 +482,7 @@ func (b *broker) start(cfg *config.Namespace, verb string, held map[int]bool) *n
 // the namespace held the port: the old socket is closed, but a fetch
 // command forked a moment before holds a copy until its exec, so a bind
 // that finds the port in use is tried again for up to rebindWait.
-func (b *broker) listen(ns string, r config.Route, store *secrets.Store, held bool) (*proxy.HTTP, error) {
+func (b *broker) listen(ns string, r config.Route, sec transform.Secrets, held bool) (*proxy.HTTP, error) {
 	trs := make([]transform.Transform, 0, len(r.Transforms))
 	for _, spec := range r.Transforms {
 		tr, err := transform.New(spec)
@@ -486,7 +491,7 @@ func (b *broker) listen(ns string, r config.Route, store *secrets.Store, held bo
 		}
 		trs = append(trs, tr)
 	}
-	h := proxy.NewHTTP(ns, r, store, trs, b.log)
+	h := proxy.NewHTTP(ns, r, sec, trs, b.log)
 	deadline := time.Now().Add(rebindWait)
 	for {
 		err := h.Start()
@@ -530,8 +535,7 @@ func (b *broker) Refresh(_ context.Context, ns, secret string) ([]admin.Namespac
 	if secret != "" && !st.defines(secret) {
 		return nil, fmt.Errorf("unknown secret %s in namespace %s", secret, ns)
 	}
-	// The values the fetch replaces stay redacted.
-	b.red.retire(ns, st.store.Values())
+	// The store retires each value the fetch drops or replaces (see start).
 	if secret == "" {
 		st.store.FetchAll(st.ctx)
 	} else {
@@ -556,10 +560,26 @@ func (b *broker) Reload(ctx context.Context) error {
 	}
 }
 
-// redactor replaces every value the broker holds in a log text: the ok
-// values of every running namespace, read from the stores at call time,
-// and the values a refresh or a reload replaced, until the namespace is
-// removed. It runs under the log's mutex, so it never calls the log.
+// nsSecrets is what the listeners of a namespace see: the current store for
+// the requests, plus the values the namespace retired for the answer scrub.
+type nsSecrets struct {
+	*secrets.Store
+	ns  string
+	red *redactor
+}
+
+var _ transform.Secrets = nsSecrets{}
+
+// Retired implements transform.Secrets.
+func (s nsSecrets) Retired() map[string][][]byte { return s.red.retiredCopies(s.ns) }
+
+// redactor keeps the values the broker holds and held: the ok values of
+// every running namespace, read from the stores at call time, and the values
+// that left the ok state (a failed or changing refresh, a reload, a secret
+// removed from the file), by secret name, until the namespace is removed or
+// the broker stops. It replaces each in a log text, and gives the retired
+// ones to the answer scrub (finding C1). redact runs under the log's mutex,
+// so the redactor never calls the log.
 type redactor struct {
 	mu sync.RWMutex
 	ns map[string]*redactNS
@@ -567,7 +587,7 @@ type redactor struct {
 
 type redactNS struct {
 	store   *secrets.Store
-	retired [][]byte
+	retired map[string][][]byte // by secret name; copies the redactor owns
 }
 
 // set makes s the current store of ns. Retired values stay.
@@ -576,24 +596,47 @@ func (r *redactor) set(ns string, s *secrets.Store) {
 	defer r.mu.Unlock()
 	e := r.ns[ns]
 	if e == nil {
-		e = &redactNS{}
+		e = &redactNS{retired: map[string][][]byte{}}
 		r.ns[ns] = e
 	}
 	e.store = s
 }
 
-// retire keeps the values (copies it owns) of ns until drop.
+// retire keeps the values (copies it owns) of ns, by secret name, until
+// drop.
 func (r *redactor) retire(ns string, vals map[string][]byte) {
+	for name, v := range vals {
+		r.retireOne(ns, name, v)
+	}
+}
+
+// retireOne keeps v (a copy it owns) as a retired value of secret name in
+// ns. A value it has already, or one of a namespace it does not know, is
+// wiped.
+func (r *redactor) retireOne(ns, name string, v []byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e := r.ns[ns]
-	for _, v := range vals {
-		if e == nil || slices.ContainsFunc(e.retired, func(old []byte) bool { return bytes.Equal(old, v) }) {
-			clear(v)
-			continue
-		}
-		e.retired = append(e.retired, v)
+	if e == nil || slices.ContainsFunc(e.retired[name], func(old []byte) bool { return bytes.Equal(old, v) }) {
+		clear(v)
+		return
 	}
+	e.retired[name] = append(e.retired[name], v)
+}
+
+// retiredCopies returns copies of the retired values of ns, by secret name.
+func (r *redactor) retiredCopies(ns string) map[string][][]byte {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := map[string][][]byte{}
+	if e := r.ns[ns]; e != nil {
+		for name, vs := range e.retired {
+			for _, v := range vs {
+				out[name] = append(out[name], append([]byte(nil), v...))
+			}
+		}
+	}
+	return out
 }
 
 // drop forgets ns and wipes its retired values.
@@ -601,8 +644,10 @@ func (r *redactor) drop(ns string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if e := r.ns[ns]; e != nil {
-		for _, v := range e.retired {
-			clear(v)
+		for _, vs := range e.retired {
+			for _, v := range vs {
+				clear(v)
+			}
 		}
 		delete(r.ns, ns)
 	}
@@ -655,7 +700,9 @@ func (r *redactor) redact(s string) string {
 		for _, v := range e.store.Values() {
 			fresh = append(fresh, v)
 		}
-		all = append(all, e.retired...)
+		for _, vs := range e.retired {
+			all = append(all, vs...)
+		}
 	}
 	all = append(all, fresh...)
 	// The proxy logs the escaped path (url.URL.EscapedPath of the decoded

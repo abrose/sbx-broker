@@ -291,11 +291,18 @@ func wipe(vals map[string][]byte) {
 }
 
 // Response scrubs every header value and the body, decoded from gzip or
-// deflate first: each value that went into the request and each ok value of
-// the namespace, in each form the broker sends (see responsePatterns),
-// becomes the same form of its placeholder.
+// deflate first: each value that went into the request, each ok value and
+// each retired value of the namespace, in each form the broker sends (see
+// responsePatterns), becomes the same form of its placeholder.
 func (swap) Response(resp *http.Response, ns string, sec Secrets, used map[string][]byte, done func(scrubbed []string)) error {
-	m := newMatcher(responsePatterns(ns, valueSets(used, sec.Values())))
+	current, retired := sec.Values(), sec.Retired()
+	m := newMatcher(responsePatterns(ns, valueSets(used, current, retired)))
+	wipe(current) // the copies of sec; used belongs to the caller
+	for _, vs := range retired {
+		for _, v := range vs {
+			clear(v)
+		}
+	}
 	hits := &hitSet{}
 	// The headers first, on every path: Content-Encoding may echo a value,
 	// and the error below quotes it.

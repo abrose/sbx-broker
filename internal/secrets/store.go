@@ -62,14 +62,19 @@ type Store struct {
 	ns      string
 	timeout time.Duration
 	log     *eventlog.Log
+	retire  func(name string, v []byte)
 	mu      sync.RWMutex
 	entries map[string]*entry
 	closed  bool // guarded by mu; set by Wipe
 }
 
-// NewStore makes a store with every secret pending.
-func NewStore(ns string, defs []config.Secret, timeout time.Duration, log *eventlog.Log) *Store {
-	s := &Store{ns: ns, timeout: timeout, log: log, entries: map[string]*entry{}}
+// NewStore makes a store with every secret pending. When a fetch drops an ok
+// value (it fails) or replaces it with another, retire, if not nil, gets a
+// copy of the old value first, while the store still serves it: an upstream
+// may have stored the value, so the answer scrub must still know it. retire
+// owns the copy and runs with no lock of the store held.
+func NewStore(ns string, defs []config.Secret, timeout time.Duration, log *eventlog.Log, retire func(name string, v []byte)) *Store {
+	s := &Store{ns: ns, timeout: timeout, log: log, retire: retire, entries: map[string]*entry{}}
 	for _, d := range defs {
 		s.entries[d.Name] = &entry{def: d, state: Status{
 			Name: d.Name, Placeholder: placeholder.Format(ns, d.Name), State: StatePending,
@@ -107,7 +112,9 @@ func (s *Store) Fetch(ctx context.Context, name string) error {
 	return err
 }
 
+// record runs under e.run, so only Wipe can change e.value meanwhile.
 func (s *Store) record(e *entry, value []byte, exit int, err error) {
+	s.retireOld(e, value, err)
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -138,6 +145,23 @@ func (s *Store) record(e *entry, value []byte, exit int, err error) {
 		ev.Message = "failed: " + logReason(err)
 	}
 	s.log.Add(ev)
+}
+
+// retireOld hands a copy of the ok value of e to retire when this fetch
+// result drops it or replaces it with another value.
+func (s *Store) retireOld(e *entry, value []byte, err error) {
+	if s.retire == nil {
+		return
+	}
+	var old []byte
+	s.mu.RLock()
+	if !s.closed && e.value != nil && (err != nil || !bytes.Equal(e.value, value)) {
+		old = append([]byte(nil), e.value...)
+	}
+	s.mu.RUnlock()
+	if old != nil {
+		s.retire(e.def.Name, old)
+	}
 }
 
 // fetchError is a failed fetch. Its text (the status Err) may be the first

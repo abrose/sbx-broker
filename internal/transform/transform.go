@@ -12,10 +12,18 @@ import (
 	"github.com/abrose/sbx-broker/internal/secrets"
 )
 
-// Secrets gives the values of one namespace. *secrets.Store satisfies it.
+// Secrets gives the values of one namespace. The server gives each listener
+// its current *secrets.Store plus the values the namespace retired.
 type Secrets interface {
+	// Lookup returns a copy of the value of an ok secret, or its state.
 	Lookup(name string) ([]byte, secrets.State)
+	// Values returns copies of the ok values, by secret name.
 	Values() map[string][]byte
+	// Retired returns copies of the values that left the ok state (a failed
+	// or changing refresh, a reload, a secret removed from the file), by
+	// secret name, several per name when they differ. An upstream may have
+	// stored such a value, so the answer scrub still takes it out.
+	Retired() map[string][][]byte
 }
 
 // Refusal is a request the broker does not forward. Status is 403 or 503 and

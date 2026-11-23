@@ -115,15 +115,23 @@ func responsePatterns(ns string, values map[string][][]byte) []pattern {
 }
 
 // valueSets returns the values to scrub, by name: the union of the values
-// that went into the request and the current ones (ruling R8). A name keeps
-// both when a refresh changed its value in between.
-func valueSets(used, current map[string][]byte) map[string][][]byte {
+// that went into the request (ruling R8), the current ones and the retired
+// ones (finding C1). A name keeps each of its values that differ.
+func valueSets(used, current map[string][]byte, retired map[string][][]byte) map[string][][]byte {
 	out := map[string][][]byte{}
+	add := func(name string, v []byte) {
+		if !slices.ContainsFunc(out[name], func(w []byte) bool { return bytes.Equal(v, w) }) {
+			out[name] = append(out[name], v)
+		}
+	}
 	for _, m := range []map[string][]byte{used, current} {
 		for name, v := range m {
-			if !slices.ContainsFunc(out[name], func(w []byte) bool { return bytes.Equal(v, w) }) {
-				out[name] = append(out[name], v)
-			}
+			add(name, v)
+		}
+	}
+	for name, vs := range retired {
+		for _, v := range vs {
+			add(name, v)
 		}
 	}
 	return out

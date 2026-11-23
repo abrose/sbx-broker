@@ -17,8 +17,6 @@ import (
 	"github.com/abrose/sbx-broker/internal/secrets"
 )
 
-var _ Secrets = (*secrets.Store)(nil)
-
 const (
 	apiKey = "real-api-key-1"
 	pass   = "p@ss word/1+&"
@@ -52,6 +50,22 @@ func (f fakeSecrets) Values() map[string][]byte {
 		if s.state == secrets.StateOK {
 			out[name] = []byte(s.value)
 		}
+	}
+	return out
+}
+
+func (f fakeSecrets) Retired() map[string][][]byte { return nil }
+
+// withRetired adds retired values to a fake namespace.
+type withRetired struct {
+	fakeSecrets
+	retired map[string]string
+}
+
+func (w withRetired) Retired() map[string][][]byte {
+	out := map[string][][]byte{}
+	for name, v := range w.retired {
+		out[name] = [][]byte{[]byte(v)}
 	}
 	return out
 }

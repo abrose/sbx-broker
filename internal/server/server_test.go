@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -558,6 +559,173 @@ func TestServeRedactsReplacedValues(t *testing.T) {
 	noValues(t, state, allValues...)
 }
 
+// storingUpstream is a CRUD-like upstream: /store keeps the X-Api-Key
+// header of the request, /show answers with what it kept.
+func storingUpstream(t *testing.T) *httptest.Server {
+	t.Helper()
+	var mu sync.Mutex
+	var kept string
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.URL.Path == "/store" {
+			kept = r.Header.Get("X-Api-Key")
+		}
+		_, _ = io.WriteString(w, "kept: "+kept)
+	}))
+	t.Cleanup(s.Close)
+	return s
+}
+
+// storeThenShow has the upstream keep the value of api-key, runs change
+// (which takes the value out of the ok state), and returns what /show gives
+// the app afterwards.
+func storeThenShow(t *testing.T, port int, change func()) string {
+	t.Helper()
+	code, body, err := get(port, "/store", "sbxb_t1_api_key")
+	if err != nil || code != http.StatusOK || body != "kept: sbxb_t1_api_key" {
+		t.Fatalf("store: %d %v, body scrubbed: %v", code, err, body == "kept: sbxb_t1_api_key")
+	}
+	change()
+	code, body, err = get(port, "/show", "")
+	if err != nil || code != http.StatusOK {
+		t.Fatalf("show: %d %v", code, err)
+	}
+	return body
+}
+
+// checkShown fails when the body the app got holds a test value.
+func checkShown(t *testing.T, body string) {
+	t.Helper()
+	for i, v := range allValues {
+		if strings.Contains(body, v) {
+			t.Errorf("the app got test value #%d", i)
+		}
+	}
+	if body != "kept: sbxb_t1_api_key" {
+		t.Errorf("the stored value was not scrubbed to its placeholder")
+	}
+}
+
+// A value that a failed refresh dropped is still scrubbed from the answers
+// (finding C1): the upstream may have stored it.
+func TestServeScrubsValueAfterFailedRefresh(t *testing.T) {
+	t.Parallel()
+	cfg, state := dirs(t)
+	up := storingUpstream(t)
+	port := freePort(t)
+	valueFile := filepath.Join(t.TempDir(), "value")
+	if err := os.WriteFile(valueFile, []byte(apiKey), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeNS(t, cfg, "t1", nsYAML([]string{secretYAML("api-key", "cat", valueFile)}, []string{routeYAML("api", port, up.URL)}))
+	start(t, cfg, state)
+	waitOK(t, state, "t1", "api-key")
+	body := storeThenShow(t, port, func() {
+		if err := os.Remove(valueFile); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := do(t, state, admin.Request{Op: "refresh", Namespace: "t1", Secret: "api-key"}); err != nil {
+			t.Fatal(err)
+		}
+		if st := secretState(t, state, "t1", "api-key"); st != secrets.StateFailed {
+			t.Fatalf("state %s after the failed refresh", st)
+		}
+	})
+	checkShown(t, body)
+}
+
+// A reload that rewrites the namespace file starts a new store with every
+// secret pending; the old value is still scrubbed.
+func TestServeScrubsValueAfterReload(t *testing.T) {
+	t.Parallel()
+	cfg, state := dirs(t)
+	up := storingUpstream(t)
+	port := freePort(t)
+	route := []string{routeYAML("api", port, up.URL)}
+	writeNS(t, cfg, "t1", nsYAML([]string{secretYAML("api-key", "printf", "%s", apiKey)}, route))
+	start(t, cfg, state)
+	waitOK(t, state, "t1", "api-key")
+	body := storeThenShow(t, port, func() {
+		writeNS(t, cfg, "t1", nsYAML([]string{secretYAML("api-key", "sleep", "30")}, route))
+		waitFor(t, 3*time.Second, "the reload", func() bool {
+			return secretState(t, state, "t1", "api-key") == secrets.StatePending
+		})
+	})
+	checkShown(t, body)
+}
+
+// A secret removed from the namespace file: its last value is still
+// scrubbed, to the placeholder it had.
+func TestServeScrubsValueOfRemovedSecret(t *testing.T) {
+	t.Parallel()
+	cfg, state := dirs(t)
+	up := storingUpstream(t)
+	port := freePort(t)
+	route := []string{routeYAML("api", port, up.URL)}
+	writeNS(t, cfg, "t1", nsYAML([]string{secretYAML("api-key", "printf", "%s", apiKey)}, route))
+	start(t, cfg, state)
+	waitOK(t, state, "t1", "api-key")
+	body := storeThenShow(t, port, func() {
+		writeNS(t, cfg, "t1", nsYAML([]string{secretYAML("other", "printf", "%s", otherKey)}, route))
+		waitFor(t, 3*time.Second, "the reload", func() bool {
+			n, ok := status(t, state, "t1")
+			return ok && len(n.Secrets) == 1 && n.Secrets[0].Name == "other"
+		})
+	})
+	checkShown(t, body)
+}
+
+// retiredOf returns the redactor's own retired slices of ns (not copies), so
+// a test can see them wiped.
+func (r *redactor) retiredOf(ns string) map[string][][]byte {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := map[string][][]byte{}
+	if e := r.ns[ns]; e != nil {
+		for name, vs := range e.retired {
+			out[name] = slices.Clone(vs)
+		}
+	}
+	return out
+}
+
+// The values a namespace retired are wiped when its file is removed.
+func TestServeWipesRetiredValuesOnRemove(t *testing.T) {
+	t.Parallel()
+	cfg, state := dirs(t)
+	b := testBroker(t, cfg, state)
+	writeNS(t, cfg, "t1", nsYAML([]string{secretYAML("api-key", "printf", "%s", apiKey)}, nil))
+	if err := b.scan(scanReload); err != nil {
+		t.Fatal(err)
+	}
+	<-b.nss["t1"].fetched
+	// A reload retires the value.
+	writeNS(t, cfg, "t1", nsYAML([]string{secretYAML("api-key", "printf", "%s", otherKey)}, nil))
+	if err := b.scan(scanReload); err != nil {
+		t.Fatal(err)
+	}
+	<-b.nss["t1"].fetched
+	retired := b.red.retiredOf("t1")
+	if len(retired["api-key"]) != 1 || string(retired["api-key"][0]) != apiKey {
+		t.Fatalf("retired: %d values of api-key", len(retired["api-key"]))
+	}
+	if err := os.Remove(filepath.Join(cfg, "t1.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.scan(scanReload); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range retired["api-key"] {
+		if !bytes.Equal(v, make([]byte, len(v))) {
+			t.Error("a retired value was not wiped")
+		}
+	}
+	if n := len(b.red.retiredOf("t1")); n != 0 {
+		t.Errorf("t1 still has %d retired names", n)
+	}
+}
+
 // The proxy logs the escaped path, so the redactor must also know a value
 // in that form.
 func TestServeRedactsEscapedPath(t *testing.T) {
@@ -854,7 +1022,7 @@ func TestListenRetriesHeldPort(t *testing.T) {
 	t.Parallel()
 	cfg, state := dirs(t)
 	b := testBroker(t, cfg, state)
-	store := secrets.NewStore("t1", nil, time.Second, b.log)
+	store := nsSecrets{Store: secrets.NewStore("t1", nil, time.Second, b.log, nil), ns: "t1", red: b.red}
 	hold := func() (int, net.Listener) {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {

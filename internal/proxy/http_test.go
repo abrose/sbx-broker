@@ -65,6 +65,8 @@ func (f fakeSecrets) Values() map[string][]byte {
 	return out
 }
 
+func (f fakeSecrets) Retired() map[string][][]byte { return nil }
+
 func t1() fakeSecrets {
 	f := fakeSecrets{"slow": {state: secrets.StatePending}}
 	for name, v := range testValues {

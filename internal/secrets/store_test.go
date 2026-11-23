@@ -14,13 +14,50 @@ import (
 
 func newTestStore(t *testing.T, timeout time.Duration, defs ...config.Secret) (*Store, string) {
 	t.Helper()
+	return newRetiringStore(t, timeout, nil, defs...)
+}
+
+func newRetiringStore(t *testing.T, timeout time.Duration, retire func(string, []byte), defs ...config.Secret) (*Store, string) {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "broker.log")
 	log, err := eventlog.Open(path, 100, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = log.Close() })
-	return NewStore("t1", defs, timeout, log), path
+	return NewStore("t1", defs, timeout, log, retire), path
+}
+
+// A fetch that drops or changes an ok value hands a copy of the old value to
+// the retire func before the store lets it go (finding C1). The same value
+// again, or a failure with no value, retires nothing.
+func TestFetchRetiresDroppedValue(t *testing.T) {
+	valueFile := filepath.Join(t.TempDir(), "value")
+	write := func(v string) {
+		if err := os.WriteFile(valueFile, []byte(v), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var got []string
+	s, _ := newRetiringStore(t, 5*time.Second, func(name string, v []byte) {
+		got = append(got, name+"="+string(v))
+	}, def("a", "cat", valueFile))
+	fetch := func() { _ = s.Fetch(context.Background(), "a") }
+
+	write("value-1111")
+	fetch()
+	fetch() // the same value
+	write("value-2222")
+	fetch() // a new value
+	if err := os.Remove(valueFile); err != nil {
+		t.Fatal(err)
+	}
+	fetch() // fails
+	fetch() // fails again: no value to retire
+	want := []string{"a=value-1111", "a=value-2222"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("retired %q, want %q", got, want)
+	}
 }
 
 func def(name string, cmd ...string) config.Secret {
