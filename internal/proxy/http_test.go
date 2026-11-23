@@ -340,6 +340,26 @@ func TestProxyDropsAcceptEncoding(t *testing.T) {
 	}
 }
 
+// An app could read a value in pieces with ranges (bytes=0-6, then
+// bytes=7-13) that no scrub pattern matches, so the upstream never sees a
+// Range or an If-Range.
+func TestProxyDropsRange(t *testing.T) {
+	got := make(chan http.Header, 1)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got <- r.Header.Clone()
+	}))
+	defer up.Close()
+	h, _ := startProxy(t, up.URL)
+
+	get(t, proxyURL(h, "/"), map[string]string{"Range": "bytes=0-6", "If-Range": `"etag-1"`})
+	hdr := <-got
+	for _, name := range []string{"Range", "If-Range"} {
+		if v := hdr.Values(name); len(v) != 0 {
+			t.Errorf("upstream saw %s %v", name, v)
+		}
+	}
+}
+
 func TestProxyStreamsWithoutBuffering(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

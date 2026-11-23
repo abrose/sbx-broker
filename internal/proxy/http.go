@@ -241,6 +241,11 @@ func (h *HTTP) proxy(x *exchange) *httputil.ReverseProxy {
 			pr.SetURL(up)
 			pr.Out.Host = up.Host
 			pr.Out.Header.Del("Accept-Encoding")
+			// A range would let the app read a stored value in pieces
+			// (bytes=0-6, then bytes=7-13) that no scrub pattern
+			// matches: the upstream always sends the whole answer.
+			pr.Out.Header.Del("Range")
+			pr.Out.Header.Del("If-Range")
 		},
 		Transport:     h.transport,
 		FlushInterval: -1,
