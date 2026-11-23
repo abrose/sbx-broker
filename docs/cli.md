@@ -1,15 +1,31 @@
 # The CLI
 
 ```text
-sbx-broker serve                     run the broker until SIGINT or SIGTERM
-sbx-broker status [<ns>]             namespaces, listeners and secret states, without values
-sbx-broker refresh <ns> [<secret>]   run the fetch commands again
-sbx-broker reload                    read the namespace files again now
-sbx-broker log [-f] [<ns>]           the last 100 events; -f follows new ones
-sbx-broker help                      the usage
+sbx-broker serve                       run the broker until SIGINT or SIGTERM
+sbx-broker status [<ns>]               namespaces, listeners and secret states, without values
+sbx-broker refresh [<ns> [<secret>]]   run the fetch commands again
+sbx-broker reload                      read the namespace files again now and retry
+                                       the files and listeners that failed
+sbx-broker log [-f] [<ns>]             the last 100 events; -f follows new ones
+sbx-broker edit [<ns>]                 open the namespace file in $VISUAL or $EDITOR
+sbx-broker init <ns>                   mark this folder as a project of <ns> and create its namespace file
+sbx-broker help                        the usage
 ```
 
+`<ns>` defaults to the name in a `.sbx-broker` file in this folder or above (see [the project marker](#the-project-marker)).
 The environment variables are in [configuration.md](configuration.md#environment-variables).
+
+## The project marker
+
+The file `.sbx-broker` in a project's root folder names the project's namespace. `sbx-broker init <ns>` writes it.
+
+- The CLI looks for it in the current folder, then in each parent folder, and uses the first one it finds.
+- The first line of the file, with spaces trimmed, is the namespace name. It must match `^[a-z0-9]{1,16}$`.
+- A namespace given as an argument wins over the marker.
+- With no argument and no marker, `status` and `log` show all namespaces, and `refresh` and `edit` stop with an error.
+- The CLI refuses a marker that is a symlink or not a regular file. An error names the marker's path, never its
+  content.
+- `serve` never reads a marker. Why the marker holds only a name: see [security.md](security.md#the-project-marker).
 
 ## The admin socket
 
@@ -19,6 +35,10 @@ The environment variables are in [configuration.md](configuration.md#environment
   `a broker already runs`.
 
 ## `status`
+
+`status` shows, for each namespace, a header line and the line `file: <path of the namespace file>`. Under a project
+marker it shows only that namespace, and it starts with the line `marker: <path of the marker>`. For a namespace with
+no file, it names `sbx-broker init <ns>`.
 
 `status` shows each secret's state and its placeholder, never the value:
 
@@ -32,6 +52,23 @@ The environment variables are in [configuration.md](configuration.md#environment
 
 `refresh` runs the fetch commands of a namespace, or of one secret, again. It exits 1 when a refreshed secret is not
 `ok` afterwards.
+
+## `edit`
+
+`edit` opens the namespace file in `$VISUAL`, else `$EDITOR`, else `vi`. It splits the setting on spaces, so
+`code --wait` works, and it runs the editor with no shell. It needs no running broker. The broker reads the changed
+file within about 2 s. For a namespace with no file, `edit` names `sbx-broker init <ns>`.
+
+## `init`
+
+`init <ns>` sets up a project in the current folder. It needs no running broker.
+
+1. It writes `.sbx-broker` with `<ns>`. If the folder has a marker with the same name, it keeps it. If the marker names
+   another namespace, or is a symlink, it stops.
+2. It creates the config folder with mode 0700 if it is missing.
+3. It creates `<ns>.yaml` with mode 0600 from a template of comments. It never overwrites a namespace file.
+
+The broker loads the template as an empty namespace. Fill it with `sbx-broker edit`.
 
 ## `log`
 

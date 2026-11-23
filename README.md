@@ -96,8 +96,19 @@ Keep `serve` running, for example in its own terminal tab. A launchd agent that 
 
 ### 2. Describe the project's secrets and services
 
-Create one namespace file for the project, for example `~/.config/sbx-broker/namespaces/acme.yaml`. It holds the
-commands that print the secrets and the services to reach, never a value:
+In the project's root folder, create the project's namespace and open its file:
+
+```sh
+sbx-broker init acme      # writes .sbx-broker and ~/.config/sbx-broker/namespaces/acme.yaml
+sbx-broker edit           # opens acme.yaml in $VISUAL or $EDITOR
+```
+
+The namespace file stays on your Mac, out of reach of the sandbox, because the broker runs the commands in it. The
+project folder gets only the marker `.sbx-broker`, which holds the name `acme`. The marker shows that the project
+uses the broker, and in the project `status`, `log`, `refresh` and `edit` need no namespace name. The marker holds no
+secret, so you may commit it.
+
+The namespace file holds the commands that print the secrets and the services to reach, never a value:
 
 ```yaml
 secrets:
@@ -118,10 +129,10 @@ http:
 The broker picks up the file within about 2 s. Check it:
 
 ```sh
-sbx-broker status acme
+sbx-broker status
 ```
 
-`status` shows each secret's state and its placeholder: `sbxb_<namespace>_<secret name>`, with each `-` as `_`. Here
+`status` shows the marker, the namespace file, and each secret's state and its placeholder: `sbxb_<namespace>_<secret name>`, with each `-` as `_`. Here
 `sbxb_acme_client_secret` and `sbxb_acme_api_key`. All rules for the file are in
 [docs/configuration.md](docs/configuration.md).
 
@@ -158,19 +169,24 @@ A route forwards every method and path as they come, so only the base URL change
 ### 5. Watch it work
 
 ```sh
-sbx-broker log -f acme
+sbx-broker log -f
 ```
 
 Each call of the app shows as a `swap` event with the names of the secrets it used.
 
 ## Day to day
 
+In a project folder, the marker supplies the namespace. Elsewhere, add it (`sbx-broker status acme`), or leave it out
+of `status` and `log` to see all namespaces.
+
 | Task | Command |
 |---|---|
 | See the secrets and listeners | `sbx-broker status` |
-| Fetch a secret again, for example after a rotation or an unlock | `sbx-broker refresh acme [client-secret]` |
+| Change the secrets or routes | `sbx-broker edit` |
+| Fetch the secrets again, for example after a rotation or an unlock | `sbx-broker refresh` |
+| Fetch one secret again | `sbx-broker refresh acme client-secret` |
 | Apply a changed namespace file at once | `sbx-broker reload` |
-| Follow the log | `sbx-broker log -f [acme]` |
+| Follow the log | `sbx-broker log -f` |
 
 All commands are in [docs/cli.md](docs/cli.md).
 

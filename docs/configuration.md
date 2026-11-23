@@ -5,6 +5,9 @@
 One namespace per project, one file per namespace: `~/.config/sbx-broker/namespaces/<ns>.yaml`. A namespace name
 matches `^[a-z0-9]{1,16}$`. The file holds commands, never values.
 
+In the project's root folder, `sbx-broker init <ns>` creates the file from a template, and `sbx-broker edit` opens
+it (see [cli.md](cli.md#init)).
+
 ```yaml
 # ~/.config/sbx-broker/namespaces/acme.yaml
 secrets:

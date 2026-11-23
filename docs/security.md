@@ -7,6 +7,26 @@
 - A value never goes to disk or into a log. The log and `status` hold secret names, never values.
 - The namespaces stay apart: a request may use only the secrets of the namespace its port belongs to.
 - The admin interface is a Unix socket of your user, out of reach of a sandbox.
+- The namespace files stay on the Mac, out of reach of a sandbox (see [the project marker](#the-project-marker)).
+
+## The project marker
+
+A sandbox can write its project folder. A namespace file holds commands that the broker runs as your user, and the
+upstreams that get the real values. In the project folder, a namespace file would let the agent run code on the Mac,
+use any secret of your store, or send a value to a host of its choice. A marker that held a path would do the same:
+the agent could point it at a file that it writes.
+
+So the marker `.sbx-broker` holds only a namespace name:
+
+- `serve` never reads a marker.
+- The CLI maps the name to `<config folder>/<name>.yaml`, and it accepts only `^[a-z0-9]{1,16}$`, so the path stays in
+  the config folder.
+- The CLI refuses a marker that is a symlink or not a regular file, also when the agent swaps it during the read.
+- No error prints the marker's content, and every path the CLI prints is escaped, so a folder name cannot inject
+  terminal escapes.
+
+The agent can still change the name to another namespace of yours. Then `status` shows that namespace (names,
+placeholders and states, never values), and `edit` opens that file, which your editor shows by its path.
 
 ## What it does not do
 
