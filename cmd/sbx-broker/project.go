@@ -7,11 +7,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"syscall"
 
 	"github.com/abrose/sbx-broker/internal/eventlog"
 	"github.com/abrose/sbx-broker/internal/placeholder"
+	"github.com/abrose/sbx-broker/internal/tui"
 )
 
 // namespaceTemplate is the file that init creates: comments only, so the
@@ -55,7 +55,7 @@ func (c *command) edit(args []string) int {
 	}
 	// The editor runs in the config folder, never in the project folder: the
 	// agent can write that one, and some editors load config from it.
-	if err := c.runEditor(cfg, editorArgv(c.getenv, path)); err != nil {
+	if err := c.runEditor(cfg, tui.EditorArgv(c.getenv, path)); err != nil {
 		return c.fail(err)
 	}
 	return exitOK
@@ -132,21 +132,16 @@ func writeNew(path, content string, perm os.FileMode) error {
 	return f.Close()
 }
 
-// editorArgv is the editor command for file: $VISUAL, else $EDITOR, else vi,
-// split on spaces and run with no shell.
-func editorArgv(getenv func(string) string, file string) []string {
-	for _, key := range []string{"VISUAL", "EDITOR"} {
-		if fields := strings.Fields(getenv(key)); len(fields) > 0 {
-			return append(fields, file)
-		}
-	}
-	return []string{"vi", file}
-}
-
 // runTerminal runs argv in dir, on the terminal of the CLI.
 func runTerminal(dir string, argv []string) error {
+	return runOn(dir, argv, tui.Terminal{In: os.Stdin, Out: os.Stdout, Err: os.Stderr})
+}
+
+// runOn runs argv in dir on term: the TUI's editor key hands over the
+// terminal Bubble Tea gives it.
+func runOn(dir string, argv []string, term tui.Terminal) error {
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = dir
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = term.In, term.Out, term.Err
 	return cmd.Run()
 }

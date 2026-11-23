@@ -32,6 +32,7 @@ type fakeClient struct {
 	statuses  int
 	script    []followStep // one per Follow call; later calls just wait
 	follows   int
+	reloads   int
 }
 
 func (f *fakeClient) Status(ns string) ([]admin.NamespaceStatus, error) {
@@ -56,7 +57,12 @@ func (f *fakeClient) Refresh(ns, secret string) ([]admin.NamespaceStatus, error)
 	return nil, errors.New("unknown namespace " + ns)
 }
 
-func (f *fakeClient) Reload() error { return nil }
+func (f *fakeClient) Reload() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reloads++
+	return nil
+}
 
 func (f *fakeClient) Reveal(ns, secret string) ([]byte, error) {
 	f.mu.Lock()
@@ -113,6 +119,10 @@ func fixture() []admin.NamespaceStatus {
 			{Name: "db-pass", Placeholder: "sbxb_acme_db_pass", State: secrets.StateFailed, ExitCode: 1,
 				Err: "no such entry\x1b[2J", Command: []string{"gopass", "show", "-o", "<path>"}},
 		},
+		HTTP: []admin.RouteInfo{{Name: "api", Listen: 29610, Upstream: "https://api.example.com", Transforms: []string{"swap"}}},
+		Postgres: &admin.PostgresInfo{Listen: 29620, Databases: []admin.DatabaseInfo{
+			{Alias: "main", Upstream: "127.0.0.1:5432", DBName: "appdb", User: "appuser", Password: "db-pass"},
+		}},
 	}, {
 		Name:      "beta",
 		Listeners: []string{},
@@ -145,6 +155,10 @@ func newHarness(t *testing.T, cl Client, opt Options) *harness {
 	h.m.after = func(d time.Duration, msg tea.Msg) tea.Cmd {
 		h.timers = append(h.timers, timer{d, msg})
 		return nil
+	}
+	// The editor runs at once, as Bubble Tea would run it between two frames.
+	h.m.exec = func(c tea.ExecCommand, fn tea.ExecCallback) tea.Cmd {
+		return func() tea.Msg { return fn(c.Run()) }
 	}
 	t.Cleanup(h.m.stopFollow)
 	h.run(h.m.Init())
@@ -192,6 +206,12 @@ func keyPress(k string) tea.KeyPressMsg {
 		return tea.KeyPressMsg{Code: tea.KeyEscape}
 	case "tab":
 		return tea.KeyPressMsg{Code: tea.KeyTab}
+	case "shift+tab":
+		return tea.KeyPressMsg{Code: tea.KeyTab, Mod: tea.ModShift}
+	case "ctrl+s":
+		return tea.KeyPressMsg{Code: 's', Mod: tea.ModCtrl}
+	case "ctrl+u":
+		return tea.KeyPressMsg{Code: 'u', Mod: tea.ModCtrl}
 	case "up":
 		return tea.KeyPressMsg{Code: tea.KeyUp}
 	case "down":
@@ -201,6 +221,13 @@ func keyPress(k string) tea.KeyPressMsg {
 	}
 	r := []rune(k)
 	return tea.KeyPressMsg{Code: r[0], Text: k}
+}
+
+// typeText types s one key at a time.
+func (h *harness) typeText(s string) {
+	for _, r := range s {
+		h.send(keyPress(string(r)))
+	}
 }
 
 func (h *harness) screen() string { return h.m.render() }
@@ -513,36 +540,7 @@ func TestFooterShowsKeysOfView(t *testing.T) {
 // TestTUIAgainstRealBroker drives the model against a real broker over the
 // admin socket: the agent's stand-in for trying the TUI by hand.
 func TestTUIAgainstRealBroker(t *testing.T) {
-	cfg := filepath.Join(t.TempDir(), "namespaces")
-	if err := os.Mkdir(cfg, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	file := "secrets:\n  api-key:\n    command: [\"printf\", \"%s\", \"real-api-key-1\"]\n"
-	if err := os.WriteFile(filepath.Join(cfg, "t1.yaml"), []byte(file), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	state, err := os.MkdirTemp("/tmp", "sbxb") // a socket path has at most 104 bytes
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(state) })
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		_ = server.Run(ctx, server.Options{ConfigDir: cfg, StateDir: state, FetchTimeout: 10 * time.Second, PollInterval: 100 * time.Millisecond})
-		close(done)
-	}()
-	t.Cleanup(func() { cancel(); <-done })
-	cl := NewSocketClient(state)
-	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(50 * time.Millisecond) {
-		nss, err := cl.Status("")
-		if err == nil && len(nss) == 1 && len(nss[0].Secrets) == 1 && nss[0].Secrets[0].State == secrets.StateOK {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("the broker did not get ready: %v %v", nss, err)
-		}
-	}
+	_, cl := realBroker(t, "secrets:\n  api-key:\n    command: [\"printf\", \"%s\", \"real-api-key-1\"]\n")
 
 	h := newHarness(t, cl, Options{})
 	h.has("t1", "1 of 1 ok")
@@ -564,7 +562,7 @@ func TestTUIAgainstRealBroker(t *testing.T) {
 	fctx, stop := context.WithTimeout(context.Background(), 5*time.Second)
 	defer stop()
 	var got *eventlog.Event
-	err = cl.Follow(fctx, func(e eventlog.Event) {
+	err := cl.Follow(fctx, func(e eventlog.Event) {
 		if e.Kind == eventlog.KindReveal {
 			got = &e
 			stop()
@@ -573,6 +571,52 @@ func TestTUIAgainstRealBroker(t *testing.T) {
 	if got == nil || got.Namespace != "t1" || strings.Join(got.Secrets, ",") != "api-key" || got.Message != "revealed" {
 		t.Fatalf("no reveal event: %+v, %v", got, err)
 	}
+}
+
+// realBroker runs a broker in-process on a config dir (0700) with the
+// namespace file t1.yaml holding file, and waits until t1 has secrets and
+// each of them is ok. It returns the config dir and a socket client.
+func realBroker(t *testing.T, file string) (string, Client) {
+	t.Helper()
+	cfg := filepath.Join(t.TempDir(), "namespaces")
+	if err := os.Mkdir(cfg, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfg, "t1.yaml"), []byte(file), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state, err := os.MkdirTemp("/tmp", "sbxb") // a socket path has at most 104 bytes
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(state) })
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_ = server.Run(ctx, server.Options{ConfigDir: cfg, StateDir: state, FetchTimeout: 10 * time.Second, PollInterval: 100 * time.Millisecond})
+		close(done)
+	}()
+	t.Cleanup(func() { cancel(); <-done })
+	cl := NewSocketClient(state)
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		nss, err := cl.Status("")
+		if err == nil && len(nss) == 1 && len(nss[0].Secrets) > 0 && allOK(nss[0].Secrets) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the broker did not get ready: %v %v", nss, err)
+		}
+	}
+	return cfg, cl
+}
+
+func allOK(ss []secrets.Status) bool {
+	for _, s := range ss {
+		if s.State != secrets.StateOK {
+			return false
+		}
+	}
+	return true
 }
 
 func TestSocketClientNoBroker(t *testing.T) {

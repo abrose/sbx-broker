@@ -54,7 +54,7 @@ When the broker goes away later, the header shows the same line and the TUI keep
 | Namespaces | `NAME`, `LISTENERS`, `SECRETS` (`<ok> of <n> ok`), `ERROR` |
 | Secrets | `NAME`, `PLACEHOLDER`, `COMMAND` (cut to fit with `…`), `STATE` (`fetching` while a refresh runs), `FETCHED`, `SWAPS` |
 | Inspect | name, placeholder, the whole command, state, fetch time, exit code and error line of a failed fetch, length, `sha256 <first 8 hex>`, swaps, and `value: hidden (r to reveal)` |
-| Routes | not built yet |
+| Routes | `HTTP`: `NAME`, `LISTEN`, `UPSTREAM`, `TRANSFORMS`; `POSTGRES <listen>`: `ALIAS`, `UPSTREAM`, `DBNAME`, `USER`, `PASSWORD` (a secret name), `REQUIRE-AUTH` |
 | Log | the header `log · ns <filter> · kind <filter>`, then the newest 1,000 events, newest last, one line each, the same line `sbx-broker log` prints |
 
 The Log view follows the broker's log from the start of the TUI, also while another view shows. When the broker goes away
@@ -71,6 +71,13 @@ argument with a character other than `A-Za-z0-9_@%+=:,./-` is in single quotes.
 | Namespaces | `enter` | select the namespace, open Secrets |
 | Secrets | `enter` | Inspect |
 | Secrets | `f`, `F` | refresh the secret, refresh all of the namespace |
+| Secrets | `a`, `e` | add a secret, edit the command of the secret |
+| Routes | `a`, `p`, `e` | add an HTTP route, add a database, edit the route or database |
+| Secrets, Routes | `d`, then `y` | remove the secret, route or database; any other key after `d` cancels |
+| Secrets, Routes | `o` | open the namespace file in `$VISUAL`, else `$EDITOR`, else `vi` (in the config folder, as `edit` does) |
+| a form | `tab`, `shift+tab` | next field, previous field |
+| a form | `enter` on the last field, `ctrl+s` | save |
+| a form | `esc` | cancel |
 | Inspect | `r`, then `y` | reveal; any other key after `r` cancels |
 | Inspect | `esc` | back to Secrets |
 | Log | `n` | next namespace filter: `all`, then each namespace in order |
@@ -78,6 +85,26 @@ argument with a character other than `A-Za-z0-9_@%+=:,./-` is in single quotes.
 | Log | `c` | clear both filters |
 | Log | `up`/`k`, `down`/`j` | scroll back, scroll forward |
 | Log | `G` | back to the newest |
+
+### Edit forms
+
+The forms change the namespace file of the namespace on screen. The fields, in order:
+
+| Form | Fields |
+|---|---|
+| secret | `name`, `command` (shell words: spaces split, quotes group, a backslash escapes; no expansion, no shell) |
+| HTTP route | `name`, `listen`, `upstream` |
+| database | `alias`, `upstream`, `dbname`, `user`, `password secret`, `require-auth` (`scram-sha-256` or empty), `postgres listen` (filled with the current one) |
+
+A name or alias is fixed once it exists: an app's config holds the placeholder made from it. Transforms are not in a
+form; `o` opens the file for them. While a form is open its fields take every key as text, also `q` and the digits;
+`ctrl+c` still quits.
+
+A save checks the new file as `serve` would load it, also its ports against the other namespace files, and writes
+nothing on an error: the error shows under the form, which keeps its input. When the file changed on disk after the
+form opened, the save writes nothing, the form closes and the TUI shows
+`the namespace file changed on disk; the TUI read it again, make the change again`. A save that works replaces the file
+in one step and sends `reload`.
 
 ### Reveal
 

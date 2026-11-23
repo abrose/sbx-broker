@@ -1,7 +1,8 @@
 // Package tui is the terminal UI of sbx-broker: the namespaces, their
-// secrets, a secret's details and a confirmed reveal of its value. It shows
-// what the broker loaded (designer's call C1) and talks to the broker only
-// through a Client.
+// secrets, routes and databases, a secret's details, a confirmed reveal of its
+// value, the live log, and forms that edit the namespace files. It shows what
+// the broker loaded (designer's call C1) and talks to the broker only through
+// a Client.
 //
 // The TUI never holds a value it does not show: a revealed value is wiped
 // (every byte set to 0) and dropped at the next key press, at a view switch,
@@ -35,8 +36,10 @@ const (
 type Options struct {
 	ConfigDir string // the namespace files
 	Namespace string // the namespace of the project marker, if any: the TUI starts on its Secrets (C7)
-	// Editor runs the owner's editor in dir with argv. The edit forms use it.
-	Editor func(dir string, argv []string) error
+	// Editor runs the owner's editor in dir with argv on term, the terminal
+	// the TUI hands over. The key o uses it.
+	Editor func(dir string, argv []string, term Terminal) error
+	Getenv func(string) string // reads $VISUAL and $EDITOR; nil: os.Getenv
 }
 
 type view int
@@ -65,8 +68,9 @@ func (v view) tab() view {
 type (
 	pollMsg   struct{}
 	statusMsg struct {
-		nss []admin.NamespaceStatus
-		err error
+		nss  []admin.NamespaceStatus
+		err  error
+		once bool // an extra status after an edit: the poll chain goes on as it is
 	}
 	refreshMsg struct {
 		key string // ns + "/" + secret, as in Model.fetching
@@ -93,6 +97,8 @@ type Model struct {
 	log    logView
 	// after returns a command that sends msg after d; tests replace it.
 	after func(d time.Duration, msg tea.Msg) tea.Cmd
+	// exec gives the terminal to c (tea.Exec); tests replace it.
+	exec func(c tea.ExecCommand, fn tea.ExecCallback) tea.Cmd
 
 	view      view
 	nss       []admin.NamespaceStatus
@@ -113,6 +119,11 @@ type Model struct {
 	shown     int    // the id of the shown value; 0: none
 	value     []byte // the shown value, wiped when it hides
 	revealErr string // why the last reveal failed, printable
+
+	routeCursor int      // the row of Routes: the HTTP routes, then the databases
+	form        *form    // the open add or edit form; nil: none
+	removal     *removal // the remove that waits for its y; nil: none
+	edits       int      // the id of the last form or removal
 }
 
 // New returns the model for cl. With opt.Namespace it starts on the Secrets
@@ -124,6 +135,7 @@ func New(cl Client, opt Options) *Model {
 		keys:     newKeyMap(),
 		help:     help.New(),
 		after:    func(d time.Duration, msg tea.Msg) tea.Cmd { return tea.Tick(d, func(time.Time) tea.Msg { return msg }) },
+		exec:     tea.Exec,
 		fetching: map[string]bool{},
 	}
 	if opt.Namespace != "" {
@@ -159,13 +171,20 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.help.SetWidth(msg.Width)
 	case tea.KeyPressMsg:
 		return m, m.key(msg)
+	case tea.PasteMsg:
+		if m.form != nil {
+			return m, m.formInput(msg)
+		}
 	case tea.InterruptMsg:
 		return m, m.quit()
 	case pollMsg:
 		return m, m.statusCmd()
 	case statusMsg:
 		m.gotStatus(msg)
-		cmds := []tea.Cmd{m.after(pollEvery, pollMsg{})}
+		var cmds []tea.Cmd
+		if !msg.once {
+			cmds = append(cmds, m.after(pollEvery, pollMsg{}))
+		}
 		if !m.gone && m.statusErr == "" {
 			cmds = append(cmds, m.followCmd()) // the broker answers: follow its log if no follow runs
 		}
@@ -182,6 +201,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.id == m.shown {
 			m.hide()
 		}
+	case formBaseMsg:
+		m.gotBase(msg)
+	case savedMsg:
+		return m, m.gotSaved(msg)
+	case editedMsg:
+		return m, m.gotEdited(msg)
+	case reloadedMsg:
+		m.gotReloaded(msg)
 	}
 	return m, nil
 }
@@ -189,6 +216,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *Model) key(k tea.KeyPressMsg) tea.Cmd {
 	if key.Matches(k, m.keys.forceQuit) {
 		return m.quit()
+	}
+	if m.form != nil {
+		return m.formKey(k) // a text field takes q and the digits as text
 	}
 	if m.confirm {
 		m.confirm = false
@@ -201,6 +231,9 @@ func (m *Model) key(k tea.KeyPressMsg) tea.Cmd {
 	// whose answer has not come yet.
 	m.hide()
 	m.note = ""
+	if m.removal != nil {
+		return m.removalKey(k)
+	}
 	switch {
 	case key.Matches(k, m.keys.quit):
 		return m.quit()
@@ -219,6 +252,8 @@ func (m *Model) key(k tea.KeyPressMsg) tea.Cmd {
 		m.namespacesKey(k)
 	case viewSecrets:
 		return m.secretsKey(k)
+	case viewRoutes:
+		return m.routesKey(k)
 	case viewInspect:
 		m.inspectKey(k)
 	case viewLog:
@@ -267,6 +302,8 @@ func (m *Model) secretsKey(k tea.KeyPressMsg) tea.Cmd {
 		}
 	case key.Matches(k, m.keys.refreshAll):
 		return m.refreshCmd(ns.Name, "")
+	default:
+		return m.secretsEditKey(k, ns)
 	}
 	return nil
 }
@@ -287,6 +324,11 @@ func (m *Model) current() *admin.NamespaceStatus {
 	if name == "" && m.nsCursor < len(m.nss) {
 		name = m.nss[m.nsCursor].Name
 	}
+	return m.status(name)
+}
+
+// status returns the status of the namespace name, or nil.
+func (m *Model) status(name string) *admin.NamespaceStatus {
 	for i := range m.nss {
 		if m.nss[i].Name == name {
 			return &m.nss[i]
@@ -315,6 +357,7 @@ func (m *Model) gotStatus(msg statusMsg) {
 		m.nsCursor = min(m.nsCursor, max(len(m.nss)-1, 0))
 		if ns := m.current(); ns != nil {
 			m.secCursor = min(m.secCursor, max(len(ns.Secrets)-1, 0))
+			m.routeCursor = min(m.routeCursor, max(routeRows(ns)-1, 0))
 		}
 		if m.inspected() == nil {
 			m.hide() // the secret is gone, so Inspect cannot show its value
@@ -409,6 +452,12 @@ type keyMap struct {
 	nsFilter            key.Binding // the Log view
 	kindFilter, clear   key.Binding
 	newest              key.Binding
+	add, addRoute       key.Binding // the edit keys of Secrets and Routes
+	addDatabase, edit   key.Binding
+	remove, editor      key.Binding
+	nextField           key.Binding // in a form
+	prevField, enter    key.Binding
+	save, cancel        key.Binding
 }
 
 func newKeyMap() keyMap {
@@ -438,18 +487,38 @@ func newKeyMap() keyMap {
 		clear:      b([]string{"c"}, "c", "clear filters"),
 		newest:     b([]string{"G"}, "G", "newest"),
 		viewsHelp:  b([]string{"1", "2", "3", "4", "tab"}, "1-4/tab", "views"), // for the footer only
+
+		add:         b([]string{"a"}, "a", "add"),
+		addRoute:    b([]string{"a"}, "a", "add route"),
+		addDatabase: b([]string{"p"}, "p", "add database"),
+		edit:        b([]string{"e"}, "e", "edit"),
+		remove:      b([]string{"d"}, "d", "remove"),
+		editor:      b([]string{"o"}, "o", "open in editor"),
+		nextField:   b([]string{"tab"}, "tab", "next field"),
+		prevField:   b([]string{"shift+tab"}, "shift+tab", "previous field"),
+		enter:       b([]string{"enter"}, "enter", "next field"),
+		save:        b([]string{"ctrl+s"}, "enter/ctrl+s", "save"), // enter saves on the last field
+		cancel:      b([]string{"esc"}, "esc", "cancel"),
 	}
 }
 
 // footerKeys are the keys of the current view.
 func (m *Model) footerKeys() []key.Binding {
 	k := m.keys
+	switch {
+	case m.form != nil:
+		return []key.Binding{k.nextField, k.prevField, k.save, k.cancel, k.forceQuit}
+	case m.removal != nil:
+		return []key.Binding{k.confirm, k.forceQuit}
+	}
 	var own []key.Binding
 	switch m.view {
 	case viewNamespaces:
 		own = []key.Binding{k.up, k.down, k.open}
 	case viewSecrets:
-		own = []key.Binding{k.up, k.down, k.inspect, k.refresh, k.refreshAll}
+		own = []key.Binding{k.up, k.down, k.inspect, k.refresh, k.refreshAll, k.add, k.edit, k.remove, k.editor}
+	case viewRoutes:
+		own = []key.Binding{k.up, k.down, k.addRoute, k.addDatabase, k.edit, k.remove, k.editor}
 	case viewInspect:
 		own = []key.Binding{k.reveal, k.back}
 	case viewLog:

@@ -132,7 +132,8 @@ func TestNoArgumentStartsTUI(t *testing.T) {
 		if code != 0 || out != "" || errOut != "" || got == nil {
 			t.Fatalf("%q: code %d, out %q, err %q, ran %v", args, code, out, errOut, got != nil)
 		}
-		if got.Namespace != "t1" || got.ConfigDir != env["SBX_BROKER_CONFIG_DIR"] || got.Editor == nil {
+		if got.Namespace != "t1" || got.ConfigDir != env["SBX_BROKER_CONFIG_DIR"] || got.Editor == nil ||
+			got.Getenv == nil || got.Getenv("SBX_BROKER_CONFIG_DIR") != env["SBX_BROKER_CONFIG_DIR"] {
 			t.Fatalf("%q: options %+v", args, *got)
 		}
 		if len(nss) != 1 || nss[0].Name != "t1" {

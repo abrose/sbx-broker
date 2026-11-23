@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/abrose/sbx-broker/internal/config"
+	"github.com/abrose/sbx-broker/internal/tui"
 )
 
 // editRun is one CLI run with a recording editor.
@@ -38,23 +39,6 @@ func cliEdit(dir string, env map[string]string, args ...string) editRun {
 func configEnv(t *testing.T) (map[string]string, string) {
 	cfg := filepath.Join(t.TempDir(), "namespaces")
 	return map[string]string{"SBX_BROKER_CONFIG_DIR": cfg}, cfg
-}
-
-func TestEditorArgv(t *testing.T) {
-	cases := []struct {
-		env  map[string]string
-		want []string
-	}{
-		{map[string]string{"VISUAL": "code --wait", "EDITOR": "nano"}, []string{"code", "--wait", "f"}},
-		{map[string]string{"VISUAL": "", "EDITOR": "nano"}, []string{"nano", "f"}},
-		{map[string]string{"VISUAL": "  ", "EDITOR": ""}, []string{"vi", "f"}},
-		{nil, []string{"vi", "f"}},
-	}
-	for _, tc := range cases {
-		if got := editorArgv(func(k string) string { return tc.env[k] }, "f"); !reflect.DeepEqual(got, tc.want) {
-			t.Errorf("env %v: got %q, want %q", tc.env, got, tc.want)
-		}
-	}
 }
 
 func TestEditUsesMarker(t *testing.T) {
@@ -96,6 +80,20 @@ func TestRunTerminalDir(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "made-here")); err != nil {
 		t.Fatalf("the command did not run in %s: %v", dir, err)
+	}
+}
+
+// The TUI's editor runs on the terminal Bubble Tea hands over.
+func TestRunOnUsesTerminal(t *testing.T) {
+	dir := t.TempDir()
+	var out bytes.Buffer
+	if err := runOn(dir, []string{"pwd"}, tui.Terminal{In: strings.NewReader(""), Out: &out, Err: &out}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := filepath.EvalSymlinks(strings.TrimSpace(out.String()))
+	want, _ := filepath.EvalSymlinks(dir)
+	if err != nil || got != want {
+		t.Fatalf("pwd %q (%v), want %q", out.String(), err, want)
 	}
 }
 

@@ -143,7 +143,7 @@ func (c *command) startTUI() int {
 	if _, err := cl.Status(""); err != nil {
 		return c.fail(err)
 	}
-	if err := c.tui(cl, tui.Options{ConfigDir: cfg, Namespace: ns, Editor: c.runEditor}); err != nil {
+	if err := c.tui(cl, tui.Options{ConfigDir: cfg, Namespace: ns, Editor: runOn, Getenv: c.getenv}); err != nil {
 		return c.fail(err)
 	}
 	return exitOK

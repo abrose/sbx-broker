@@ -8,6 +8,9 @@ matches `^[a-z0-9]{1,16}$`. The file holds commands, never values.
 In the project's root folder, `sbx-broker init <ns>` creates the file from a template, and `sbx-broker edit` opens
 it (see [cli.md](cli.md#init)).
 
+The TUI's edit forms keep the file's comments and key order (not its blank lines); transforms change only in the editor
+(see [cli.md](cli.md#edit-forms)).
+
 ```yaml
 # ~/.config/sbx-broker/namespaces/acme.yaml
 secrets:
