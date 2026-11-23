@@ -3,6 +3,7 @@ module github.com/abrose/sbx-broker
 go 1.27
 
 require (
+	github.com/jackc/pgx/v5 v5.13.0
 	github.com/moby/moby/api v1.56.1
 	github.com/testcontainers/testcontainers-go v0.45.0
 	gopkg.in/yaml.v3 v3.0.1
