@@ -92,8 +92,8 @@ postgres:
 - The app's password is the placeholder of the entry's secret, `sbxb_<ns>_<secret>`. The real password goes only from
   the broker to the real server.
 - `require-auth: scram-sha-256` is optional, and its only value is `scram-sha-256`. With it, the broker lets the real
-  server's login end only in SCRAM-SHA-256. If the server asks for a cleartext password or MD5, the login ends before
-  the password leaves the broker. Use it for every server that offers SCRAM, which is the default of current Postgres
+  server's login end only in SCRAM-SHA-256. If the server asks for a cleartext password or MD5, or asks for no
+  password at all (trust), the login ends before the password leaves the broker. Use it for every server that offers SCRAM, which is the default of current Postgres
   versions: the broker's TLS to the server encrypts but checks no certificate, so without this key a fake server on the
   path could ask for the cleartext password (see [security.md](security.md#postgres)). Leave it out only for a server
   that cannot do SCRAM.

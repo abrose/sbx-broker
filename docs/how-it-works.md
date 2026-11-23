@@ -99,8 +99,9 @@ sequenceDiagram
 
 - The broker answers an `SSLRequest` or a `GSSENCRequest` of the app with `N`, so the app stays on the plain hop.
 - It speaks protocol 3.0 on both sides. A newer client is negotiated down to 3.0.
-- A refused login ends with a `FATAL` error and no connection to the real server. The codes are in
-  [troubleshooting.md](troubleshooting.md#postgres-logins).
+- A refused login ends with a `FATAL` error. Checks 1 to 5 (the first five of the diagram) refuse before any
+  connection to the real server. The refusals of the real server's login (its own error, `require-auth`, `08006`) come
+  from the attempt to log in there. The codes are in [troubleshooting.md](troubleshooting.md#postgres-logins).
 - The startup parameters of the app (such as `application_name` and `options`) go to the real server.
 
 ### The hand-off

@@ -174,7 +174,7 @@ section of the namespace file. The sandbox reaches the broker's Postgres port wi
 your Mac:
 
 ```sh
-DATABASE_URL=postgres://<user>:sbxb_acme_db_password@host.docker.internal:29620/<alias>?sslmode=disable
+DATABASE_URL=postgres://<user>:sbxb_acme_app_db_password@host.docker.internal:29620/<alias>?sslmode=disable
 ```
 
 ### 5. Watch it work
