@@ -26,6 +26,7 @@ import (
 	"github.com/abrose/sbx-broker/internal/secrets"
 	"github.com/abrose/sbx-broker/internal/server"
 	"github.com/abrose/sbx-broker/test/cases"
+	"github.com/abrose/sbx-broker/test/pgcases"
 )
 
 // The proof values. They are test values, not secrets.
@@ -35,6 +36,7 @@ const (
 	ValueOldSecret    = "real-old-secret-9"
 	ValuePass         = "p@ss word/1+&"
 	ValueOtherAPIKey  = "other-api-key-2"
+	ValueDBPass       = "real-db-pass-1"
 )
 
 // The fixed test ports of the proof routes.
@@ -42,6 +44,8 @@ const (
 	PortT1API = 29691
 	PortT1IdP = 29692
 	PortT2API = 29693
+	PortT1PG  = 29694
+	PortT2PG  = 29695
 )
 
 const (
@@ -60,12 +64,14 @@ func ProofValues() map[string]string {
 		"old-secret":    ValueOldSecret,
 		"pass":          ValuePass,
 		"t2/api-key":    ValueOtherAPIKey,
+		"db-pass":       ValueDBPass,
 	}
 }
 
 // ProofNamespaces returns the files t1 and t2, with both routes of t1 and
-// the route of t2 to the recorder at recorderBase.
-func ProofNamespaces(recorderBase string) map[string]string {
+// the route of t2 to the recorder at recorderBase, and the Postgres section
+// of each to the server at pgUpstream (host:port).
+func ProofNamespaces(recorderBase, pgUpstream string) map[string]string {
 	t1 := fmt.Sprintf(`secrets:
   api-key:
     command: ["printf", "%%s", %q]
@@ -77,6 +83,8 @@ func ProofNamespaces(recorderBase string) map[string]string {
     command: ["printf", "%%s", %q]
   broken:
     command: ["false"]
+  db-pass:
+    command: ["printf", "%%s", %q]
 http:
   - name: api
     listen: %d
@@ -84,7 +92,27 @@ http:
   - name: idp
     listen: %d
     upstream: %s
-`, ValueAPIKey, ValueClientSecret, ValueOldSecret, ValuePass, PortT1API, recorderBase, PortT1IdP, recorderBase)
+postgres:
+  listen: %d
+  databases:
+    app:
+      upstream: %s
+      dbname: appdb
+      user: app
+      password: db-pass
+      require-auth: scram-sha-256
+    down:
+      upstream: %s
+      dbname: appdb
+      user: app
+      password: broken
+    stale:
+      upstream: %s
+      dbname: appdb
+      user: app
+      password: old-secret
+`, ValueAPIKey, ValueClientSecret, ValueOldSecret, ValuePass, ValueDBPass,
+		PortT1API, recorderBase, PortT1IdP, recorderBase, PortT1PG, pgUpstream, pgUpstream, pgUpstream)
 	t2 := fmt.Sprintf(`secrets:
   api-key:
     command: ["printf", "%%s", %q]
@@ -92,7 +120,15 @@ http:
   - name: api
     listen: %d
     upstream: %s
-`, ValueOtherAPIKey, PortT2API, recorderBase)
+postgres:
+  listen: %d
+  databases:
+    app:
+      upstream: %s
+      dbname: appdb
+      user: app
+      password: api-key
+`, ValueOtherAPIKey, PortT2API, recorderBase, PortT2PG, pgUpstream)
 	return map[string]string{"t1": t1, "t2": t2}
 }
 
@@ -114,6 +150,7 @@ func ProofPlaceholders() map[string]string {
 		cases.Broken:       placeholder.Format("t1", "broken"),
 		cases.Undefined:    placeholder.Format("t1", "nope"),
 		cases.OtherNS:      placeholder.Format("t2", "api-key"),
+		pgcases.DBPass:     placeholder.Format("t1", "db-pass"),
 	}
 }
 

@@ -5,7 +5,7 @@ The broker is proved at three levels:
 | Level | Command | Needs |
 |---|---|---|
 | Unit | `go test ./...` | Go |
-| Integration | `go test -tags integration ./test/integration/` | Docker; the fixed ports 29691 to 29693 free |
+| Integration | `go test -tags integration ./test/integration/` | Docker; the fixed ports 29691 to 29695 free |
 | End to end | `go test -tags e2e -timeout 20m ./test/e2e/` | sbx; the `sbx-instance` wrapper of sbx-instances in `PATH`, with the instance `check` selected for this folder; the template `sbx-stack-base:0` in that instance |
 
 Go caches a passing result and then prints `(cached)` without running the proof. Add `-count=1` to run it again, for
@@ -14,13 +14,32 @@ example after an sbx update.
 ## Integration
 
 The recorder mock (`test/mocks/recorder`, an echo API and a mock IdP) runs in a container. The broker runs in the test
-with the test namespaces `t1` (ports 29691 and 29692) and `t2` (port 29693), and the cases of `test/cases` go through
-the routes of `t1`. The test asserts:
+with the test namespaces `t1` (HTTP ports 29691 and 29692, Postgres port 29694) and `t2` (HTTP port 29693, Postgres
+port 29695), and the cases of `test/cases` go through the routes of `t1`. The test asserts:
 
 - the mock got the real value in each place;
 - no answer and no line of `broker.log` holds a value in any covered form;
 - the refusals are right and reach no mock;
 - one log event per case.
+
+A real Postgres (`postgres:17-bookworm`) runs in a second container, with TLS from the image's snakeoil certificate,
+the image's scram-sha-256 password check, and `log_connections=on`. The entry `app` of `t1` has
+`require-auth: scram-sha-256`, so a login proves the key does not break SCRAM. The cases of `test/pgcases` log in at
+port 29694 with `pgx`:
+
+| Case | Result | Reaches the server |
+|---|---|---|
+| `pg-login` | works over TLS, `select` shows `app appdb true` | yes |
+| `pg-cancel` | a `pg_sleep(30)` ends with `57014` after a cancel request, well under 10 s | yes |
+| `pg-other-namespace` | `28000` | no |
+| `pg-failed` | `57P03`, the secret did not load | no |
+| `pg-wrong-placeholder` | `28P01` | no |
+| `pg-unknown-db` | `3D000` | no |
+| `pg-wrong-user` | `28000` | no |
+| `pg-upstream-refused` | `28P01`, the server refuses the old password | tried, no login line |
+
+"Reaches the server" is read from the server's log: a `connection authorized` line with the case's `application_name`.
+The test also asserts one `swap`, `refuse` or `upstream` event per case, and no value in any message, row or log line.
 
 ## End to end
 

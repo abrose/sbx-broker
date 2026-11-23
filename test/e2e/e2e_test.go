@@ -69,7 +69,9 @@ func TestEndToEnd(t *testing.T) {
 	run(t, ctx, stepWait, dir, nil, "sbx", "kit", "validate", filepath.Join(dir, "kit"))
 
 	base, records := harness.StartRecorder(t)
-	harness.StartBroker(t, harness.ProofNamespaces(base))
+	// The e2e proof runs no Postgres case: the broker only needs a valid
+	// upstream address, and connects to it only on a login.
+	harness.StartBroker(t, harness.ProofNamespaces(base, "127.0.0.1:5432"))
 	harness.ClearRecords(t, records)
 
 	// Registered first: a failed removal of a leftover stops the test, and

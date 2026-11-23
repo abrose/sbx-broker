@@ -20,11 +20,13 @@ import (
 	"github.com/abrose/sbx-broker/internal/eventlog"
 	"github.com/abrose/sbx-broker/test/cases"
 	"github.com/abrose/sbx-broker/test/harness"
+	"github.com/abrose/sbx-broker/test/pgcases"
 )
 
 func TestProof(t *testing.T) {
 	base, records := harness.StartRecorder(t)
-	_, state := harness.StartBroker(t, harness.ProofNamespaces(base))
+	pgUpstream, pgLogs := harness.StartPostgres(t)
+	_, state := harness.StartBroker(t, harness.ProofNamespaces(base, pgUpstream))
 	harness.ClearRecords(t, records)
 
 	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true}}
@@ -55,6 +57,8 @@ func TestProof(t *testing.T) {
 		}
 	})
 
+	t.Run("8-postgres", func(t *testing.T) { pgProof(t, state, pgLogs) })
+
 	t.Run("7-scrubbed-answers", func(t *testing.T) {
 		for _, ph := range []string{"sbxb_t1_api_key", "sbxb_t1_client_secret", "sbxb_t1_pass"} {
 			if !strings.Contains(outcomes["error"].Body, ph) {
@@ -77,25 +81,77 @@ func TestProof(t *testing.T) {
 	})
 }
 
+// pgProof is assertion 8: the Postgres cases, each with its one event.
+func pgProof(t *testing.T, state string, pgLogs func() string) {
+	outcomes := pgcases.Run(fmt.Sprintf("127.0.0.1:%d", harness.PortT1PG), harness.ProofPlaceholders())
+	harness.AssertPostgres(t, outcomes, harness.WaitUpstreamLog(pgLogs))
+
+	want := harness.PGWantEvents()
+	got := waitForPGEvents(t, state, len(want))
+	if !slices.Equal(got, want) {
+		t.Errorf("postgres events:\n got  %q\n want %q (one per case)", got, want)
+	}
+	data, err := os.ReadFile(filepath.Join(state, "broker.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		harness.NoValue(t, fmt.Sprintf("broker.log line %d", i+1), line)
+	}
+}
+
+// waitForPGEvents reads broker.log until it holds n Postgres swap, refuse or
+// upstream events, at most 3 s, and returns their keys, sorted. A swap event
+// is written at the hand-off, which may be a moment after the app got its
+// answer.
+func waitForPGEvents(t *testing.T, state string, n int) []string {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var keys []string
+		for _, e := range caseEvents(t, state) {
+			if harness.IsPGEvent(e) {
+				keys = append(keys, harness.PGEventKey(e))
+			}
+		}
+		if len(keys) >= n || time.Now().After(deadline) {
+			sort.Strings(keys)
+			return keys
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 func eventKey(kind eventlog.Kind, ns, route, method, path string, status int, secrets []string) string {
 	s := slices.Clone(secrets)
 	sort.Strings(s)
 	return fmt.Sprintf("%s %s/%s %s %s %d %v", kind, ns, route, method, path, status, s)
 }
 
-// waitForCaseEvents reads broker.log until it holds n swap or refuse events,
-// at most 3 s: a swap event is written when the proxy closes the answer,
+// waitForCaseEvents reads broker.log until it holds n swap or refuse events
+// of the HTTP routes, at most 3 s: a swap event is written when the proxy closes the answer,
 // which may be a moment after the client read it. It returns them all.
 func waitForCaseEvents(t *testing.T, state string, n int) []eventlog.Event {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		events := caseEvents(t, state)
+		events := httpEvents(caseEvents(t, state))
 		if len(events) >= n || time.Now().After(deadline) {
 			return events
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// httpEvents keeps the events of the HTTP routes api and idp.
+func httpEvents(events []eventlog.Event) []eventlog.Event {
+	var out []eventlog.Event
+	for _, e := range events {
+		if e.User == "" && (e.Route == "api" || e.Route == "idp") {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 func caseEvents(t *testing.T, state string) []eventlog.Event {
@@ -110,7 +166,7 @@ func caseEvents(t *testing.T, state string) []eventlog.Event {
 		if err := json.Unmarshal([]byte(line), &e); err != nil {
 			t.Fatalf("broker.log: %v", err)
 		}
-		if e.Kind == eventlog.KindSwap || e.Kind == eventlog.KindRefuse {
+		if e.Kind == eventlog.KindSwap || e.Kind == eventlog.KindRefuse || e.Kind == eventlog.KindUpstream {
 			out = append(out, e)
 		}
 	}
