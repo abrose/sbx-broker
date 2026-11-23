@@ -24,14 +24,32 @@ type pattern struct{ from, to, tag string }
 // R7): as text, escaped for a query or form, a path, a JSON string, and as
 // Base64 in both alphabets. Then the common re-encodings an upstream may
 // make (ruling R9): JSON with HTML escapes, JSON with \/, the
-// encodeURIComponent form, and each percent form with lowercase hex.
-var wholeForms = []func([]byte) string{
+// encodeURIComponent form, and each percent form with lowercase hex. Last
+// the HTML entity forms (htmlForms).
+var wholeForms = append([]func([]byte) string{
 	asIs, queryEscape, pathEscape, jsonEscape,
 	base64.StdEncoding.EncodeToString, base64.URLEncoding.EncodeToString,
 	jsonHTMLEscape, jsonSlashEscape, uriComponent,
 	func(v []byte) string { return lowerHex(queryEscape(v)) },
 	func(v []byte) string { return lowerHex(pathEscape(v)) },
 	func(v []byte) string { return lowerHex(uriComponent(v)) },
+}, htmlForms()...)
+
+// htmlForms are the HTML entity escapes of a value, as an HTML error page
+// (an IdP's, say) quotes it: &, < and > as &amp;, &lt; and &gt;, and " and '
+// each as is or as one of their common entities. That covers Go's
+// html.EscapeString (&#34; &#39;), Python's html.escape (&quot; &#x27;),
+// PHP's htmlspecialchars (&quot; &#039;) and an escape of text only. Forms
+// equal to another (a value without " or ') are dropped by newMatcher.
+func htmlForms() []func([]byte) string {
+	var out []func([]byte) string
+	for _, quot := range []string{`"`, "&#34;", "&quot;"} {
+		for _, apos := range []string{"'", "&#39;", "&#x27;", "&#039;"} {
+			r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, quot, "'", apos)
+			out = append(out, func(v []byte) string { return r.Replace(string(v)) })
+		}
+	}
+	return out
 }
 
 // jsonHTMLEscape is the inside of a JSON string as Go's json.Marshal writes

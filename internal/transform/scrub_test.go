@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"maps"
 	"net/http"
@@ -144,6 +145,11 @@ var forms = []struct {
 	{"lowercase query escape", func(s string) string { return lowerPercent(url.QueryEscape(s)) }},
 	{"lowercase path escape", func(s string) string { return lowerPercent(url.PathEscape(s)) }},
 	{"lowercase encodeURIComponent", func(s string) string { return lowerPercent(jsURIComponent(s)) }},
+	// The HTML entity forms (an IdP's HTML error page quotes the value).
+	{"html (Go)", html.EscapeString},
+	{"html (Python)", strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&#x27;").Replace},
+	{"html (PHP)", strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&#039;").Replace},
+	{"html text only", strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace},
 }
 
 // jsURIComponent is JavaScript's encodeURIComponent, written out here so
@@ -164,25 +170,35 @@ var percentHex = regexp.MustCompile(`%[0-9A-F]{2}`)
 
 func lowerPercent(s string) string { return percentHex.ReplaceAllStringFunc(s, strings.ToLower) }
 
-// r7Forms is how many of forms come from ruling R7; the rest are R9's.
-const r7Forms = 6
+// The first r7Forms of forms come from ruling R7, the forms up to r9Forms
+// from ruling R9, the rest are the HTML entity forms.
+const (
+	r7Forms = 6
+	r9Forms = 12
+)
 
-// TestEscapedFormsDiffer checks the test data: each R9 form of pass is a
-// text of its own, so each R9 case of TestScrubEscapedForms tests something
-// new. (Some R7 forms of pass coincide, such as its JSON escape and text.)
+// TestEscapedFormsDiffer checks the test data: each R9 form of pass, and
+// each HTML entity form of quote, is a text of its own, so each such case of
+// TestScrubEscapedForms tests something new. (Some R7 forms of pass
+// coincide, such as its JSON escape and text.)
 func TestEscapedFormsDiffer(t *testing.T) {
-	seen := map[string]string{}
-	for i, f := range forms {
-		got := f.enc(pass)
-		if other, ok := seen[got]; ok && i >= r7Forms {
-			t.Errorf("the %s form of pass equals the %s form", f.name, other)
+	for _, c := range []struct {
+		value    string
+		from, to int
+	}{{pass, r7Forms, r9Forms}, {quote, r9Forms, len(forms)}} {
+		seen := map[string]string{}
+		for i, f := range forms {
+			got := f.enc(c.value)
+			if other, ok := seen[got]; ok && i >= c.from && i < c.to {
+				t.Errorf("the %s form of %s equals the %s form", f.name, show(c.value), other)
+			}
+			seen[got] = f.name
 		}
-		seen[got] = f.name
 	}
 }
 
 func TestScrubEscapedForms(t *testing.T) {
-	for _, name := range []string{"pass", "api-key", "odd"} {
+	for _, name := range []string{"pass", "api-key", "odd", "quote"} {
 		v, ph := testValues[name], "sbxb_t1_"+strings.ReplaceAll(name, "-", "_")
 		for _, f := range forms {
 			resp := newResp(strings.NewReader("x " + f.enc(v) + " y"))

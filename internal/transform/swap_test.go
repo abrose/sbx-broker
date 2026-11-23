@@ -21,10 +21,11 @@ const (
 	apiKey = "real-api-key-1"
 	pass   = "p@ss word/1+&"
 	odd    = `o"dd<v>\al`
+	quote  = `it's <"q&a">`
 )
 
 // testValues are the ok values of the fake namespace t1, by secret name.
-var testValues = map[string]string{"api-key": apiKey, "pass": pass, "odd": odd}
+var testValues = map[string]string{"api-key": apiKey, "pass": pass, "odd": odd, "quote": quote}
 
 type fakeSecret struct {
 	value string
