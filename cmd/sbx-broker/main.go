@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -29,11 +30,13 @@ const usage = `usage: sbx-broker <command>
 commands:
   serve                      run the broker until SIGINT or SIGTERM
   status [<ns>]              namespaces, listeners and secret states, without values
-  refresh <ns> [<secret>]    run the fetch commands again
+  refresh [<ns> [<secret>]]  run the fetch commands again
   reload                     read the namespace files again now and retry
                              the files and listeners that failed
   log [-f] [<ns>]            the last 100 events; -f follows new ones
   help                       this text
+
+<ns> defaults to the name in a .sbx-broker file in this folder or above.
 
 environment:
   SBX_BROKER_CONFIG_DIR      the namespace files (default ~/.config/sbx-broker/namespaces)
@@ -54,21 +57,26 @@ func main() {
 
 // run runs one command and returns the exit code.
 func run(args []string, getenv func(string) string, stdout, stderr io.Writer) int {
+	c := &command{getenv: getenv, getwd: os.Getwd, runEditor: runTerminal, stdout: stdout, stderr: stderr}
+	return c.run(args)
+}
+
+// run runs one command with c's environment and returns the exit code.
+func (c *command) run(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprint(stderr, usage)
+		fmt.Fprint(c.stderr, usage)
 		return exitUsage
 	}
-	c := &command{getenv: getenv, stdout: stdout, stderr: stderr}
 	cmd, rest := args[0], args[1:]
 	switch {
 	case cmd == "help" || cmd == "-h" || cmd == "--help":
-		fmt.Fprint(stdout, usage)
+		fmt.Fprint(c.stdout, usage)
 		return exitOK
 	case cmd == "serve" && len(rest) == 0:
 		return c.serve()
 	case cmd == "status" && len(rest) <= 1:
 		return c.status(rest)
-	case cmd == "refresh" && len(rest) >= 1 && len(rest) <= 2:
+	case cmd == "refresh" && len(rest) <= 2:
 		return c.refresh(rest)
 	case cmd == "reload" && len(rest) == 0:
 		return c.reload()
@@ -77,9 +85,12 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) in
 			return c.log(follow, ns)
 		}
 	}
-	fmt.Fprint(stderr, usage)
+	fmt.Fprint(c.stderr, usage)
 	return exitUsage
 }
+
+// runTerminal runs an editor on the terminal. Task 3 replaces this stub.
+func runTerminal(argv []string) error { return errors.New("not implemented") }
 
 func logArgs(args []string) (follow bool, ns string, ok bool) {
 	for _, a := range args {
@@ -95,10 +106,36 @@ func logArgs(args []string) (follow bool, ns string, ok bool) {
 	return follow, ns, true
 }
 
-// command runs one CLI command with its environment and output.
+// command runs one CLI command with its environment and output. getwd and
+// runEditor are fields so that tests never use the real current folder or
+// start an editor.
 type command struct {
 	getenv         func(string) string
+	getwd          func() (string, error)
+	runEditor      func(argv []string) error
 	stdout, stderr io.Writer
+}
+
+// namespace returns args[0] when given, else the namespace of the project
+// marker of the current folder and the marker's path. With neither it
+// returns errNoMarker.
+func (c *command) namespace(args []string) (ns, marker string, err error) {
+	if len(args) > 0 {
+		return args[0], "", nil
+	}
+	dir, err := c.getwd()
+	if err != nil {
+		return "", "", err
+	}
+	marker, ns, err = findMarker(dir)
+	return ns, marker, err
+}
+
+// noNamespace reports a command that needs a namespace and found none.
+func (c *command) noNamespace() int {
+	fmt.Fprintf(c.stderr, "sbx-broker: %v\n", errNoMarker)
+	fmt.Fprint(c.stderr, usage)
+	return exitUsage
 }
 
 func (c *command) fail(err error) int {
@@ -126,8 +163,12 @@ func (c *command) stateDir() (string, error) {
 	return c.dir("SBX_BROKER_STATE_DIR", ".local", "state", "sbx-broker")
 }
 
+func (c *command) configDir() (string, error) {
+	return c.dir("SBX_BROKER_CONFIG_DIR", ".config", "sbx-broker", "namespaces")
+}
+
 func (c *command) serve() int {
-	cfg, err := c.dir("SBX_BROKER_CONFIG_DIR", ".config", "sbx-broker", "namespaces")
+	cfg, err := c.configDir()
 	if err != nil {
 		return c.fail(err)
 	}
@@ -174,26 +215,52 @@ func (c *command) namespaces(req admin.Request) ([]admin.NamespaceStatus, error)
 	return out, err
 }
 
+// status shows one namespace (the argument or the marker's) or, outside a
+// project, all of them.
 func (c *command) status(args []string) int {
-	req := admin.Request{Op: "status"}
-	if len(args) == 1 {
-		req.Namespace = args[0]
-	}
-	nss, err := c.namespaces(req)
+	cfg, err := c.configDir()
 	if err != nil {
 		return c.fail(err)
+	}
+	ns, marker, err := c.namespace(args)
+	if err != nil && !errors.Is(err, errNoMarker) {
+		return c.fail(err)
+	}
+	nss, err := c.namespaces(admin.Request{Op: "status", Namespace: ns})
+	if err != nil {
+		code := c.fail(err)
+		if ns != "" && !errors.Is(err, admin.ErrNoBroker) {
+			if _, serr := os.Stat(filepath.Join(cfg, ns+".yaml")); errors.Is(serr, fs.ErrNotExist) {
+				fmt.Fprintf(c.stderr, "create it with: sbx-broker init %s\n", ns)
+			}
+		}
+		return code
 	}
 	if len(nss) == 0 {
 		fmt.Fprintln(c.stdout, "no namespaces")
 		return exitOK
 	}
-	printStatus(c.stdout, nss)
+	if marker != "" {
+		fmt.Fprintf(c.stdout, "marker: %s\n", marker)
+	}
+	printStatus(c.stdout, nss, cfg)
 	return exitOK
 }
 
 // refresh exits 1 when a refreshed secret is not ok afterwards.
 func (c *command) refresh(args []string) int {
-	req := admin.Request{Op: "refresh", Namespace: args[0]}
+	cfg, err := c.configDir()
+	if err != nil {
+		return c.fail(err)
+	}
+	ns, _, err := c.namespace(args)
+	if errors.Is(err, errNoMarker) {
+		return c.noNamespace()
+	}
+	if err != nil {
+		return c.fail(err)
+	}
+	req := admin.Request{Op: "refresh", Namespace: ns}
 	if len(args) == 2 {
 		req.Secret = args[1]
 	}
@@ -201,7 +268,7 @@ func (c *command) refresh(args []string) int {
 	if err != nil {
 		return c.fail(err)
 	}
-	printStatus(c.stdout, nss)
+	printStatus(c.stdout, nss, cfg)
 	for _, ns := range nss {
 		for _, s := range ns.Secrets {
 			if (req.Secret == "" || s.Name == req.Secret) && s.State != secrets.StateOK {
@@ -220,7 +287,15 @@ func (c *command) reload() int {
 	return exitOK
 }
 
+// log shows the events of one namespace (the argument or the marker's) or,
+// outside a project, of all of them.
 func (c *command) log(follow bool, ns string) int {
+	if ns == "" {
+		var err error
+		if ns, _, err = c.namespace(nil); err != nil && !errors.Is(err, errNoMarker) {
+			return c.fail(err)
+		}
+	}
 	err := c.do(admin.Request{Op: "log", Namespace: ns, Follow: follow}, func(r admin.Response) error {
 		if r.Event != nil {
 			return printEvent(c.stdout, *r.Event)
@@ -233,9 +308,10 @@ func (c *command) log(follow bool, ns string) int {
 	return exitOK
 }
 
-// printStatus writes one header line per namespace and one aligned line
-// per secret, sorted by name as the broker sends them.
-func printStatus(w io.Writer, nss []admin.NamespaceStatus) {
+// printStatus writes one header line per namespace, the path of its file in
+// cfgDir, and one aligned line per secret, sorted by name as the broker sends
+// them.
+func printStatus(w io.Writer, nss []admin.NamespaceStatus, cfgDir string) {
 	for _, ns := range nss {
 		ok := 0
 		for _, s := range ns.Secrets {
@@ -248,6 +324,7 @@ func printStatus(w io.Writer, nss []admin.NamespaceStatus) {
 			where = "listening on " + strings.Join(ns.Listeners, ", ")
 		}
 		fmt.Fprintf(w, "namespace %s: %d of %d secrets ok, %s\n", ns.Name, ok, len(ns.Secrets), where)
+		fmt.Fprintf(w, "  file: %s\n", filepath.Join(cfgDir, ns.Name+".yaml"))
 		var table bytes.Buffer
 		tw := tabwriter.NewWriter(&table, 0, 0, 3, ' ', 0)
 		for _, s := range ns.Secrets {

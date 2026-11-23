@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -17,10 +18,45 @@ import (
 	"github.com/abrose/sbx-broker/internal/server"
 )
 
+// noProject is an empty folder with no marker in it: the current folder of
+// cli, so that a marker above the real current folder never changes a test.
+var noProject string
+
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "sbxb-noproject")
+	if err != nil {
+		panic(err)
+	}
+	noProject = dir
+	code := m.Run()
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
+}
+
 func cli(env map[string]string, args ...string) (int, string, string) {
+	return cliIn(noProject, env, args...)
+}
+
+// cliIn runs the CLI with dir as the current folder.
+func cliIn(dir string, env map[string]string, args ...string) (int, string, string) {
 	var out, errOut bytes.Buffer
-	code := run(args, func(k string) string { return env[k] }, &out, &errOut)
+	c := &command{
+		getenv:    func(k string) string { return env[k] },
+		getwd:     func() (string, error) { return dir, nil },
+		runEditor: func([]string) error { return errors.New("no editor in tests") },
+		stdout:    &out,
+		stderr:    &errOut,
+	}
+	code := c.run(args)
 	return code, out.String(), errOut.String()
+}
+
+// project returns a folder with a marker that names ns.
+func project(t *testing.T, ns string) string {
+	t.Helper()
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, markerName), ns+"\n", 0o644)
+	return dir
 }
 
 func stateDir(t *testing.T) string {
@@ -151,13 +187,15 @@ func TestFormatStatus(t *testing.T) {
 			{Name: "slow", Placeholder: "sbxb_t1_slow", State: secrets.StateFailed, ExitCode: 3, Err: "oops"},
 			{Name: "tmo", Placeholder: "sbxb_t1_tmo", State: secrets.StateFailed, ExitCode: -1, Err: "timeout after 1m0s"},
 		},
-	}, {Name: "t2", Listeners: []string{}, Secrets: []secrets.Status{}, Error: "route idp: address already in use"}})
+	}, {Name: "t2", Listeners: []string{}, Secrets: []secrets.Status{}, Error: "route idp: address already in use"}}, "/cfg")
 	want := "namespace t1: 1 of 4 secrets ok, listening on 127.0.0.1:29691\n" +
+		"  file: /cfg/t1.yaml\n" +
 		"  api-key   ok        sbxb_t1_api_key   len 14 sha 1a2b3c4d   fetched 13:02:11\n" +
 		"  idp       pending   sbxb_t1_idp\n" +
 		"  slow      failed    sbxb_t1_slow      exit 3: oops\n" +
 		"  tmo       failed    sbxb_t1_tmo       timeout after 1m0s\n" +
 		"namespace t2: 0 of 0 secrets ok, no listeners\n" +
+		"  file: /cfg/t2.yaml\n" +
 		"  error: route idp: address already in use\n"
 	if b.String() != want {
 		t.Fatalf("got\n%s\nwant\n%s", b.String(), want)
@@ -195,8 +233,83 @@ func TestLogLineEscapesControls(t *testing.T) {
 func TestStatusEscapesControls(t *testing.T) {
 	var b bytes.Buffer
 	printStatus(&b, []admin.NamespaceStatus{{Name: "t1", Listeners: []string{}, Error: "bad\x1b[2J",
-		Secrets: []secrets.Status{{Name: "a", Placeholder: "sbxb_t1_a", State: secrets.StateFailed, ExitCode: 3, Err: "oops\x1b]0;x\x07"}}}})
+		Secrets: []secrets.Status{{Name: "a", Placeholder: "sbxb_t1_a", State: secrets.StateFailed, ExitCode: 3, Err: "oops\x1b]0;x\x07"}}}}, "/cfg")
 	if strings.ContainsAny(b.String(), "\x1b\x07") {
 		t.Fatalf("got %q", b.String())
+	}
+}
+
+func TestStatusUsesMarker(t *testing.T) {
+	env, _ := broker(t)
+	dir := project(t, "t1")
+	code, out, errOut := cliIn(dir, env, "status")
+	head := "marker: " + filepath.Join(dir, markerName) + "\nnamespace t1:"
+	if code != 0 || !strings.HasPrefix(out, head) {
+		t.Fatalf("code %d, out %q, err %q", code, out, errOut)
+	}
+	if file := "  file: " + filepath.Join(env["SBX_BROKER_CONFIG_DIR"], "t1.yaml") + "\n"; !strings.Contains(out, file) {
+		t.Fatalf("out %q has no %q", out, file)
+	}
+}
+
+func TestStatusArgBeatsMarker(t *testing.T) {
+	env, _ := broker(t)
+	code, out, errOut := cliIn(project(t, "t9"), env, "status", "t1")
+	if code != 0 || !strings.HasPrefix(out, "namespace t1:") || strings.Contains(out, "marker:") {
+		t.Fatalf("code %d, out %q, err %q", code, out, errOut)
+	}
+}
+
+func TestStatusNoMarkerListsAll(t *testing.T) {
+	env, _ := broker(t)
+	code, out, _ := cli(env, "status")
+	if code != 0 || !strings.HasPrefix(out, "namespace t1:") || strings.Contains(out, "marker:") {
+		t.Fatalf("code %d, out %q", code, out)
+	}
+}
+
+func TestStatusMissingNamespaceHint(t *testing.T) {
+	env, _ := broker(t)
+	code, _, errOut := cliIn(project(t, "t9"), env, "status")
+	if code != 1 || !strings.Contains(errOut, "unknown namespace t9") || !strings.Contains(errOut, "create it with: sbx-broker init t9") {
+		t.Fatalf("code %d, err %q", code, errOut)
+	}
+}
+
+func TestStatusBadMarker(t *testing.T) {
+	env, _ := broker(t)
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, markerName), "../x\n", 0o644)
+	code, _, errOut := cliIn(dir, env, "status")
+	if code != 1 || !strings.Contains(errOut, "not a valid namespace name") || strings.Contains(errOut, "../x") {
+		t.Fatalf("code %d, err %q", code, errOut)
+	}
+}
+
+func TestLogUsesMarker(t *testing.T) {
+	env, _ := broker(t)
+	code, out, errOut := cliIn(project(t, "t1"), env, "log")
+	if code != 0 || out == "" {
+		t.Fatalf("code %d, out %q, err %q", code, out, errOut)
+	}
+	for _, line := range strings.Split(strings.TrimSuffix(out, "\n"), "\n") {
+		if !strings.Contains(line, " t1 ") {
+			t.Fatalf("a line of another namespace: %q", line)
+		}
+	}
+}
+
+func TestRefreshUsesMarker(t *testing.T) {
+	env, _ := broker(t)
+	code, out, errOut := cliIn(project(t, "t1"), env, "refresh")
+	if code != 0 || !strings.Contains(out, "namespace t1:") {
+		t.Fatalf("code %d, out %q, err %q", code, out, errOut)
+	}
+}
+
+func TestRefreshNoMarker(t *testing.T) {
+	code, _, errOut := cli(nil, "refresh")
+	if code != 2 || !strings.Contains(errOut, "no .sbx-broker marker") || !strings.Contains(errOut, "usage: sbx-broker") {
+		t.Fatalf("code %d, err %q", code, errOut)
 	}
 }
