@@ -48,8 +48,11 @@ type fakePG struct {
 	authMode string
 	// gone, when set, gets one value each time a connection of the fake ends.
 	gone chan struct{}
+	// sessionKey, when set, gives the secret key of the nth login (from 1)
+	// instead of the same key for every login.
+	sessionKey func(n int) []byte
 
-	mu        sync.Mutex
+	mu       sync.Mutex
 	conns     int
 	startups  []map[string]string
 	passwords []string
@@ -140,7 +143,12 @@ func (f *fakePG) serve(c net.Conn, tlsConf *tls.Config) {
 	}
 	f.mu.Lock()
 	f.startups = append(f.startups, maps.Clone(st.Parameters))
+	nth := len(f.startups)
 	f.mu.Unlock()
+	secretKey := []byte{9, 9, 9, 9}
+	if f.sessionKey != nil {
+		secretKey = f.sessionKey(nth)
+	}
 	switch f.authMode {
 	case "none": // AuthenticationOk with no authentication at all
 		be.Send(&pgproto3.AuthenticationOk{})
@@ -179,7 +187,7 @@ func (f *fakePG) serve(c net.Conn, tlsConf *tls.Config) {
 	be.Send(&pgproto3.AuthenticationOk{})
 	be.Send(&pgproto3.ParameterStatus{Name: "server_version", Value: "17.0"})
 	be.Send(&pgproto3.ParameterStatus{Name: "client_encoding", Value: "UTF8"})
-	be.Send(&pgproto3.BackendKeyData{ProcessID: 42, SecretKey: []byte{9, 9, 9, 9}})
+	be.Send(&pgproto3.BackendKeyData{ProcessID: 42, SecretKey: secretKey})
 	be.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 	if be.Flush() != nil {
 		return
@@ -342,6 +350,12 @@ func (a *pgApp) wantEOF() {
 // wantLogin reads the hand-off of the fake's login.
 func (a *pgApp) wantLogin() {
 	a.t.Helper()
+	a.wantLoginKey([]byte{9, 9, 9, 9})
+}
+
+// wantLoginKey is wantLogin for a fake that hands out the secret key key.
+func (a *pgApp) wantLoginKey(key []byte) {
+	a.t.Helper()
 	if msg := a.recv(); !isType[*pgproto3.AuthenticationOk](msg) {
 		a.t.Fatalf("got %#v, want AuthenticationOk", msg)
 	}
@@ -357,8 +371,8 @@ func (a *pgApp) wantLogin() {
 		a.t.Fatalf("parameters %v, want %v", params, want)
 	}
 	bk, ok := a.recv().(*pgproto3.BackendKeyData)
-	if !ok || bk.ProcessID != 42 || string(bk.SecretKey) != "\x09\x09\x09\x09" {
-		a.t.Fatalf("got %#v, want BackendKeyData{42, 9999}", bk)
+	if !ok || bk.ProcessID != 42 || !slices.Equal(bk.SecretKey, key) {
+		a.t.Fatalf("got %#v, want BackendKeyData{42, %v}", bk, key)
 	}
 	rq, ok := a.recv().(*pgproto3.ReadyForQuery)
 	if !ok || rq.TxStatus != 'I' {
@@ -935,9 +949,12 @@ func TestPGCancelUnknownKey(t *testing.T) {
 			fake := startFakePG(t, nil)
 			p, _, _ := loggedIn(t, fake)
 			cancelFrom(t, p, c.pid, c.key)
-			if n, cn := fake.connCount(), fake.cancelCount(); n != 1 || cn != 0 {
-				t.Errorf("the fake got %d connections and %d cancels, want only the login", n, cn)
-			}
+			// The fake counts a connection in its own goroutine, so a wrongly
+			// dialed cancel might not be counted yet. A valid cancel behind it
+			// is recorded after the wrong one, and orders the checks.
+			cancelFrom(t, p, 42, []byte{9, 9, 9, 9})
+			waitUntil(t, "the fake records the valid cancel", func() bool { return fake.cancelCount() == 1 })
+			wantOnlyCancel(t, fake, 1, pgproto3.CancelRequest{ProcessID: 42, SecretKey: []byte{9, 9, 9, 9}})
 		})
 	}
 	t.Run("no session", func(t *testing.T) {
@@ -951,14 +968,42 @@ func TestPGCancelUnknownKey(t *testing.T) {
 }
 
 func TestPGCancelAfterSessionEnd(t *testing.T) {
-	fake := startFakePG(t, nil)
-	p, l, a := loggedIn(t, fake)
-	_ = a.c.Close()
+	// Each login gets its own key, so the ended session's key is not the live
+	// session's key.
+	keyOf := func(n int) []byte { return []byte{9, 9, 9, byte(n)} }
+	fake := startFake(t, &fakePG{sessionKey: keyOf})
+	p, l := newPG(t, pgEntries(fake.addr))
+	startPG(t, p)
+	first := dialPG(t, p)
+	first.startup("app", "app")
+	first.send(&pgproto3.PasswordMessage{Password: "sbxb_t1_db_pass"})
+	first.wantLoginKey(keyOf(1))
+	_ = first.c.Close()
 	// The close event comes after the session leaves the map.
 	waitUntil(t, "the session ends", func() bool { return len(eventsOf(l, eventlog.KindClose)) == 1 })
-	cancelFrom(t, p, 42, []byte{9, 9, 9, 9})
-	if n, cn := fake.connCount(), fake.cancelCount(); n != 1 || cn != 0 {
-		t.Errorf("the fake got %d connections and %d cancels, want only the login", n, cn)
+	second := dialPG(t, p)
+	second.startup("app", "app")
+	second.send(&pgproto3.PasswordMessage{Password: "sbxb_t1_db_pass"})
+	second.wantLoginKey(keyOf(2))
+
+	cancelFrom(t, p, 42, keyOf(1)) // the ended session: no dial
+	cancelFrom(t, p, 42, keyOf(2)) // the live session: forwarded
+	waitUntil(t, "the fake records the valid cancel", func() bool { return fake.cancelCount() == 1 })
+	wantOnlyCancel(t, fake, 2, pgproto3.CancelRequest{ProcessID: 42, SecretKey: keyOf(2)})
+}
+
+// wantOnlyCancel fails unless the fake got logins login connections and one
+// cancel connection, and the cancel is want. Callers wait for the valid cancel
+// first, so a wrongly dialed one before it is counted by now.
+func wantOnlyCancel(t *testing.T, fake *fakePG, logins int, want pgproto3.CancelRequest) {
+	t.Helper()
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.conns != logins+1 || len(fake.cancels) != 1 {
+		t.Errorf("the fake got %d connections and %d cancels, want %d logins and one cancel", fake.conns, len(fake.cancels), logins)
+	}
+	if len(fake.cancels) > 0 && (fake.cancels[0].ProcessID != want.ProcessID || !slices.Equal(fake.cancels[0].SecretKey, want.SecretKey)) {
+		t.Errorf("cancel %+v, want %+v", fake.cancels[0], want)
 	}
 }
 
