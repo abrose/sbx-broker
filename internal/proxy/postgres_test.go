@@ -828,16 +828,106 @@ func TestPGRefusesReplication(t *testing.T) {
 		Message: "0A000 replication connections are not supported"})
 }
 
-// TestPGCancelCloses: until cancels are forwarded, a cancel request ends the
-// connection with no answer and no event.
-func TestPGCancelCloses(t *testing.T) {
-	p, l := newPG(t, pgEntries("127.0.0.1:1"))
+// cancelFrom opens a new connection to the listener, sends a cancel request,
+// and expects the close with no answer. The broker closes only after it has
+// dialed and written (or decided not to), so the EOF orders the checks after.
+func cancelFrom(t *testing.T, p *Postgres, pid uint32, key []byte) {
+	t.Helper()
+	a := dialPG(t, p)
+	a.send(&pgproto3.CancelRequest{ProcessID: pid, SecretKey: key})
+	a.wantEOF()
+}
+
+// waitUntil polls cond until it holds or 2 s pass.
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out: %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func (f *fakePG) cancelCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.cancels)
+}
+
+// loggedIn starts a listener on fake and returns it with an app past its login.
+func loggedIn(t *testing.T, fake *fakePG) (*Postgres, *eventlog.Log, *pgApp) {
+	t.Helper()
+	p, l := newPG(t, pgEntries(fake.addr))
 	startPG(t, p)
 	a := dialPG(t, p)
-	a.send(&pgproto3.CancelRequest{ProcessID: 42, SecretKey: []byte{9, 9, 9, 9}})
-	a.wantEOF()
-	if events := l.Recent(1000); len(events) != 0 {
-		t.Fatalf("events %+v", events)
+	a.startup("app", "app")
+	a.send(&pgproto3.PasswordMessage{Password: "sbxb_t1_db_pass"})
+	a.wantLogin()
+	return p, l, a
+}
+
+func TestPGCancelForwarded(t *testing.T) {
+	fake := startFakePG(t, nil)
+	p, l, _ := loggedIn(t, fake)
+	cancelFrom(t, p, 42, []byte{9, 9, 9, 9})
+	waitUntil(t, "the fake records the cancel", func() bool { return fake.cancelCount() == 1 })
+	fake.mu.Lock()
+	got := fake.cancels[0]
+	fake.mu.Unlock()
+	if got.ProcessID != 42 || !slices.Equal(got.SecretKey, []byte{9, 9, 9, 9}) {
+		t.Errorf("cancel %+v", got)
+	}
+	if n := fake.connCount(); n != 2 { // the login, and the cancel on its own connection
+		t.Errorf("the fake got %d connections", n)
+	}
+	for _, e := range l.Recent(1000) { // a cancel logs no event
+		if e.Kind != eventlog.KindSwap {
+			t.Errorf("event %+v", e)
+		}
+	}
+}
+
+func TestPGCancelUnknownKey(t *testing.T) {
+	cases := map[string]struct {
+		pid uint32
+		key []byte
+	}{
+		"wrong key":    {42, []byte{1, 1, 1, 1}},
+		"wrong pid":    {43, []byte{9, 9, 9, 9}},
+		"long key":     {42, []byte{9, 9, 9, 9, 9}},
+		"unknown both": {7, []byte{1, 1, 1, 1}},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			fake := startFakePG(t, nil)
+			p, _, _ := loggedIn(t, fake)
+			cancelFrom(t, p, c.pid, c.key)
+			if n, cn := fake.connCount(), fake.cancelCount(); n != 1 || cn != 0 {
+				t.Errorf("the fake got %d connections and %d cancels, want only the login", n, cn)
+			}
+		})
+	}
+	t.Run("no session", func(t *testing.T) {
+		p, l := newPG(t, pgEntries("127.0.0.1:1"))
+		startPG(t, p)
+		cancelFrom(t, p, 42, []byte{9, 9, 9, 9})
+		if events := l.Recent(1000); len(events) != 0 {
+			t.Fatalf("events %+v", events)
+		}
+	})
+}
+
+func TestPGCancelAfterSessionEnd(t *testing.T) {
+	fake := startFakePG(t, nil)
+	p, l, a := loggedIn(t, fake)
+	_ = a.c.Close()
+	// The close event comes after the session leaves the map.
+	waitUntil(t, "the session ends", func() bool { return len(eventsOf(l, eventlog.KindClose)) == 1 })
+	cancelFrom(t, p, 42, []byte{9, 9, 9, 9})
+	if n, cn := fake.connCount(), fake.cancelCount(); n != 1 || cn != 0 {
+		t.Errorf("the fake got %d connections and %d cancels, want only the login", n, cn)
 	}
 }
 

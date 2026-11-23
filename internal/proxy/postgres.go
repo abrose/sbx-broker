@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -206,7 +207,8 @@ func (p *Postgres) serve(app net.Conn) {
 		return
 	}
 	if cancel != nil {
-		return // not forwarded yet
+		p.forwardCancel(cancel)
+		return
 	}
 	l := pgLogin{user: st.Params["user"], db: st.Params["database"]}
 	if l.db == "" {
@@ -235,6 +237,49 @@ func (p *Postgres) serve(app net.Conn) {
 		return
 	}
 	p.session(app, hj, l, entry)
+}
+
+// forwardCancel sends cr to the upstream of the open session that has its PID
+// and key, on a new plain TCP connection. With no such session it dials
+// nothing. The caller closes the app's connection with no answer either way.
+// The path logs no event, writes no value and holds no secret.
+func (p *Postgres) forwardCancel(cr *pgproto3.CancelRequest) {
+	upstream, ok := p.sessionUpstream(cr)
+	if !ok {
+		return
+	}
+	buf, err := cr.Encode(nil)
+	if err != nil {
+		return
+	}
+	ctx, stop := context.WithTimeout(p.ctx, p.dialTimeout)
+	defer stop()
+	var d net.Dialer
+	c, err := d.DialContext(ctx, "tcp", upstream)
+	if err != nil {
+		return
+	}
+	if !p.track(c, false) { // Close ran
+		_ = c.Close()
+		return
+	}
+	defer p.untrack(c)
+	_ = c.SetWriteDeadline(time.Now().Add(p.dialTimeout))
+	_, _ = c.Write(buf)
+}
+
+// sessionUpstream finds the open session of cr. The key is the only secret of
+// a cancel, so it is compared in constant time against every session of the
+// PID.
+func (p *Postgres) sessionUpstream(cr *pgproto3.CancelRequest) (string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for k, s := range p.sessions {
+		if k.pid == cr.ProcessID && subtle.ConstantTimeCompare([]byte(k.key), cr.SecretKey) == 1 {
+			return s.upstream, true
+		}
+	}
+	return "", false
 }
 
 // protocolError answers a broken login with 08P01. A plain read error (the
@@ -387,13 +432,6 @@ func (p *Postgres) session(app net.Conn, hj *pgconn.HijackedConn, l pgLogin, ent
 	p.mu.Lock()
 	p.sessions[key] = s
 	p.mu.Unlock()
-	defer func() {
-		p.mu.Lock()
-		if p.sessions[key] == s {
-			delete(p.sessions, key)
-		}
-		p.mu.Unlock()
-	}()
 	e := l.event(eventlog.KindSwap, "login")
 	e.Secrets = []string{entry.Password}
 	p.add(e)
@@ -401,6 +439,13 @@ func (p *Postgres) session(app net.Conn, hj *pgconn.HijackedConn, l pgLogin, ent
 	if err := writeHandoff(app, hj); err == nil {
 		pipe(app, up)
 	}
+	// Out of the map before the close event, so a cancel after the event
+	// finds nothing. No path between the insert and here returns early.
+	p.mu.Lock()
+	if p.sessions[key] == s {
+		delete(p.sessions, key)
+	}
+	p.mu.Unlock()
 	e = l.event(eventlog.KindClose, "closed")
 	e.DurationMS = time.Since(start).Milliseconds()
 	p.add(e)
