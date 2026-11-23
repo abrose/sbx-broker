@@ -347,6 +347,27 @@ func TestSwapRefusesOtherNamespace(t *testing.T) {
 	}
 }
 
+// A placeholder of another namespace hidden in a Base64 header token is
+// refused like a plain one, and nothing of the request changes.
+func TestSwapRefusesOtherNamespaceInBase64(t *testing.T) {
+	basic := "Basic " + b64("user:sbxb_t2_api_key")
+	r := get("http://api.test/x?key=sbxb_t1_pass")
+	r.Header.Set("Authorization", basic)
+	r.Header.Set("X-API-Key", "sbxb_t1_api_key")
+	res, err := swapT1(t, r)
+	ref := refusal(t, err)
+	want := map[string]string{"error": "placeholder of another namespace", "namespace": "t2"}
+	if ref.Status != http.StatusForbidden || !maps.Equal(ref.Body, want) {
+		t.Errorf("refusal = %d %v", ref.Status, ref.Body)
+	}
+	if res.Used != nil {
+		t.Errorf("Used has %d entries", len(res.Used))
+	}
+	check(t, "Authorization", r.Header.Get("Authorization"), basic)
+	check(t, "X-API-Key", r.Header.Get("X-API-Key"), "sbxb_t1_api_key")
+	check(t, "query", r.URL.RawQuery, "key=sbxb_t1_pass")
+}
+
 func TestSwapRefusesNotLoaded(t *testing.T) {
 	cases := []struct{ placeholder, secret, state string }{
 		{"sbxb_t1_slow", "slow", "pending"},
