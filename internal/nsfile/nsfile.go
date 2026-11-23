@@ -88,7 +88,17 @@ func readNoFollow(path string) ([]byte, error) {
 // Bytes encodes the file with a two-space indent.
 func (f *File) Bytes() ([]byte, error) {
 	if len(f.root.Content) == 0 {
-		return []byte(f.prefix), nil
+		// Nothing to encode: write the comments as text, so an emptied file
+		// keeps its header.
+		out := f.prefix
+		if f.doc != nil {
+			for _, c := range []string{f.doc.HeadComment, f.doc.FootComment} {
+				if c != "" {
+					out += c + "\n"
+				}
+			}
+		}
+		return []byte(out), nil
 	}
 	var buf bytes.Buffer
 	if f.prefix != "" {
@@ -234,7 +244,7 @@ func (f *File) RemoveRoute(name string) error {
 		if v := get(it, "name"); v != nil && v.Value == name {
 			list.Content = append(list.Content[:i], list.Content[i+1:]...)
 			if len(list.Content) == 0 {
-				deleteKey(f.root, "http")
+				f.dropSection("http")
 			}
 			return nil
 		}
@@ -282,7 +292,7 @@ func (f *File) RemoveDatabase(alias string) error {
 	}
 	deleteKey(dbs, alias)
 	if len(dbs.Content) == 0 {
-		deleteKey(f.root, "postgres")
+		f.dropSection("postgres")
 	}
 	return nil
 }
@@ -294,7 +304,7 @@ func (f *File) removeFromMap(section, name string) error {
 	}
 	deleteKey(m, name)
 	if len(m.Content) == 0 {
-		deleteKey(f.root, section)
+		f.dropSection(section)
 	}
 	return nil
 }
@@ -374,6 +384,21 @@ func setTyped(m *yaml.Node, key, tag, value string) {
 		return
 	}
 	setNode(m, key, &yaml.Node{Kind: yaml.ScalarNode, Tag: tag, Value: value})
+}
+
+// dropSection removes a top-level key. When it is the first key, its head
+// comment may be the file header (yaml.v3 attaches a header without a blank
+// line to the first key), so it moves to the document.
+func (f *File) dropSection(key string) {
+	if f.doc != nil && len(f.root.Content) > 0 && f.root.Content[0].Value == key {
+		if hc := f.root.Content[0].HeadComment; hc != "" {
+			if f.doc.HeadComment != "" {
+				hc = f.doc.HeadComment + "\n\n" + hc
+			}
+			f.doc.HeadComment = hc
+		}
+	}
+	deleteKey(f.root, key)
 }
 
 func deleteKey(m *yaml.Node, key string) {

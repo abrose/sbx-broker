@@ -167,6 +167,31 @@ func TestEditsKeepCommentsAndKeyOrder(t *testing.T) {
 	}
 }
 
+func assertLinesInOrder(t *testing.T, out, text string) {
+	t.Helper()
+	pos := 0
+	for _, line := range strings.Split(strings.TrimSuffix(text, "\n"), "\n") {
+		i := strings.Index(out[pos:], line)
+		if i < 0 {
+			t.Fatalf("line %q missing or out of order in\n%s", line, out)
+		}
+		pos += i + len(line)
+	}
+}
+
+func TestRemoveLastSecretKeepsTemplateHeadComment(t *testing.T) {
+	f, _ := open(t, template+"\nsecrets:\n  k:\n    command: [\"a\"]\n")
+	must(t, f.RemoveSecret("k"))
+	assertLinesInOrder(t, bytesOf(t, f), template)
+}
+
+func TestRemoveFirstSectionKeepsFileHeader(t *testing.T) {
+	header := "# file header line 1\n# file header line 2\n"
+	f, _ := open(t, header+"secrets:\n  k:\n    command: [\"a\"]\n")
+	must(t, f.RemoveSecret("k"))
+	assertLinesInOrder(t, bytesOf(t, f), header)
+}
+
 func TestSetSecretChangesCommandOfExisting(t *testing.T) {
 	f, _ := open(t, commented)
 	must(t, f.SetSecret("db-pass", []string{"gopass", "show", "-o", "<path>"}))
