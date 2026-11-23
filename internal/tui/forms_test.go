@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
+
 	"github.com/abrose/sbx-broker/internal/admin"
 	"github.com/abrose/sbx-broker/internal/config"
 	"github.com/abrose/sbx-broker/internal/nsfile"
@@ -337,6 +339,63 @@ func TestAddRefusesExistingName(t *testing.T) {
 	h.has(`secret "api-key" exists (e edits it)`)
 	if read(t, path) != acmeFile {
 		t.Fatal("the file changed")
+	}
+}
+
+// The file decides, not the broker's status: a name added in the editor that
+// the broker has not loaded yet is refused all the same.
+func TestAddRefusesNameOnlyInFile(t *testing.T) {
+	h, dir, path := startForms(t)
+	inFile := strings.Replace(acmeFile, "  db-pass:\n", "  extra:\n    command: [\"printf\", \"e\"]\n  db-pass:\n", 1)
+	writeNamespace(t, dir, "acme", inFile)
+	h.keys("a")
+	h.typeText("extra")
+	h.keys("tab")
+	h.typeText("printf x")
+	h.keys("enter")
+	h.has(`secret "extra" exists (e edits it)`)
+	if h.m.form == nil {
+		t.Fatal("the form closed")
+	}
+	if read(t, path) != inFile || h.reloads() != 0 {
+		t.Fatal("the add changed the file")
+	}
+}
+
+// An edit of an entry that left the file (the broker has not seen it go
+// yet) does not create it again.
+func TestEditRefusesEntryGoneFromFile(t *testing.T) {
+	h, dir, path := startForms(t)
+	gone := strings.Replace(acmeFile, "  api-key: # the main key\n    command: [\"printf\", \"k\"]\n", "", 1)
+	writeNamespace(t, dir, "acme", gone)
+	h.keys("e")
+	h.has("Edit secret api-key of acme")
+	h.keys("ctrl+s")
+	h.has("secret api-key is no longer in the file")
+	if h.m.form == nil {
+		t.Fatal("the form closed")
+	}
+	if read(t, path) != gone || h.reloads() != 0 {
+		t.Fatal("the edit changed the file")
+	}
+
+	h.keys("esc")
+	writeNamespace(t, dir, "acme", strings.Split(gone, "\n# the api route")[0]+"\n")
+	h.keys("3", "e", "ctrl+s")
+	h.has("route api is no longer in the file")
+}
+
+// ctrl+v must not read the system clipboard: it often holds a password, and
+// the TUI never holds a value it does not show. A terminal paste still works.
+func TestCtrlVDoesNotReadClipboard(t *testing.T) {
+	h, _, _ := startForms(t)
+	h.keys("a")
+	if _, cmd := h.m.Update(keyPress("ctrl+v")); cmd != nil {
+		t.Fatal("ctrl+v returned a command (a clipboard read)")
+	}
+	h.send(tea.PasteMsg{Content: "pasted-name"})
+	if got := h.m.form.inputs[0].Value(); got != "pasted-name" {
+		t.Fatalf("field %q after a terminal paste", got)
 	}
 }
 

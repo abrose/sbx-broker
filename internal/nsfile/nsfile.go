@@ -213,6 +213,30 @@ func (f *File) SetSecret(name string, command []string) error {
 	return nil
 }
 
+// Kind is a kind of entry of a namespace file.
+type Kind int
+
+const (
+	KindSecret   Kind = iota // a key of secrets
+	KindRoute                // an item of http, by its name
+	KindDatabase             // a key of postgres.databases
+)
+
+// Has tells whether the file, with the edits made so far, holds the entry
+// of kind named name. The Set methods add or replace, so a caller that must
+// not replace (an add) or must not add (an edit) asks first.
+func (f *File) Has(kind Kind, name string) bool {
+	switch kind {
+	case KindSecret:
+		return get(get(f.root, "secrets"), name) != nil
+	case KindRoute:
+		list := get(f.root, "http")
+		return list != nil && list.Kind == yaml.SequenceNode && routeItem(list, name) != nil
+	default:
+		return get(get(get(f.root, "postgres"), "databases"), name) != nil
+	}
+}
+
 func (f *File) RemoveSecret(name string) error {
 	return f.removeFromMap("secrets", name)
 }

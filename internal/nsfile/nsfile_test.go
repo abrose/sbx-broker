@@ -408,3 +408,29 @@ func must(t *testing.T, err error) {
 		t.Fatal(err)
 	}
 }
+
+func TestHas(t *testing.T) {
+	f, _ := open(t, commented)
+	for _, tc := range []struct {
+		kind Kind
+		name string
+		want bool
+	}{
+		{KindSecret, "db-pass", true}, {KindSecret, "other", true}, {KindSecret, "api", false},
+		{KindRoute, "api", true}, {KindRoute, "db-pass", false},
+		{KindDatabase, "app", true}, {KindDatabase, "api", false},
+	} {
+		if got := f.Has(tc.kind, tc.name); got != tc.want {
+			t.Errorf("Has(%v, %q) = %v, want %v", tc.kind, tc.name, got, tc.want)
+		}
+	}
+	// It sees the edits in memory, and an empty file has nothing.
+	must(t, f.RemoveRoute("api"))
+	if f.Has(KindRoute, "api") {
+		t.Error("a removed route is still there")
+	}
+	empty, _ := open(t, template)
+	if empty.Has(KindSecret, "api-key") || empty.Has(KindRoute, "api") || empty.Has(KindDatabase, "app") {
+		t.Error("a file of comments has entries")
+	}
+}

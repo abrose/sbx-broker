@@ -67,12 +67,13 @@ const (
 // formSpecs name each kind and list the fields of its form, in order. The
 // first field is the name or alias.
 var formSpecs = [...]struct {
-	noun, a string // "HTTP route", "an HTTP route"
-	labels  []string
+	noun, a, word string // "HTTP route", "an HTTP route", "route"
+	labels        []string
+	file          nsfile.Kind
 }{
-	secretForm:   {"secret", "a secret", []string{"name", "command"}},
-	routeForm:    {"HTTP route", "an HTTP route", []string{"name", "listen", "upstream"}},
-	databaseForm: {"database", "a database", []string{"alias", "upstream", "dbname", "user", "password secret", "require-auth", "postgres listen"}},
+	secretForm:   {"secret", "a secret", "secret", []string{"name", "command"}, nsfile.KindSecret},
+	routeForm:    {"HTTP route", "an HTTP route", "route", []string{"name", "listen", "upstream"}, nsfile.KindRoute},
+	databaseForm: {"database", "a database", "database", []string{"alias", "upstream", "dbname", "user", "password secret", "require-auth", "postgres listen"}, nsfile.KindDatabase},
 }
 
 // form is an open add or edit form.
@@ -125,6 +126,10 @@ func (m *Model) openForm(kind formKind, ns string, edit bool, values ...string) 
 		st := in.Styles()
 		st.Cursor.Blink = false // a blinking cursor would send a tick every half second
 		in.SetStyles(st)
+		// ctrl+v would read the system clipboard (often a password) into a
+		// message the TUI drops: a value it holds but never shows. A paste
+		// of the terminal still arrives as a tea.PasteMsg.
+		in.KeyMap.Paste.SetEnabled(false)
 		if i < len(values) {
 			in.SetValue(values[i])
 		}
@@ -200,7 +205,7 @@ func (m *Model) saveForm() tea.Cmd {
 	for i, in := range f.inputs {
 		v[i] = strings.TrimSpace(in.Value())
 	}
-	apply, err := m.formEdit(f, v)
+	apply, err := formEdit(f, v)
 	if err != nil {
 		f.err = p(err.Error())
 		return nil
@@ -209,13 +214,30 @@ func (m *Model) saveForm() tea.Cmd {
 	return m.saveCmd(f.id, f.ns, f.base, "saved "+formSpecs[f.kind].noun+" "+v[0], apply)
 }
 
-// formEdit turns the values of f into the edit of the file. It refuses an
-// add of a name the broker has: the add would change that entry.
-func (m *Model) formEdit(f *form, v []string) (func(*nsfile.File) error, error) {
-	if !f.edit && m.has(f.kind, f.ns, v[0]) {
-		return nil, fmt.Errorf("%s %q exists (e edits it)", formSpecs[f.kind].noun, v[0])
+// formEdit turns the values of f into the edit of the file. The nsfile Set
+// methods add or replace, so the edit asks the opened file first: an add
+// refuses a name the file holds, and an edit refuses an entry that left it.
+// The broker's status can lag the file, so it does not decide.
+func formEdit(f *form, v []string) (func(*nsfile.File) error, error) {
+	set, err := formSet(f.kind, v)
+	if err != nil {
+		return nil, err
 	}
-	switch f.kind {
+	spec, edit, name := formSpecs[f.kind], f.edit, v[0]
+	return func(nf *nsfile.File) error {
+		switch have := nf.Has(spec.file, name); {
+		case have && !edit:
+			return fmt.Errorf("%s %q exists (e edits it)", spec.noun, name)
+		case !have && edit:
+			return fmt.Errorf("%s %s is no longer in the file", spec.word, name)
+		}
+		return set(nf)
+	}, nil
+}
+
+// formSet parses the values of a form of kind into the Set call it makes.
+func formSet(kind formKind, v []string) (func(*nsfile.File) error, error) {
+	switch kind {
 	case secretForm:
 		var argv []string // none: config.Check says the command is empty
 		if v[1] != "" {
@@ -248,37 +270,6 @@ func port(label, s string) (int, error) {
 		return 0, fmt.Errorf("%s %q is not a number", label, s)
 	}
 	return n, nil
-}
-
-// has tells whether the broker's ns has an entry of kind named name.
-func (m *Model) has(kind formKind, ns, name string) bool {
-	st := m.status(ns)
-	if st == nil {
-		return false
-	}
-	var names []string
-	switch kind {
-	case secretForm:
-		for _, s := range st.Secrets {
-			names = append(names, s.Name)
-		}
-	case routeForm:
-		for _, r := range st.HTTP {
-			names = append(names, r.Name)
-		}
-	default:
-		if st.Postgres != nil {
-			for _, d := range st.Postgres.Databases {
-				names = append(names, d.Alias)
-			}
-		}
-	}
-	for _, n := range names {
-		if n == name {
-			return true
-		}
-	}
-	return false
 }
 
 // askRemove asks for the y that removes name.
