@@ -26,11 +26,12 @@ Many real calls put the credential somewhere else, and there the built-in swap d
 | A form or JSON body, such as the `client_secret` of an OAuth token request | no: it swaps only in headers | yes |
 | The path or the query of the URL | no: it swaps only in headers | yes |
 | A Postgres login | no: the login is not HTTP | yes: the placeholder is the password, the broker logs in with the real one |
-| An answer that echoes the secret, such as an IdP error page that quotes the rejected client secret | no: the real value reaches the sandbox | yes: the broker scrubs it |
+| An answer that echoes the secret, such as an IdP error page that quotes the rejected client secret | no: the real value reaches the sandbox | yes for HTTP answers: the broker scrubs it |
 
 The last row matters even for header tokens. The sbx proxy does not scrub answers. An upstream that echoes a request
-header or body sends the real value straight into the sandbox. The broker scrubs every answer, in
-[many encoded forms](docs/how-it-works.md#the-forms-the-scrub-covers).
+header or body sends the real value straight into the sandbox. The broker scrubs every HTTP answer, in
+[many encoded forms](docs/how-it-works.md#the-forms-the-scrub-covers). For Postgres it swaps the login and scrubs the
+error of a failed login only; it does not read queries or results after the login.
 
 Often you cannot move the credential to a plain header. An app may have no setting for it, and the OAuth method
 (`client_secret_post`) or the API may not allow it. The broker needs no change to the app beyond its base URL.
@@ -216,7 +217,8 @@ Details and fixes are in [docs/troubleshooting.md](docs/troubleshooting.md).
 ## Limits
 
 The broker protects the values, not what an app may do with them: a sandbox can use every secret of its namespace
-against the services of that namespace. The hop from the sandbox to the broker is plain HTTP on your Mac. An upstream
+against the services of that namespace. The hop from the sandbox to the broker is plain HTTP (or a plain Postgres connection) on your Mac. Postgres queries
+and results after the login are not scanned: a result that holds a value reaches the sandbox as is. An upstream
 that changes a value before it echoes it (for example hashes it) defeats the scrub. WebSockets are not supported. The
 full list is in [docs/security.md](docs/security.md).
 
