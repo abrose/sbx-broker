@@ -84,6 +84,8 @@ command `fake-fetch` lives only in a temp bin dir that the plist's `PATH` names,
 the agent uses the captured `PATH`. The test asserts:
 
 - the secret is `ok` within 75 s;
+- a second install with a changed env replaces the agent: `launchctl print` shows a new pid and the new env, and the
+  secret is `ok` again within 75 s;
 - after `Uninstall`, `launchctl print gui/<uid>/io.github.abrose.sbx-broker.test` fails, the plist is gone, and no
   process holds the state dir's lock.
 

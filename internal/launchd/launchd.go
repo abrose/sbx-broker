@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 )
 
 const (
@@ -100,7 +101,9 @@ func Loaded(lc Launchctl, label string) bool {
 
 // Install writes the plist, creates the log dir, boots a loaded agent of the
 // same label out, and bootstraps the agent, which starts it (RunAtLoad).
-func Install(a Agent, lc Launchctl) error {
+func Install(a Agent, lc Launchctl) error { return install(a, lc, time.Sleep) }
+
+func install(a Agent, lc Launchctl, sleep func(time.Duration)) error {
 	if err := writeAtomic(a.PlistPath, a.Plist()); err != nil {
 		return err
 	}
@@ -111,8 +114,29 @@ func Install(a Agent, lc Launchctl) error {
 		if err := run(lc, "bootout", target(a.Label)); err != nil {
 			return err
 		}
+		if err := waitUnloaded(lc, a.Label, sleep); err != nil {
+			return err
+		}
 	}
 	return run(lc, "bootstrap", domain(), a.PlistPath)
+}
+
+const (
+	unloadPoll  = 100 * time.Millisecond
+	unloadPolls = 100 // 10 s
+)
+
+// waitUnloaded waits until launchd no longer knows label. A bootstrap right
+// after a bootout fails with an I/O error while launchd still tears the old
+// service down, and the old broker could still answer the new one's poll.
+func waitUnloaded(lc Launchctl, label string, sleep func(time.Duration)) error {
+	for range unloadPolls {
+		if !Loaded(lc, label) {
+			return nil
+		}
+		sleep(unloadPoll)
+	}
+	return fmt.Errorf("the agent %s is still loaded %v after bootout; run install again", label, unloadPoll*unloadPolls)
 }
 
 // Uninstall boots the agent out when it is loaded and removes its plist.

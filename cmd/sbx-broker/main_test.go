@@ -199,7 +199,7 @@ func TestInstallReplacesLoadedAgent(t *testing.T) {
 	if want := "installed " + plist + "\nthe broker answers on " + sock + "\n"; code != 0 || out != want || errOut != "" {
 		t.Fatalf("code %d, out %q, err %q", code, out, errOut)
 	}
-	if want := []string{"print", "print", "bootout", "bootstrap"}; !slices.Equal(f.calls, want) {
+	if want := []string{"print", "print", "bootout", "print", "bootstrap"}; !slices.Equal(f.calls, want) {
 		t.Fatalf("calls %q, want %q", f.calls, want)
 	}
 }

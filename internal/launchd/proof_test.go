@@ -7,6 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -58,18 +61,21 @@ func TestLaunchdAgentFetchesWithCapturedPath(t *testing.T) {
 	if err := Install(a, Real); err != nil {
 		t.Fatal(err)
 	}
+	waitOK(t, a, state)
+	first := agentPID(t)
 
-	deadline := time.Now().Add(75 * time.Second)
-	for {
-		st, err := secretState(state, "t1", "api-key")
-		if err == nil && st == secrets.StateOK {
-			break
-		}
-		if time.Now().After(deadline) {
-			log, _ := os.ReadFile(a.LogPath)
-			t.Fatalf("the secret is not ok after 75 s: state %q, err %v\nserve.log:\n%s", st, err, log)
-		}
-		time.Sleep(250 * time.Millisecond)
+	// A second install with a changed env replaces the running agent: a new
+	// process with the new env answers, the secret ok again.
+	a.Env["SBX_BROKER_FETCH_TIMEOUT"] = "30s"
+	if err := Install(a, Real); err != nil {
+		t.Fatalf("reinstall: %v", err)
+	}
+	waitOK(t, a, state)
+	if second := agentPID(t); second == first {
+		t.Fatalf("the reinstalled agent runs the old process %d", first)
+	}
+	if out, _ := Real("print", target(testLabel)); !strings.Contains(string(out), "SBX_BROKER_FETCH_TIMEOUT => 30s") {
+		t.Fatalf("the reinstalled agent lacks the new env:\n%s", out)
 	}
 
 	removed, err := Uninstall(a, Real)
@@ -93,6 +99,38 @@ func TestLaunchdAgentFetchesWithCapturedPath(t *testing.T) {
 			t.Fatalf("a process still holds the lock of %s: %v", state, err)
 		}
 	}
+}
+
+// waitOK waits up to 75 s for the secret api-key of t1 to be ok.
+func waitOK(t *testing.T, a Agent, state string) {
+	t.Helper()
+	deadline := time.Now().Add(75 * time.Second)
+	for {
+		st, err := secretState(state, "t1", "api-key")
+		if err == nil && st == secrets.StateOK {
+			return
+		}
+		if time.Now().After(deadline) {
+			log, _ := os.ReadFile(a.LogPath)
+			t.Fatalf("the secret is not ok after 75 s: state %q, err %v\nserve.log:\n%s", st, err, log)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+// agentPID is the pid that launchctl print shows for the test agent.
+func agentPID(t *testing.T) int {
+	t.Helper()
+	out, err := Real("print", target(testLabel))
+	if err != nil {
+		t.Fatalf("launchctl print: %v\n%s", err, out)
+	}
+	m := regexp.MustCompile(`(?m)^\s*pid = (\d+)$`).FindSubmatch(out)
+	if m == nil {
+		t.Fatalf("launchctl print shows no pid:\n%s", out)
+	}
+	pid, _ := strconv.Atoi(string(m[1]))
+	return pid
 }
 
 // secretState asks the broker in state for the state of one secret.

@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fake is a launchctl that knows one agent: print succeeds while it is
@@ -149,7 +150,7 @@ func TestInstallCallsLaunchctlInOrder(t *testing.T) {
 		}
 		want := []string{"print", "bootstrap"}
 		if loaded {
-			want = []string{"print", "bootout", "bootstrap"}
+			want = []string{"print", "bootout", "print", "bootstrap"}
 		}
 		if !slices.Equal(f.calls, want) {
 			t.Fatalf("loaded %v: calls %q, want %q", loaded, f.calls, want)
@@ -171,15 +172,17 @@ func TestInstallCallsLaunchctlInOrder(t *testing.T) {
 func TestInstallLaunchctlArguments(t *testing.T) {
 	a := agent(t)
 	var calls [][]string
+	f := &fake{loaded: true}
 	lc := func(args ...string) ([]byte, error) {
 		calls = append(calls, args)
-		return nil, nil // print succeeds: loaded
+		return f.run(args...)
 	}
 	if err := Install(a, lc); err != nil {
 		t.Fatal(err)
 	}
 	domain := fmt.Sprintf("gui/%d", os.Getuid())
-	want := [][]string{{"print", domain + "/" + a.Label}, {"bootout", domain + "/" + a.Label}, {"bootstrap", domain, a.PlistPath}}
+	svc := domain + "/" + a.Label
+	want := [][]string{{"print", svc}, {"bootout", svc}, {"print", svc}, {"bootstrap", domain, a.PlistPath}}
 	if !slices.EqualFunc(calls, want, slices.Equal) {
 		t.Fatalf("calls %q, want %q", calls, want)
 	}
@@ -196,7 +199,7 @@ func TestInstallTwiceReplaces(t *testing.T) {
 	if err := Install(a, f.run); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"print", "bootout", "bootstrap"}; !slices.Equal(f.calls, want) {
+	if want := []string{"print", "bootout", "print", "bootstrap"}; !slices.Equal(f.calls, want) {
 		t.Fatalf("calls %q, want %q", f.calls, want)
 	}
 	got, err := os.ReadFile(a.PlistPath)
@@ -206,6 +209,56 @@ func TestInstallTwiceReplaces(t *testing.T) {
 	entries, err := os.ReadDir(filepath.Dir(a.PlistPath))
 	if err != nil || len(entries) != 1 {
 		t.Fatalf("plist dir %v, %v: a temp file is left", entries, err)
+	}
+}
+
+// lingering is a launchctl whose agent stays loaded for the first n prints
+// after bootout, as launchd does while it tears the old service down.
+type lingering struct {
+	fake
+	n int
+}
+
+func (l *lingering) run(args ...string) ([]byte, error) {
+	if args[0] == "print" && !l.loaded && l.n > 0 {
+		l.n--
+		l.calls = append(l.calls, "print")
+		return nil, nil
+	}
+	return l.fake.run(args...)
+}
+
+func TestInstallWaitsForBootout(t *testing.T) {
+	a := agent(t)
+	l := &lingering{fake: fake{loaded: true}, n: 3}
+	var slept int
+	if err := install(a, l.run, func(time.Duration) { slept++ }); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"print", "bootout", "print", "print", "print", "print", "bootstrap"}
+	if !slices.Equal(l.calls, want) {
+		t.Fatalf("calls %q, want %q", l.calls, want)
+	}
+	if slept != 3 {
+		t.Fatalf("slept %d times, want 3", slept)
+	}
+}
+
+func TestInstallStopsWhenBootoutHangs(t *testing.T) {
+	a := agent(t)
+	lc := func(args ...string) ([]byte, error) {
+		if args[0] == "bootstrap" {
+			t.Fatal("bootstrap while the old agent is still loaded")
+		}
+		return nil, nil // print succeeds: loaded, always
+	}
+	var slept time.Duration
+	err := install(a, lc, func(d time.Duration) { slept += d })
+	if err == nil || !strings.Contains(err.Error(), a.Label) || !strings.Contains(err.Error(), "still loaded") {
+		t.Fatalf("err %v", err)
+	}
+	if slept < 9*time.Second || slept > 11*time.Second {
+		t.Fatalf("waited %v, want about 10 s", slept)
 	}
 }
 
