@@ -30,6 +30,9 @@ So the marker `.sbx-broker` holds only a namespace name:
 The agent can still change the name to another namespace of yours. Then `status` shows that namespace (names,
 placeholders and states, never values), and `edit` opens that file, which your editor shows by its path.
 
+The marker also picks the namespace the TUI starts on (its Secrets view). A sandbox that changes the marker can only
+pick another namespace of yours. The TUI shows the namespace name, and a reveal still needs `r` and `y`.
+
 ## Reveal
 
 The admin socket has a `reveal` op: it answers the value of one secret that is loaded (state `ok`), for the TUI to show

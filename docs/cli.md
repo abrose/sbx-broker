@@ -28,7 +28,8 @@ The file `.sbx-broker` in a project's root folder names the project's namespace.
 - The first line of the file, with spaces trimmed, is the namespace name. It must match `^[a-z0-9]{1,16}$`.
 - A namespace given as an argument wins over the marker.
 - With no argument and no marker, `status` and `log` show all namespaces, and `refresh` and `edit` stop with an error.
-- The TUI starts on the secrets of the marker's namespace, or on the list of namespaces with no marker.
+- The TUI starts on the secrets of the marker's namespace, or on the list of namespaces with no marker. With a bad
+  marker it starts on the list of namespaces and shows the marker's error in its header.
 - The CLI refuses a marker that is a symlink or not a regular file. An error names the marker's path, never its
   content.
 - `serve` never reads a marker. Why the marker holds only a name: see [security.md](security.md#the-project-marker).
@@ -82,7 +83,7 @@ argument with a character other than `A-Za-z0-9_@%+=:,./-` is in single quotes.
 | Secrets | `a`, `e` | add a secret, edit the command of the secret |
 | Routes | `a`, `p`, `e` | add an HTTP route, add a database, edit the route or database |
 | Secrets, Routes | `d`, then `y` | remove the secret, route or database; any other key after `d` cancels |
-| Secrets, Routes | `o` | open the namespace file in `$VISUAL`, else `$EDITOR`, else `vi` (in the config folder, as `edit` does) |
+| Secrets, Routes | `o` | open the namespace file in `$VISUAL`, else `$EDITOR`, else `vi` (in the config folder, as `edit` does), also of a namespace the broker has not loaded |
 | a form | `tab`, `shift+tab` | next field, previous field |
 | a form | `enter` on the last field, `ctrl+s` | save |
 | a form | `esc` | cancel |
@@ -107,7 +108,8 @@ The forms change the namespace file of the namespace on screen. The fields, in o
 A form reads the namespace file when it opens, and an edit form fills its fields from that read, as the file writes
 them, not from what the broker loaded (which lags a save in an editor by about 2 s). Until the read arrives the form
 shows `reading the file…` and does not save; when the read fails, or the entry left the file, it shows why and does not
-save.
+save. An edit form of a secret whose command holds a control character shows
+`the command holds a control character: press o to edit the file` and does not save.
 
 A name or alias is fixed once it exists: an app's config holds the placeholder made from it. Transforms are not in a
 form; `o` opens the file for them. While a form is open its fields take every key as text, also `q` and the digits;
@@ -122,8 +124,9 @@ in one step and sends `reload`.
 ### Reveal
 
 `r` asks `Reveal the value of <name>? The broker logs it. (y/n)`. With `y` the broker sends the value, only of a secret
-in state `ok`, and logs a `reveal` event. The TUI shows `value: <value>   (any key hides it)` and holds the value only
-while it shows it: it overwrites the value with zeros and drops it at the next key, at a view switch, 30 s after it
+in state `ok`, and logs a `reveal` event. The TUI shows `value: <value>   (any key hides it)`. A value with a control
+character or a backslash is shown escaped, and the line says `(escaped)` before `(any key hides it)`. The TUI holds the
+value only while it shows it: it overwrites the value with zeros and drops it at the next key, at a view switch, 30 s after it
 appeared, and when the TUI quits. A status update does not hide it. The TUI runs in the terminal's alternate screen, so
 no value stays in the scrollback. The TUI clears `TEA_TRACE`, `TEA_DEBUG` and `UV_DEBUG` before it starts: with
 `TEA_TRACE` or `UV_DEBUG` set, the terminal library would append every frame, a shown value included, to a file, and
