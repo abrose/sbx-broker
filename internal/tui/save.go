@@ -73,26 +73,26 @@ func formSet(kind formKind, v []string) (func(*nsfile.File) error, error) {
 	switch kind {
 	case secretForm:
 		var argv []string // none: config.Check says the command is empty
-		if v[1] != "" {
+		if v[secretCommand] != "" {
 			var err error
-			if argv, err = SplitArgs(v[1]); err != nil {
+			if argv, err = SplitArgs(v[secretCommand]); err != nil {
 				return nil, fmt.Errorf("command: %w", err)
 			}
 		}
-		return func(nf *nsfile.File) error { return nf.SetSecret(v[0], argv) }, nil
+		return func(nf *nsfile.File) error { return nf.SetSecret(v[secretName], argv) }, nil
 	case routeForm:
-		listen, err := port("listen port", v[1])
+		listen, err := port("listen port", v[routeListen])
 		if err != nil {
 			return nil, err
 		}
-		r := nsfile.Route{Name: v[0], Listen: listen, Upstream: v[2]}
+		r := nsfile.Route{Name: v[routeName], Listen: listen, Upstream: v[routeUpstream]}
 		return func(nf *nsfile.File) error { return nf.SetRoute(r) }, nil
 	default:
-		listen, err := port("postgres listen port", v[6])
+		listen, err := port("postgres listen port", v[dbListen])
 		if err != nil {
 			return nil, err
 		}
-		d := nsfile.Database{Alias: v[0], Upstream: v[1], DBName: v[2], User: v[3], Password: v[4], RequireAuth: v[5]}
+		d := nsfile.Database{Alias: v[dbAlias], Upstream: v[dbUpstream], DBName: v[dbName], User: v[dbUser], Password: v[dbPassword], RequireAuth: v[dbRequireAuth]}
 		return func(nf *nsfile.File) error { return nf.SetDatabase(listen, d) }, nil
 	}
 }

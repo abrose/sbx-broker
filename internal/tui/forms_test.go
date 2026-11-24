@@ -637,3 +637,13 @@ func hasSecret(ns admin.NamespaceStatus, name string) bool {
 	}
 	return false
 }
+
+// TestFormFieldsMatchLabels keeps the named field indexes of each form in step
+// with its labels.
+func TestFormFieldsMatchLabels(t *testing.T) {
+	for kind, want := range map[formKind]int{secretForm: secretFields, routeForm: routeFields, databaseForm: dbFields} {
+		if got := len(formSpecs[kind].labels); got != want {
+			t.Errorf("form kind %d has %d labels, want %d", kind, got, want)
+		}
+	}
+}

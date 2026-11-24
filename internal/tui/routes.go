@@ -21,7 +21,7 @@ func (m *Model) routesKey(k tea.KeyPressMsg) tea.Cmd {
 	if ns.Postgres != nil {
 		pg = *ns.Postgres
 	}
-	n := len(ns.HTTP) + len(pg.Databases)
+	n := routeRows(ns)
 	at := m.routeCursor < n
 	switch {
 	case key.Matches(k, m.keys.up):

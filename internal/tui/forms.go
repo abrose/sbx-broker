@@ -27,6 +27,31 @@ const (
 	databaseForm
 )
 
+// The index of each field of a form, in the order of its labels in formSpecs.
+const (
+	secretName = iota
+	secretCommand
+	secretFields // the number of fields
+)
+
+const (
+	routeName = iota
+	routeListen
+	routeUpstream
+	routeFields
+)
+
+const (
+	dbAlias = iota
+	dbUpstream
+	dbName
+	dbUser
+	dbPassword
+	dbRequireAuth
+	dbListen
+	dbFields
+)
+
 // formSpecs name each kind and list the fields of its form, in order. The
 // first field is the name or alias.
 var formSpecs = [...]struct {
@@ -114,7 +139,9 @@ func (m *Model) openForm(kind formKind, ns, name string) tea.Cmd {
 func formValues(kind formKind, name string, nf *nsfile.File) ([]string, error) {
 	if name == "" {
 		if kind == databaseForm {
-			return []string{"", "", "", "", "", "", nf.PostgresListen()}, nil
+			v := make([]string, dbFields)
+			v[dbListen] = nf.PostgresListen()
+			return v, nil
 		}
 		return nil, nil
 	}
@@ -124,16 +151,20 @@ func formValues(kind formKind, name string, nf *nsfile.File) ([]string, error) {
 	case secretForm:
 		var argv []string
 		argv, err = nf.Secret(name)
-		v = []string{name, JoinArgs(argv)}
+		v = make([]string, secretFields)
+		v[secretName], v[secretCommand] = name, JoinArgs(argv)
 	case routeForm:
 		var listen, upstream string
 		listen, upstream, err = nf.Route(name)
-		v = []string{name, listen, upstream}
+		v = make([]string, routeFields)
+		v[routeName], v[routeListen], v[routeUpstream] = name, listen, upstream
 	default:
 		var d nsfile.Database
 		var listen string
 		d, listen, err = nf.Database(name)
-		v = []string{name, d.Upstream, d.DBName, d.User, d.Password, d.RequireAuth, listen}
+		v = make([]string, dbFields)
+		v[dbAlias], v[dbUpstream], v[dbName], v[dbUser] = name, d.Upstream, d.DBName, d.User
+		v[dbPassword], v[dbRequireAuth], v[dbListen] = d.Password, d.RequireAuth, listen
 	}
 	if errors.Is(err, nsfile.ErrNotFound) {
 		return nil, fmt.Errorf("%s %s is no longer in the file", formSpecs[kind].word, name)
