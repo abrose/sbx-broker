@@ -82,14 +82,13 @@ func (m *Model) gotEdited(msg editedMsg) tea.Cmd {
 	if msg.err != nil {
 		m.note = "editor: " + p(msg.err.Error())
 	}
-	cl, refreshes := m.cl, m.refreshes
-	return func() tea.Msg {
+	cl := m.cl
+	return m.statusAfter(true, func() tea.Msg {
 		if err := cl.Reload(); err != nil {
 			return reloadedMsg{err: err}
 		}
-		nss, err := cl.Status("")
-		return statusMsg{nss: nss, err: err, once: true, refreshes: refreshes}
-	}
+		return nil
+	})
 }
 
 // gotReloaded shows why the reload after the editor failed, after the

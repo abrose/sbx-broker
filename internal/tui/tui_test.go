@@ -519,6 +519,28 @@ func TestStaleStatusAfterRefreshIsDropped(t *testing.T) {
 	}
 }
 
+// The extra status after the editor returns, and after a save, carries the
+// stamp of the refreshes so far: once a refresh happened, it is not dropped.
+func TestExtraStatusAfterRefreshIsKept(t *testing.T) {
+	dir, _ := configDir(t, acmeFile)
+	h := newHarness(t, &fakeClient{nss: fixture()}, Options{ConfigDir: dir, Namespace: "acme",
+		Getenv: func(string) string { return "" },
+		Editor: func(string, []string, Terminal) error { return nil }})
+	h.keys("f") // a refresh has answered: refreshes is 1
+	for name, act := range map[string]func(){
+		"the editor": func() { h.keys("o") },
+		"a save":     func() { h.send(savedMsg{done: "saved secret x"}) },
+	} {
+		nss := fixture()
+		nss[0].Secrets[0].Swaps += 10
+		h.fake.nss = nss
+		act()
+		if got := h.m.nss[0].Secrets[0].Swaps; got != nss[0].Secrets[0].Swaps {
+			t.Fatalf("after %s the swaps are %d, want %d: its status was dropped", name, got, nss[0].Secrets[0].Swaps)
+		}
+	}
+}
+
 // A confirm whose secret leaves the status is dropped: y does not reveal.
 func TestConfirmDroppedWhenSecretGoes(t *testing.T) {
 	h := start(t, Options{Namespace: "acme"})

@@ -26,13 +26,26 @@ type (
 	}
 )
 
-func (m *Model) statusCmd() tea.Cmd {
+// statusAfter builds the command that asks for a status. It is the only place
+// that builds a statusMsg, so every one carries the stamp of Model.refreshes
+// from when the command was made: a message without it has stamp 0 and
+// gotStatus would drop it after the first refresh. once marks an extra status
+// outside the poll chain. When before is not nil it runs first, and a message
+// it returns is sent instead of the status.
+func (m *Model) statusAfter(once bool, before func() tea.Msg) tea.Cmd {
 	cl, refreshes := m.cl, m.refreshes
 	return func() tea.Msg {
+		if before != nil {
+			if msg := before(); msg != nil {
+				return msg
+			}
+		}
 		nss, err := cl.Status("")
-		return statusMsg{nss: nss, err: err, refreshes: refreshes}
+		return statusMsg{nss: nss, err: err, once: once, refreshes: refreshes}
 	}
 }
+
+func (m *Model) statusCmd() tea.Cmd { return m.statusAfter(false, nil) }
 
 func (m *Model) gotStatus(msg statusMsg) {
 	if msg.refreshes < m.refreshes {
@@ -107,10 +120,4 @@ func (m *Model) gotRefresh(msg refreshMsg) {
 }
 
 // statusOnce asks for a status now, outside the 2 s poll chain.
-func (m *Model) statusOnce() tea.Cmd {
-	cl, refreshes := m.cl, m.refreshes
-	return func() tea.Msg {
-		nss, err := cl.Status("")
-		return statusMsg{nss: nss, err: err, once: true, refreshes: refreshes}
-	}
-}
+func (m *Model) statusOnce() tea.Cmd { return m.statusAfter(true, nil) }
