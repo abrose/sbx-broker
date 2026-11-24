@@ -89,6 +89,11 @@ the agent uses the captured `PATH`. The test asserts:
 - after `Uninstall`, `launchctl print gui/<uid>/io.github.abrose.sbx-broker.test` fails, the plist is gone, and no
   process holds the state dir's lock.
 
+The proof sets both dirs (`SBX_BROKER_CONFIG_DIR` and `SBX_BROKER_STATE_DIR`) on purpose. A run with the default dirs
+would touch your own config and state dirs. The unit test `TestInstallDefaultDirs` in `cmd/sbx-broker` covers the
+default dirs in the plist instead. The proof reads the pid only when two reads 200 ms apart agree. A lingering old
+agent after `bootout` is proven only by the unit test `TestInstallWaitsForBootout`, which fakes the slow teardown.
+
 The test boots out a test agent left by an interrupted run before it starts, and its cleanup boots the agent out after
 a failure. To check by hand that nothing is left:
 

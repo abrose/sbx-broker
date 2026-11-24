@@ -58,8 +58,18 @@ Do not approve the request by hand.
 - **A fetch command is not found under launchd:** the agent has the `PATH` of the shell that ran `install`, not the
   `PATH` of a later shell. Run `sbx-broker install` again from a shell whose `PATH` finds the command
   (`command -v op`).
+- **A fetch command works in a terminal but fails as the launchd agent:** the agent gets only `PATH` and the
+  `SBX_BROKER_*` variables, no other variable of your shell. A command that needs `GNUPGHOME`, `OP_ACCOUNT`,
+  `PASSWORD_STORE_DIR` or `SSH_AUTH_SOCK` gets them through `env`, for example
+  `command: ["env", "GNUPGHOME=/Users/<you>/.gnupg", "gpg", "--decrypt", "/Users/<you>/secrets/<name>.gpg"]`.
+  `SSH_AUTH_SOCK` changes with each login, so a fixed value breaks after a reboot.
 - **`install` refuses: `a broker already runs on <socket>, not as the launchd agent`:** a `serve` runs, for example in
   a terminal tab. Stop it, then run `sbx-broker install` again.
+- **`install` fails: `a broker answers, but it is not the launchd agent (the agent has no running process)`:** another
+  broker answered on the socket while the agent has no process of its own. Stop the other broker, then run
+  `sbx-broker install` again.
+- **`install` fails with a `launchctl bootstrap` error:** the plist stays in `~/Library/LaunchAgents`.
+  `sbx-broker uninstall` removes it.
 - **`the broker does not answer`** (a command, the TUI's header, or the TUI's start): a broker accepted the connection
   on `admin.sock` but sent no answer within 5 s (a `refresh` waits `SBX_BROKER_FETCH_TIMEOUT` plus 5 s). Most often a
   `serve` in a terminal was stopped with `ctrl+z`: run `fg` in that terminal, or stop it. Else the broker hangs: stop it
