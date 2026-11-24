@@ -62,7 +62,12 @@ func (m *Model) valueLine(name string) string {
 	case m.confirm:
 		return "Reveal the value of " + p(name) + "? The broker logs it. (y/n)"
 	case m.value != nil:
-		return "value: " + p(string(m.value)) + "   (any key hides it)"
+		v := string(m.value)
+		line := "value: " + p(v)
+		if p(v) != v {
+			line += "   (escaped)" // the screen does not show the value as it is
+		}
+		return line + "   (any key hides it)"
 	case m.revealErr != "":
 		return "reveal failed: " + m.revealErr
 	case m.pending != 0:

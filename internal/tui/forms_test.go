@@ -2,6 +2,7 @@ package tui
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -304,6 +305,73 @@ func TestDatabaseFormFillsListen(t *testing.T) {
 	h.keys("3", "p")
 	if got := h.m.form.inputs[6].Value(); got != "29620" {
 		t.Fatalf("postgres listen %q", got)
+	}
+}
+
+// config.Check refuses a database whose password names no secret: the form
+// shows why, stays open, and the file stays as it was.
+func TestDatabaseFormShowsConfigError(t *testing.T) {
+	h, _, path := startForms(t)
+	h.keys("3", "p")
+	for i, v := range []string{"extra", "127.0.0.1:5432", "appdb", "appuser", "nosuch"} {
+		if i > 0 {
+			h.keys("tab")
+		}
+		h.typeText(v)
+	}
+	h.keys("ctrl+s") // postgres listen port: the file's, filled by the form
+	h.has(`password names the undefined secret "nosuch"`)
+	if h.m.form == nil {
+		t.Fatal("the form closed")
+	}
+	if read(t, path) != acmeFile || h.reloads() != 0 {
+		t.Fatal("the save changed the file")
+	}
+}
+
+// A command with a control character cannot be shown in a form field as it
+// is: the edit form refuses it and points to the editor, and saves nothing.
+func TestEditRefusesCommandWithControlCharacter(t *testing.T) {
+	file := strings.Replace(acmeFile, `["printf", "k"]`, `["printf", "a\x01b"]`, 1)
+	dir, path := configDir(t, file)
+	h := start(t, Options{ConfigDir: dir, Namespace: "acme"})
+	h.keys("e")
+	h.has("Edit secret api-key of acme", "the command holds a control character: press o to edit the file")
+	h.keys("ctrl+s")
+	if h.m.form == nil || read(t, path) != file || h.reloads() != 0 {
+		t.Fatalf("the edit saved: form %v, reloads %d:\n%s", h.m.form != nil, h.reloads(), read(t, path))
+	}
+}
+
+// The editor failed and so did the reload after it: the note shows both.
+func TestEditorAndReloadErrorsBothShown(t *testing.T) {
+	dir, _ := configDir(t, acmeFile)
+	fake := &fakeClient{nss: fixture(), reloadErr: errors.New("the broker refused")}
+	h := newHarness(t, fake, Options{ConfigDir: dir, Namespace: "acme",
+		Getenv: func(string) string { return "" },
+		Editor: func(string, []string, Terminal) error { return errors.New("exit status 1") }})
+	h.keys("o")
+	h.has("editor: exit status 1; reload: the broker refused")
+}
+
+// o opens the file of the marker's namespace also when the broker has not
+// loaded it (its file has an error, or is not there yet).
+func TestEditorKeyForUnloadedNamespace(t *testing.T) {
+	dir := t.TempDir()
+	var files []string
+	opt := Options{ConfigDir: dir, Namespace: "ghost",
+		Getenv: func(string) string { return "" },
+		Editor: func(_ string, argv []string, _ Terminal) error {
+			files = append(files, argv[len(argv)-1])
+			return nil
+		}}
+	h := start(t, opt)
+	h.has("the broker has no namespace ghost")
+	h.keys("o")
+	h.keys("3", "o")
+	want := filepath.Join(dir, "ghost.yaml")
+	if len(files) != 2 || files[0] != want || files[1] != want {
+		t.Fatalf("the editor opened %q, want %q twice", files, want)
 	}
 }
 

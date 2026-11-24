@@ -201,9 +201,9 @@ func (m *Model) gotSaved(msg savedMsg) tea.Cmd {
 
 // statusOnce asks for a status now, outside the 2 s poll chain.
 func (m *Model) statusOnce() tea.Cmd {
-	cl := m.cl
+	cl, refreshes := m.cl, m.refreshes
 	return func() tea.Msg {
 		nss, err := cl.Status("")
-		return statusMsg{nss: nss, err: err, once: true}
+		return statusMsg{nss: nss, err: err, once: true, refreshes: refreshes}
 	}
 }

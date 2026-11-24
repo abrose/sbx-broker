@@ -4,6 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
+	"strings"
+	"unicode"
 
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textinput"
@@ -151,6 +154,11 @@ func formValues(kind formKind, name string, nf *nsfile.File) ([]string, error) {
 	case secretForm:
 		var argv []string
 		argv, err = nf.Secret(name)
+		// A form field cannot hold a control character as it is, so a save
+		// would change the command.
+		if slices.ContainsFunc(argv, func(a string) bool { return strings.ContainsFunc(a, unicode.IsControl) }) {
+			return nil, errors.New("the command holds a control character: press o to edit the file")
+		}
 		v = make([]string, secretFields)
 		v[secretName], v[secretCommand] = name, JoinArgs(argv)
 	case routeForm:
@@ -241,8 +249,6 @@ func (m *Model) secretsEditKey(k tea.KeyPressMsg, ns *admin.NamespaceStatus) tea
 		return m.openForm(secretForm, ns.Name, ns.Secrets[m.secCursor].Name)
 	case key.Matches(k, m.keys.remove) && at:
 		m.askRemove(secretForm, ns.Name, ns.Secrets[m.secCursor].Name)
-	case key.Matches(k, m.keys.editor):
-		return m.editorCmd(ns.Name)
 	}
 	return nil
 }

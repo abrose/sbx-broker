@@ -49,9 +49,12 @@ type (
 
 // editorCmd gives the terminal to the owner's editor on the file of ns. The
 // editor runs in the config dir, never in a project folder, as
-// `sbx-broker edit` does.
+// `sbx-broker edit` does. With no namespace (ns "") it does nothing.
 func (m *Model) editorCmd(ns string) tea.Cmd {
-	if m.opt.Editor == nil {
+	switch {
+	case ns == "":
+		return nil
+	case m.opt.Editor == nil:
 		m.note = "no editor"
 		return nil
 	}
@@ -68,20 +71,29 @@ func (m *Model) gotEdited(msg editedMsg) tea.Cmd {
 	if msg.err != nil {
 		m.note = "editor: " + p(msg.err.Error())
 	}
-	cl := m.cl
+	cl, refreshes := m.cl, m.refreshes
 	return func() tea.Msg {
 		if err := cl.Reload(); err != nil {
 			return reloadedMsg{err: err}
 		}
 		nss, err := cl.Status("")
-		return statusMsg{nss: nss, err: err, once: true}
+		return statusMsg{nss: nss, err: err, once: true, refreshes: refreshes}
 	}
 }
 
+// gotReloaded shows why the reload after the editor failed, after the
+// editor's error if there is one.
 func (m *Model) gotReloaded(msg reloadedMsg) {
-	if errors.Is(msg.err, admin.ErrNoBroker) {
+	switch {
+	case msg.err == nil:
+		return
+	case errors.Is(msg.err, admin.ErrNoBroker):
 		m.down = NoBroker
 		return
 	}
-	m.note = "reload: " + p(msg.err.Error())
+	reload := "reload: " + p(msg.err.Error())
+	if m.note != "" {
+		reload = m.note + "; " + reload
+	}
+	m.note = reload
 }

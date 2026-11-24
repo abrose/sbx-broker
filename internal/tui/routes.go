@@ -13,6 +13,9 @@ import (
 // routesKey handles the keys of the Routes view. Its rows are the HTTP
 // routes, then the databases.
 func (m *Model) routesKey(k tea.KeyPressMsg) tea.Cmd {
+	if key.Matches(k, m.keys.editor) {
+		return m.editorCmd(m.nsName()) // also for a namespace the broker has not loaded
+	}
 	ns := m.current()
 	if ns == nil {
 		return nil
@@ -43,8 +46,6 @@ func (m *Model) routesKey(k tea.KeyPressMsg) tea.Cmd {
 		} else {
 			m.askRemove(databaseForm, ns.Name, pg.Databases[i-len(ns.HTTP)].Alias)
 		}
-	case key.Matches(k, m.keys.editor):
-		return m.editorCmd(ns.Name)
 	}
 	return nil
 }

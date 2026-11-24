@@ -135,10 +135,10 @@ func (m *Model) secretsView() string {
 }
 
 func (m *Model) state(ns string, s secrets.Status) string {
-	if m.fetching[ns+"/"+s.Name] || m.fetching[ns+"/"] {
+	if m.fetching[ns+"/"+s.Name] > 0 || m.fetching[ns+"/"] > 0 {
 		return "fetching"
 	}
-	return string(s.State)
+	return p(string(s.State))
 }
 
 func fetchedAt(s secrets.Status) string {

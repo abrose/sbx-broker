@@ -7,7 +7,9 @@
 // The TUI never holds a value it does not show: a revealed value is wiped
 // (every byte set to 0) and dropped at the next key press, at a view switch,
 // 30 s after it appeared, and when the TUI quits. It runs in the alternate
-// screen, so no value stays in the terminal's scrollback.
+// screen, so no value stays in the terminal's scrollback. The value's []byte
+// is wiped; the rendered screen text is a Go string that the TUI cannot wipe,
+// and it is dropped with the next frame.
 package tui
 
 import (
@@ -41,6 +43,7 @@ type Options struct {
 	// the TUI hands over. The key o uses it.
 	Editor func(dir string, argv []string, term Terminal) error
 	Getenv func(string) string // reads $VISUAL and $EDITOR; nil: os.Getenv
+	Note   string              // a line the TUI shows as its note at start, printable: the caller escapes it
 }
 
 type view int
@@ -69,9 +72,10 @@ func (v view) tab() view {
 type (
 	pollMsg   struct{}
 	statusMsg struct {
-		nss  []admin.NamespaceStatus
-		err  error
-		once bool // an extra status after an edit: the poll chain goes on as it is
+		nss       []admin.NamespaceStatus
+		err       error
+		once      bool // an extra status after an edit: the poll chain goes on as it is
+		refreshes int  // Model.refreshes when it was sent
 	}
 	refreshMsg struct {
 		key string // ns + "/" + secret, as in Model.fetching
@@ -105,8 +109,9 @@ type Model struct {
 	nsCursor  int
 	ns        string // the namespace of Secrets and Inspect; "" until one is picked
 	secCursor int
-	secret    string          // the secret of Inspect
-	fetching  map[string]bool // ns + "/" + secret (secret "" for all) of each refresh in flight
+	secret    string         // the secret of Inspect
+	fetching  map[string]int // the refreshes in flight per ns + "/" + secret (secret "" for all)
+	refreshes int            // the refresh answers taken; a status sent before the last one is stale
 
 	confirm   bool   // r was pressed in Inspect; the next key decides
 	reveals   int    // the id of the last reveal asked for
@@ -131,7 +136,8 @@ func New(cl Client, opt Options) *Model {
 		help:     help.New(),
 		after:    func(d time.Duration, msg tea.Msg) tea.Cmd { return tea.Tick(d, func(time.Time) tea.Msg { return msg }) },
 		exec:     tea.Exec,
-		fetching: map[string]bool{},
+		fetching: map[string]int{},
+		note:     opt.Note,
 	}
 	if opt.Namespace != "" {
 		m.ns, m.view = opt.Namespace, viewSecrets
@@ -165,8 +171,16 @@ func run(cl Client, opt Options, popts ...tea.ProgramOption) error {
 	}
 	m := New(cl, opt)
 	_, err := tea.NewProgram(m, popts...).Run()
-	m.hide() // the model hid it on quit already; this covers a crash of the program
+	m.hide() // the wipe for SIGINT and SIGTERM, which end Run without Update, and for a crash
 	m.stopFollow()
+	return quitErr(err)
+}
+
+// quitErr is the error of Run: a SIGINT is the owner's quit, not a failure.
+func quitErr(err error) error {
+	if errors.Is(err, tea.ErrInterrupted) {
+		return nil
+	}
 	return err
 }
 
@@ -192,8 +206,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.form != nil {
 			return m, m.formInput(msg)
 		}
-	case tea.InterruptMsg:
-		return m, m.quit()
 	case pollMsg:
 		return m, m.statusCmd()
 	case statusMsg:
@@ -303,6 +315,9 @@ func (m *Model) namespacesKey(k tea.KeyPressMsg) {
 }
 
 func (m *Model) secretsKey(k tea.KeyPressMsg) tea.Cmd {
+	if key.Matches(k, m.keys.editor) {
+		return m.editorCmd(m.nsName()) // also for a namespace the broker has not loaded
+	}
 	ns := m.current()
 	if ns == nil {
 		return nil
@@ -328,15 +343,18 @@ func (m *Model) secretsKey(k tea.KeyPressMsg) tea.Cmd {
 	return nil
 }
 
-// current returns the namespace of Secrets: the picked one, else the one
-// under the cursor of Namespaces. It is nil when the broker has none such.
-func (m *Model) current() *admin.NamespaceStatus {
-	name := m.ns
-	if name == "" && m.nsCursor < len(m.nss) {
-		name = m.nss[m.nsCursor].Name
+// nsName is the name of the namespace of Secrets: the picked one, else the
+// one under the cursor of Namespaces; "" for none.
+func (m *Model) nsName() string {
+	if m.ns == "" && m.nsCursor < len(m.nss) {
+		return m.nss[m.nsCursor].Name
 	}
-	return m.status(name)
+	return m.ns
 }
+
+// current returns the status of the namespace of Secrets, or nil when the
+// broker has none such.
+func (m *Model) current() *admin.NamespaceStatus { return m.status(m.nsName()) }
 
 // status returns the status of the namespace name, or nil.
 func (m *Model) status(name string) *admin.NamespaceStatus {
@@ -349,14 +367,17 @@ func (m *Model) status(name string) *admin.NamespaceStatus {
 }
 
 func (m *Model) statusCmd() tea.Cmd {
-	cl := m.cl
+	cl, refreshes := m.cl, m.refreshes
 	return func() tea.Msg {
 		nss, err := cl.Status("")
-		return statusMsg{nss: nss, err: err}
+		return statusMsg{nss: nss, err: err, refreshes: refreshes}
 	}
 }
 
 func (m *Model) gotStatus(msg statusMsg) {
+	if msg.refreshes < m.refreshes {
+		return // older than a refresh's answer; the next poll brings the news
+	}
 	m.down, m.statusErr = "", ""
 	switch {
 	case errors.Is(msg.err, admin.ErrNoBroker):
@@ -374,6 +395,7 @@ func (m *Model) gotStatus(msg statusMsg) {
 		}
 		if m.inspected() == nil {
 			m.hide() // the secret is gone, so Inspect cannot show its value
+			m.confirm = false
 		}
 	}
 }
@@ -395,7 +417,7 @@ func (m *Model) inspected() *secrets.Status {
 
 func (m *Model) refreshCmd(ns, secret string) tea.Cmd {
 	k := ns + "/" + secret
-	m.fetching[k] = true
+	m.fetching[k]++
 	cl := m.cl
 	return func() tea.Msg {
 		nss, err := cl.Refresh(ns, secret)
@@ -404,7 +426,10 @@ func (m *Model) refreshCmd(ns, secret string) tea.Cmd {
 }
 
 func (m *Model) gotRefresh(msg refreshMsg) {
-	delete(m.fetching, msg.key)
+	if m.fetching[msg.key]--; m.fetching[msg.key] <= 0 {
+		delete(m.fetching, msg.key)
+	}
+	m.refreshes++
 	switch {
 	case errors.Is(msg.err, admin.ErrNoBroker):
 		m.down = NoBroker

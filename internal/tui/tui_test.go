@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"io/fs"
 	"net"
 	"os"
@@ -29,6 +30,8 @@ type fakeClient struct {
 	nss       []admin.NamespaceStatus
 	statusErr error
 	revealErr error
+	reloadErr error
+	value     string   // what Reveal answers; "": fakeValue
 	refreshes []string // "ns/secret"
 	reveals   []string // "ns/secret"
 	values    [][]byte // every slice Reveal returned, to check the wipe
@@ -64,7 +67,7 @@ func (f *fakeClient) Reload() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.reloads++
-	return nil
+	return f.reloadErr
 }
 
 func (f *fakeClient) Reveal(ns, secret string) ([]byte, error) {
@@ -75,6 +78,9 @@ func (f *fakeClient) Reveal(ns, secret string) ([]byte, error) {
 		return nil, f.revealErr
 	}
 	v := []byte(fakeValue)
+	if f.value != "" {
+		v = []byte(f.value)
+	}
 	f.values = append(f.values, v)
 	return v, nil
 }
@@ -247,6 +253,18 @@ func (h *harness) has(parts ...string) {
 	}
 }
 
+// line returns the first line of the screen that holds part.
+func (h *harness) line(part string) string {
+	h.t.Helper()
+	for _, l := range strings.Split(h.screen(), "\n") {
+		if strings.Contains(l, part) {
+			return l
+		}
+	}
+	h.t.Fatalf("screen has no line with %q:\n%s", part, h.screen())
+	return ""
+}
+
 func (h *harness) hasNot(parts ...string) {
 	h.t.Helper()
 	s := h.screen()
@@ -315,8 +333,11 @@ func TestNamespacesView(t *testing.T) {
 func TestSecretsView(t *testing.T) {
 	h := start(t, Options{Namespace: "acme"})
 	h.has("NAME", "PLACEHOLDER", "COMMAND", "STATE", "FETCHED", "SWAPS",
-		"sbxb_acme_api_key", "op read 'op://<vault>/<item>/credential'", "ok", "15:04:05", " 3",
+		"sbxb_acme_api_key", "op read 'op://<vault>/<item>/credential'", "ok", "15:04:05",
 		"gopass show -o '<path>'", "failed")
+	if cells := strings.Fields(h.line("api-key")); cells[len(cells)-1] != "3" {
+		t.Fatalf("SWAPS of api-key %q, want 3", cells[len(cells)-1])
+	}
 	// The failed row has no time.
 	for _, line := range strings.Split(h.screen(), "\n") {
 		if strings.Contains(line, "db-pass") && !strings.Contains(line, " - ") {
@@ -400,11 +421,112 @@ func TestRevealHidesOnNextKeyAndWipes(t *testing.T) {
 }
 
 func TestRevealHidesOnViewSwitch(t *testing.T) {
-	h := revealed(t)
-	h.keys("4")
-	h.wiped()
-	if h.m.view != viewLog {
-		t.Fatalf("view %v, want the Log view", h.m.view)
+	for i, k := range []string{"1", "2", "3", "4"} {
+		t.Run(k, func(t *testing.T) {
+			h := revealed(t)
+			h.keys(k)
+			if h.m.view != tabs[i].v {
+				t.Fatalf("view %v, want %v", h.m.view, tabs[i].v)
+			}
+			h.wiped()
+		})
+	}
+}
+
+// A value with a control character or a backslash is shown escaped, and the
+// line says so: the owner must not copy the escaped text as the value.
+func TestRevealMarksEscapedValue(t *testing.T) {
+	h := start(t, Options{Namespace: "acme"})
+	h.fake.value = "a\\b\x1bc"
+	h.keys("enter", "r", "y")
+	if l := h.line("value: "); !strings.HasSuffix(l, `value: a\\b\x1bc   (escaped)   (any key hides it)`) {
+		t.Fatalf("value line %q", l)
+	}
+	h.hasNot("\x1bc")
+
+	h = revealed(t) // its exact text: value: real-api-key-1   (any key hides it)
+	h.hasNot("(escaped)")
+}
+
+// The Secrets view and Inspect show the state escaped: it comes from the
+// broker.
+func TestSecretStateIsEscaped(t *testing.T) {
+	nss := fixture()
+	nss[0].Secrets[0].State = "ok\x1b[2J"
+	h := newHarness(t, &fakeClient{nss: nss}, Options{Namespace: "acme"})
+	if l := h.line("api-key"); !strings.Contains(l, `ok\x1b[2J`) || strings.Contains(l, "\x1b") {
+		t.Fatalf("Secrets row %q", l)
+	}
+	h.keys("enter")
+	if l := h.line("state"); !strings.Contains(l, `ok\x1b[2J`) || strings.Contains(l, "\x1b") {
+		t.Fatalf("Inspect state %q", l)
+	}
+	h.hasNot("\x1b[2J")
+}
+
+// Two refreshes of one secret: it shows fetching until the last answer.
+func TestRefreshFetchingStaysUntilLastAnswer(t *testing.T) {
+	h := start(t, Options{Namespace: "acme"})
+	_, first := h.m.Update(keyPress("f"))
+	_, second := h.m.Update(keyPress("f"))
+	h.run(first)
+	h.has("fetching")
+	h.run(second)
+	h.hasNot("fetching")
+}
+
+// A status sent before a refresh answers after it: its older state does not
+// replace the refresh's, and the poll goes on.
+func TestStaleStatusAfterRefreshIsDropped(t *testing.T) {
+	h := start(t, Options{Namespace: "acme"})
+	_, poll := h.m.Update(pollMsg{})
+	nss := fixture()
+	nss[0].Secrets[0].Swaps = 7
+	h.fake.nss = nss
+	h.keys("f") // the refresh answers with 7 swaps
+	h.fake.nss = fixture()
+	polls := len(h.timers)
+	h.run(poll) // the status answers with 3 swaps, from before the refresh
+	if got := h.m.nss[0].Secrets[0].Swaps; got != 7 {
+		t.Fatalf("swaps %d after the stale status, want 7", got)
+	}
+	armed := 0
+	for _, tm := range h.timers[polls:] {
+		if tm.d == pollEvery {
+			armed++
+		}
+	}
+	if armed != 1 {
+		t.Fatalf("the stale status armed %d polls, want 1", armed)
+	}
+}
+
+// A confirm whose secret leaves the status is dropped: y does not reveal.
+func TestConfirmDroppedWhenSecretGoes(t *testing.T) {
+	h := start(t, Options{Namespace: "acme"})
+	h.keys("enter", "r")
+	h.has("Reveal the value of api-key?")
+	nss := fixture()
+	nss[0].Secrets = nss[0].Secrets[1:]
+	h.fake.nss = nss
+	h.send(h.lastTimer(pollEvery).msg)
+	h.keys("y")
+	if len(h.fake.reveals) != 0 {
+		t.Fatalf("reveals %q", h.fake.reveals)
+	}
+}
+
+// A SIGINT ends Run with tea.ErrInterrupted: that is the owner's quit, not a
+// failure.
+func TestQuitErrDropsInterrupt(t *testing.T) {
+	if err := quitErr(tea.ErrInterrupted); err != nil {
+		t.Fatalf("quitErr(ErrInterrupted) = %v", err)
+	}
+	if err := quitErr(io.EOF); err != io.EOF {
+		t.Fatalf("quitErr(io.EOF) = %v", err)
+	}
+	if err := quitErr(nil); err != nil {
+		t.Fatalf("quitErr(nil) = %v", err)
 	}
 }
 
