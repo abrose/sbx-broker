@@ -141,7 +141,8 @@ type command struct {
 // startTUI runs the TUI on the namespace of the project marker, if any. It
 // asks the broker for its status first: with no broker it prints the
 // no-broker line, with a broker that does not answer it prints that, and it
-// exits 1; it never starts a broker.
+// exits 1; it never starts a broker. A bad marker does not stop it: the TUI
+// starts with no namespace and shows the marker's error.
 func (c *command) startTUI() int {
 	cfg, err := c.configDir()
 	if err != nil {
@@ -149,10 +150,6 @@ func (c *command) startTUI() int {
 	}
 	state, err := c.stateDir()
 	if err != nil {
-		return c.fail(err)
-	}
-	ns, _, err := c.namespace(nil)
-	if err != nil && !errors.Is(err, errNoMarker) {
 		return c.fail(err)
 	}
 	fetch, err := c.fetchTimeout() // a refresh waits for it
@@ -163,7 +160,14 @@ func (c *command) startTUI() int {
 	if _, err := cl.Status(""); err != nil {
 		return c.fail(err)
 	}
-	if err := c.tui(cl, tui.Options{ConfigDir: cfg, Namespace: ns, Editor: runOn, Getenv: c.getenv}); err != nil {
+	opt := tui.Options{ConfigDir: cfg, Editor: runOn, Getenv: c.getenv}
+	opt.Namespace, _, err = c.namespace(nil)
+	if err != nil && !errors.Is(err, errNoMarker) {
+		// Escaped: the error names the marker's path, which the sandbox
+		// can name. It never holds the marker's content.
+		opt.Note = "marker: " + eventlog.Printable(err.Error())
+	}
+	if err := c.tui(cl, opt); err != nil {
 		return c.fail(err)
 	}
 	return exitOK

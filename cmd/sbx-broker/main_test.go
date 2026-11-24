@@ -441,6 +441,38 @@ func TestTUIWithoutMarker(t *testing.T) {
 	}
 }
 
+// A bad marker does not block the TUI: it starts with no namespace and shows
+// the marker error, which names the marker's path (escaped) and the rule,
+// never the content.
+func TestTUIStartsWithBadMarker(t *testing.T) {
+	env, _ := broker(t)
+	dir := filepath.Join(t.TempDir(), "evil\x1b]0;x\x07")
+	writeFile(t, filepath.Join(dir, markerName), "Bad Name\n", 0o644)
+	var got *tui.Options
+	code, out, errOut := cliTUI(dir, env, func(_ tui.Client, opt tui.Options) error { got = &opt; return nil })
+	if code != 0 || out != "" || errOut != "" || got == nil {
+		t.Fatalf("code %d, out %q, err %q, ran %v", code, out, errOut, got != nil)
+	}
+	marker := eventlog.Printable(filepath.Join(dir, markerName))
+	if got.Namespace != "" || !strings.HasPrefix(got.Note, "marker: "+marker+": ") ||
+		!strings.Contains(got.Note, "not a valid namespace name (want 1-16 characters of a-z, 0-9)") ||
+		strings.Contains(got.Note, "Bad Name") || strings.ContainsAny(got.Note, "\x1b\x07") {
+		t.Fatalf("namespace %q, note %q", got.Namespace, got.Note)
+	}
+}
+
+// With a bad marker and no broker, the no-broker line wins.
+func TestTUIBadMarkerAndNoBroker(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, markerName), "Bad Name\n", 0o644)
+	ran := false
+	code, out, errOut := cliTUI(dir, map[string]string{"SBX_BROKER_STATE_DIR": stateDir(t)},
+		func(tui.Client, tui.Options) error { ran = true; return nil })
+	if code != 1 || out != "" || errOut != noBroker+"\n" || ran {
+		t.Fatalf("code %d, out %q, err %q, ran %v", code, out, errOut, ran)
+	}
+}
+
 func TestTUINoBrokerOneLine(t *testing.T) {
 	env := map[string]string{"SBX_BROKER_STATE_DIR": stateDir(t)}
 	ran := false
