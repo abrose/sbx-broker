@@ -132,24 +132,38 @@ func TestEditsKeepCommentsAndKeyOrder(t *testing.T) {
 	must(t, f.SetRoute(Route{Name: "api", Listen: 29711, Upstream: "https://api.example.com"}))
 	must(t, f.SetDatabase(29720, Database{Alias: "app", Upstream: "127.0.0.1:5432", DBName: "appdb", User: "other", Password: "db-pass"}))
 	must(t, f.RemoveSecret("other"))
+	// Each comment stays on its key's line or on the line right above it.
+	want := `# head comment
+# second head line
+
+# postgres block comment
+postgres:
+  listen: 29720 # pg port
+  databases:
+    app: # app database
+      upstream: 127.0.0.1:5432
+      dbname: appdb
+      user: other
+      password: db-pass
+# http block comment
+http:
+  - name: api # api route
+    listen: 29711
+    upstream: https://api.example.com
+# secrets block comment
+secrets:
+  db-pass: # the keeper
+    command: ["echo", "x"]
+  fresh:
+    command: ["echo", "z"]
+`
 	out := bytesOf(t, f)
-	for _, c := range []string{
-		"# head comment", "# second head line", "# postgres block comment", "# pg port",
-		"# app database", "# http block comment", "# api route", "# secrets block comment", "# the keeper",
-	} {
-		if !strings.Contains(out, c) {
-			t.Errorf("comment %q lost in\n%s", c, out)
-		}
-	}
-	if got := topKeys(t, out); !reflect.DeepEqual(got, []string{"postgres", "http", "secrets"}) {
-		t.Errorf("key order = %v", got)
+	if out != want {
+		t.Errorf("got\n%s\nwant\n%s", out, want)
 	}
 	ns := load(t, out)
 	if ns.HTTP[0].Listen != 29711 || ns.Postgres.Databases[0].User != "other" || len(ns.Secrets) != 2 {
 		t.Errorf("loaded = %+v %+v", ns.HTTP, ns.Postgres)
-	}
-	if !strings.Contains(out, "  db-pass:") || strings.Contains(out, "other:\n    command") {
-		t.Errorf("unexpected text\n%s", out)
 	}
 }
 
@@ -282,7 +296,7 @@ func TestSaveRefusesChangedFile(t *testing.T) {
 	if !errors.Is(err, ErrChanged) {
 		t.Fatalf("err = %v", err)
 	}
-	if got, _ := os.ReadFile(filepath.Join(dir, "acme.yaml")); string(got) != outside {
+	if got := readFile(t, filepath.Join(dir, "acme.yaml")); got != outside {
 		t.Errorf("file = %q", got)
 	}
 }
@@ -294,7 +308,7 @@ func TestSaveRunsCheckFirst(t *testing.T) {
 	if err := f.Save(func([]byte) error { return boom }); !errors.Is(err, boom) {
 		t.Fatalf("err = %v", err)
 	}
-	if got, _ := os.ReadFile(filepath.Join(dir, "acme.yaml")); string(got) != Template {
+	if got := readFile(t, filepath.Join(dir, "acme.yaml")); got != Template {
 		t.Errorf("file changed: %q", got)
 	}
 	assertOnlyFile(t, dir, "acme.yaml")
@@ -312,11 +326,11 @@ func TestSaveWritesMode0600AtomicNoTmpLeft(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := filepath.Join(dir, "acme.yaml")
-	got, _ := os.ReadFile(p)
-	if string(got) != string(seen) || !strings.Contains(string(got), "k:") {
+	got := readFile(t, p)
+	if got != string(seen) || !strings.Contains(got, "k:") {
 		t.Errorf("file = %q, checked = %q", got, seen)
 	}
-	if fi, _ := os.Stat(p); fi.Mode().Perm() != 0o600 {
+	if fi := mustStat(t, p); fi.Mode().Perm() != 0o600 {
 		t.Errorf("mode = %v", fi.Mode())
 	}
 	assertOnlyFile(t, dir, "acme.yaml")
@@ -365,20 +379,16 @@ func TestOpenRefusesSymlinkAndGroupWritable(t *testing.T) {
 	dir := newDir(t)
 	real := writeNS(t, dir, "real", Template)
 	link := filepath.Join(dir, "link.yaml")
-	if err := os.Symlink(real, link); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Open(link); err == nil {
-		t.Error("symlink accepted")
-	}
-	if err := os.Chmod(real, 0o660); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Open(real); err == nil {
-		t.Error("group-writable file accepted")
-	}
-	if _, err := Open(dir); err == nil {
-		t.Error("directory accepted")
+	must(t, os.Symlink(real, link))
+	must(t, os.Chmod(real, 0o660))
+	for _, tc := range []struct{ path, want string }{
+		{link, "is a symlink"},
+		{real, "is writable by group or others"},
+		{dir, "is not a regular file"},
+	} {
+		if _, err := Open(tc.path); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("Open(%s): err = %v, want %q", tc.path, err, tc.want)
+		}
 	}
 }
 
@@ -411,6 +421,15 @@ func readFile(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+func mustStat(t *testing.T, path string) os.FileInfo {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi
 }
 
 func TestSaveRequiresCheck(t *testing.T) {
@@ -541,6 +560,17 @@ http:
     upstream: https://api.example.com
 `
 
+func TestDropFirstSectionMergesHeadComments(t *testing.T) {
+	f, _ := open(t, "# a\n\n# b\nsecrets:\n  k:\n    command: [\"a\"]\nhttp:\n  - name: web\n    listen: 9080\n    upstream: https://api.example.com\n")
+	must(t, f.RemoveSecret("k"))
+	out := bytesOf(t, f)
+	if !strings.HasPrefix(out, "# a\n") {
+		t.Errorf("header lost\n%s", out)
+	}
+	assertLinesInOrder(t, out, "# b\nhttp:\n")
+	load(t, out)
+}
+
 // A comment under the last key of a section belongs to the key yaml.v3 hangs
 // it on; removing that key or its section keeps the comment.
 func TestRemoveLastKeepsFootComment(t *testing.T) {
@@ -567,6 +597,35 @@ func TestRemoveLastKeepsFootComment(t *testing.T) {
 	must(t, h.RemoveSecret("a"))
 	out = bytesOf(t, h)
 	assertLinesInOrder(t, out, "secrets:\n  # under a\n  b:\n")
+	load(t, out)
+}
+
+func TestSecondDatabaseAlias(t *testing.T) {
+	f, _ := open(t, commented)
+	must(t, f.SetDatabase(29720, Database{Alias: "rep", Upstream: "127.0.0.1:5433", DBName: "repdb", User: "u", Password: "db-pass"}))
+	pg := load(t, bytesOf(t, f)).Postgres
+	if len(pg.Databases) != 2 || pg.Databases[0].Alias != "app" || pg.Databases[1].Alias != "rep" || pg.Databases[1].DBName != "repdb" {
+		t.Errorf("databases = %+v", pg.Databases)
+	}
+}
+
+func TestRemoveNonLastDatabaseKeepsBlock(t *testing.T) {
+	f, _ := open(t, commented)
+	must(t, f.SetDatabase(29720, Database{Alias: "rep", Upstream: "127.0.0.1:5433", DBName: "repdb", User: "u", Password: "db-pass"}))
+	must(t, f.RemoveDatabase("app"))
+	pg := load(t, bytesOf(t, f)).Postgres
+	if pg == nil || pg.Listen != 29720 || len(pg.Databases) != 1 || pg.Databases[0].Alias != "rep" {
+		t.Errorf("postgres = %+v", pg)
+	}
+}
+
+func TestRemoveLastRouteDropsHttpKey(t *testing.T) {
+	f, _ := open(t, commented)
+	must(t, f.RemoveRoute("api"))
+	out := bytesOf(t, f)
+	if got := topKeys(t, out); !reflect.DeepEqual(got, []string{"postgres", "secrets"}) {
+		t.Errorf("top keys = %v\n%s", got, out)
+	}
 	load(t, out)
 }
 
