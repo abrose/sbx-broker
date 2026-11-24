@@ -126,14 +126,7 @@ func LoadDir(dir string) (ok map[string]*Namespace, bad map[string]error, err er
 	ok = map[string]*Namespace{}
 	bad = map[string]error{}
 	portOwner := map[int]string{}
-	var files []string
-	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".yaml") {
-			files = append(files, e.Name())
-		}
-	}
-	sort.Strings(files)
-	for _, file := range files {
+	for _, file := range yamlFiles(entries, "") {
 		ns, err := loadFile(filepath.Join(dir, file), strings.TrimSuffix(file, ".yaml"))
 		if err == nil {
 			err = claimPorts(ns, portOwner)
@@ -151,9 +144,12 @@ func LoadDir(dir string) (ok map[string]*Namespace, bad map[string]error, err er
 // the rules of LoadDir, and checks its ports against every other valid file of
 // dir. It does not read `file` from disk, so it works on bytes not yet written.
 func Check(dir, file string, data []byte) error {
-	name := strings.TrimSuffix(file, ".yaml")
-	if file == name || !placeholder.ValidNamespace(name) {
-		return fmt.Errorf("namespace name %q is invalid (want 1-16 characters of a-z, 0-9)", name)
+	name, isYAML := strings.CutSuffix(file, ".yaml")
+	if err := checkName(name); err != nil {
+		return err
+	}
+	if !isYAML {
+		return fmt.Errorf(invalidName, name)
 	}
 	ns, err := parse(filepath.Join(dir, file), name, data)
 	if err != nil {
@@ -166,15 +162,8 @@ func Check(dir, file string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	var others []string
-	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".yaml") && e.Name() != file {
-			others = append(others, e.Name())
-		}
-	}
-	sort.Strings(others)
 	portOwner := map[int]string{}
-	for _, o := range others {
+	for _, o := range yamlFiles(entries, file) {
 		other, err := loadFile(filepath.Join(dir, o), strings.TrimSuffix(o, ".yaml"))
 		if err == nil {
 			_ = claimPorts(other, portOwner) // a clash among the others is not ours
@@ -200,36 +189,69 @@ func claimPorts(ns *Namespace, owner map[int]string) error {
 // regular file, not a symlink, owned by the user, not writable by others.
 func CheckOwnerOnlyFile(path string) error { return checkOwnerOnly(path, false) }
 
+// CheckOwnerOnlyDir applies to the namespace folder the rule LoadDir applies:
+// a directory, not a symlink, owned by the user, not writable by others.
+func CheckOwnerOnlyDir(path string) error { return checkOwnerOnly(path, true) }
+
 func checkOwnerOnly(path string, wantDir bool) error {
 	fi, err := os.Lstat(path)
 	if err != nil {
 		return err
 	}
+	return CheckOwnerOnlyInfo(path, fi, wantDir)
+}
+
+// CheckOwnerOnlyInfo applies the checks of CheckOwnerOnlyFile (or, with
+// wantDir, CheckOwnerOnlyDir) to fi, the info of name. A caller that opened
+// the file passes the info of its handle, so the checked file is the read one.
+func CheckOwnerOnlyInfo(name string, fi os.FileInfo, wantDir bool) error {
 	if fi.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("%s is a symlink", path)
+		return fmt.Errorf("%s is a symlink", name)
 	}
 	if wantDir && !fi.IsDir() {
-		return fmt.Errorf("%s is not a directory", path)
+		return fmt.Errorf("%s is not a directory", name)
 	}
 	if !wantDir && !fi.Mode().IsRegular() {
-		return fmt.Errorf("%s is not a regular file", path)
+		return fmt.Errorf("%s is not a regular file", name)
 	}
 	st, isStat := fi.Sys().(*syscall.Stat_t)
 	if !isStat {
-		return fmt.Errorf("cannot read the owner of %s", path)
+		return fmt.Errorf("cannot read the owner of %s", name)
 	}
 	if int(st.Uid) != os.Getuid() {
-		return fmt.Errorf("%s is not owned by the current user", path)
+		return fmt.Errorf("%s is not owned by the current user", name)
 	}
 	if fi.Mode().Perm()&0o022 != 0 {
-		return fmt.Errorf("%s is writable by group or others (mode %04o)", path, fi.Mode().Perm())
+		return fmt.Errorf("%s is writable by group or others (mode %04o)", name, fi.Mode().Perm())
+	}
+	return nil
+}
+
+// yamlFiles returns the sorted names of the *.yaml entries, without skip.
+func yamlFiles(entries []os.DirEntry, skip string) []string {
+	var files []string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".yaml") && e.Name() != skip {
+			files = append(files, e.Name())
+		}
+	}
+	sort.Strings(files)
+	return files
+}
+
+const invalidName = "namespace name %q is invalid (want 1-16 characters of a-z, 0-9)"
+
+// checkName refuses a namespace name LoadDir does not load.
+func checkName(name string) error {
+	if !placeholder.ValidNamespace(name) {
+		return fmt.Errorf(invalidName, name)
 	}
 	return nil
 }
 
 func loadFile(path, name string) (*Namespace, error) {
-	if !placeholder.ValidNamespace(name) {
-		return nil, fmt.Errorf("namespace name %q is invalid (want 1-16 characters of a-z, 0-9)", name)
+	if err := checkName(name); err != nil {
+		return nil, err
 	}
 	if err := checkOwnerOnly(path, false); err != nil {
 		return nil, err

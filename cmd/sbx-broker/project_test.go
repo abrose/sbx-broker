@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/abrose/sbx-broker/internal/config"
+	"github.com/abrose/sbx-broker/internal/nsfile"
 	"github.com/abrose/sbx-broker/internal/tui"
 )
 
@@ -148,8 +149,8 @@ func TestInitNewProject(t *testing.T) {
 		t.Fatalf("config folder mode %o", mode(t, cfg))
 	}
 	file := filepath.Join(cfg, "acme.yaml")
-	if b, _ := os.ReadFile(file); string(b) != namespaceTemplate || mode(t, file) != 0o600 {
-		t.Fatalf("namespace file mode %o, template %v", mode(t, file), string(b) == namespaceTemplate)
+	if b, _ := os.ReadFile(file); string(b) != nsfile.Template || mode(t, file) != 0o600 {
+		t.Fatalf("namespace file mode %o, template %v", mode(t, file), string(b) == nsfile.Template)
 	}
 }
 
@@ -240,7 +241,7 @@ func TestMarkerErrorEscapesPath(t *testing.T) {
 
 func TestTemplateLoads(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "namespaces")
-	writeFile(t, filepath.Join(dir, "acme.yaml"), namespaceTemplate, 0o600)
+	writeFile(t, filepath.Join(dir, "acme.yaml"), nsfile.Template, 0o600)
 	ok, bad, err := config.LoadDir(dir)
 	if err != nil || len(bad) != 0 || ok["acme"] == nil || len(ok["acme"].Secrets) != 0 {
 		t.Fatalf("ok %v, bad %v, err %v", ok, bad, err)

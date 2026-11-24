@@ -306,6 +306,31 @@ func TestLoadMissingDir(t *testing.T) {
 	}
 }
 
+func TestCheckOwnerOnlyInfo(t *testing.T) {
+	dir := newDir(t)
+	writeFile(t, dir, "own.yaml", "")
+	writeFile(t, dir, "shared.yaml", "")
+	if err := os.Chmod(filepath.Join(dir, "shared.yaml"), 0o660); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		path, want string // want "" is no error
+	}{
+		{filepath.Join(dir, "own.yaml"), ""},
+		{filepath.Join(dir, "shared.yaml"), "is writable by group or others (mode 0660)"},
+		{dir, "is not a regular file"},
+	} {
+		fi, err := os.Lstat(tc.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = CheckOwnerOnlyInfo(tc.path, fi, false)
+		if tc.want == "" && err != nil || tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)) {
+			t.Errorf("%s: err = %v, want %q", tc.path, err, tc.want)
+		}
+	}
+}
+
 func TestLoadRefusesSymlink(t *testing.T) {
 	dir := newDir(t)
 	writeFile(t, dir, "real.yaml", goodYAML)

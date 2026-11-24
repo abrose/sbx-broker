@@ -2,6 +2,7 @@ package nsfile
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -12,21 +13,6 @@ import (
 
 	"github.com/abrose/sbx-broker/internal/config"
 )
-
-// template is the text of `sbx-broker init` (cmd/sbx-broker namespaceTemplate).
-const template = `# An sbx-broker namespace: the secrets and services of one project.
-# The broker reads this file again within about 2 s of a change.
-# Reference: https://github.com/abrose/sbx-broker/blob/main/docs/configuration.md
-#
-# secrets:
-#   api-key:                  # the placeholder is sbxb_<namespace>_api_key (each - as _)
-#     command: ["op", "read", "op://<vault>/<item>/credential"]
-#
-# http:
-#   - name: api
-#     listen: 29610           # the broker's port for this route, 1024 to 65535
-#     upstream: https://<host>
-`
 
 const commented = `# head comment
 # second head line
@@ -120,14 +106,14 @@ func topKeys(t *testing.T, text string) []string {
 }
 
 func TestSetSecretOnCommentOnlyFile(t *testing.T) {
-	f, _ := open(t, template)
+	f, _ := open(t, Template)
 	argv := []string{"op", "read", "op://<vault>/<item>/credential"}
 	if err := f.SetSecret("api-key", argv); err != nil {
 		t.Fatal(err)
 	}
 	out := bytesOf(t, f)
 	pos := 0
-	for _, line := range strings.Split(strings.TrimSuffix(template, "\n"), "\n") {
+	for _, line := range strings.Split(strings.TrimSuffix(Template, "\n"), "\n") {
 		i := strings.Index(out[pos:], line)
 		if i < 0 {
 			t.Fatalf("comment line %q missing or out of order in\n%s", line, out)
@@ -180,9 +166,9 @@ func assertLinesInOrder(t *testing.T, out, text string) {
 }
 
 func TestRemoveLastSecretKeepsTemplateHeadComment(t *testing.T) {
-	f, _ := open(t, template+"\nsecrets:\n  k:\n    command: [\"a\"]\n")
+	f, _ := open(t, Template+"\nsecrets:\n  k:\n    command: [\"a\"]\n")
 	must(t, f.RemoveSecret("k"))
-	assertLinesInOrder(t, bytesOf(t, f), template)
+	assertLinesInOrder(t, bytesOf(t, f), Template)
 }
 
 func TestRemoveFirstSectionKeepsFileHeader(t *testing.T) {
@@ -219,7 +205,7 @@ func TestSetRouteKeepsTransforms(t *testing.T) {
 }
 
 func TestSetRouteAddsRoute(t *testing.T) {
-	f, _ := open(t, template)
+	f, _ := open(t, Template)
 	must(t, f.SetRoute(Route{Name: "idp", Listen: 29610, Upstream: "https://idp.example.com"}))
 	must(t, f.SetRoute(Route{Name: "web", Listen: 29611, Upstream: "http://127.0.0.1:9080"}))
 	ns := load(t, bytesOf(t, f))
@@ -265,7 +251,7 @@ func TestRemoveLastDatabaseRemovesPostgres(t *testing.T) {
 }
 
 func TestRemoveUnknownIsErrNotFound(t *testing.T) {
-	f, _ := open(t, template)
+	f, _ := open(t, Template)
 	for name, err := range map[string]error{
 		"secret":   f.RemoveSecret("nope"),
 		"route":    f.RemoveRoute("nope"),
@@ -288,7 +274,7 @@ func TestRemoveUnknownIsErrNotFound(t *testing.T) {
 }
 
 func TestSaveRefusesChangedFile(t *testing.T) {
-	f, dir := open(t, template)
+	f, dir := open(t, Template)
 	outside := "# written from outside\n"
 	writeNS(t, dir, "acme", outside)
 	must(t, f.SetSecret("k", []string{"echo", "x"}))
@@ -302,20 +288,20 @@ func TestSaveRefusesChangedFile(t *testing.T) {
 }
 
 func TestSaveRunsCheckFirst(t *testing.T) {
-	f, dir := open(t, template)
+	f, dir := open(t, Template)
 	must(t, f.SetSecret("k", []string{"echo", "x"}))
 	boom := errors.New("boom")
 	if err := f.Save(func([]byte) error { return boom }); !errors.Is(err, boom) {
 		t.Fatalf("err = %v", err)
 	}
-	if got, _ := os.ReadFile(filepath.Join(dir, "acme.yaml")); string(got) != template {
+	if got, _ := os.ReadFile(filepath.Join(dir, "acme.yaml")); string(got) != Template {
 		t.Errorf("file changed: %q", got)
 	}
 	assertOnlyFile(t, dir, "acme.yaml")
 }
 
 func TestSaveWritesMode0600AtomicNoTmpLeft(t *testing.T) {
-	f, dir := open(t, template)
+	f, dir := open(t, Template)
 	must(t, f.SetSecret("k", []string{"echo", "x"}))
 	var seen []byte
 	err := f.Save(func(b []byte) error {
@@ -341,9 +327,11 @@ func TestSaveWritesMode0600AtomicNoTmpLeft(t *testing.T) {
 	}
 }
 
-func TestSaveReplacesStaleTmp(t *testing.T) {
+// A stale temp file (an earlier crash, or a symlink planted there) does not
+// block a save, and a save never writes through it: each save has its own.
+func TestStaleTmpDoesNotBlockSave(t *testing.T) {
 	for _, symlink := range []bool{false, true} {
-		f, dir := open(t, template)
+		f, dir := open(t, Template)
 		tmp := filepath.Join(dir, ".acme.yaml.tmp")
 		outside := filepath.Join(t.TempDir(), "outside")
 		must(t, os.WriteFile(outside, []byte("keep me"), 0o600))
@@ -356,19 +344,26 @@ func TestSaveReplacesStaleTmp(t *testing.T) {
 		if err := f.Save(func([]byte) error { return nil }); err != nil {
 			t.Fatalf("symlink=%v: %v", symlink, err)
 		}
-		if got, _ := os.ReadFile(filepath.Join(dir, "acme.yaml")); !strings.Contains(string(got), "k:") {
+		if got := readFile(t, filepath.Join(dir, "acme.yaml")); !strings.Contains(got, "k:") {
 			t.Errorf("symlink=%v: file = %q", symlink, got)
 		}
-		if got, _ := os.ReadFile(outside); string(got) != "keep me" {
+		if got := readFile(t, outside); got != "keep me" {
 			t.Errorf("symlink=%v: outside file = %q", symlink, got)
 		}
-		assertOnlyFile(t, dir, "acme.yaml")
+		if fi, err := os.Lstat(tmp); err != nil || (fi.Mode()&os.ModeSymlink != 0) != symlink {
+			t.Errorf("symlink=%v: the stale tmp did not stay: %v %v", symlink, fi, err)
+		}
+		entries, err := os.ReadDir(dir)
+		must(t, err)
+		if len(entries) != 2 {
+			t.Errorf("symlink=%v: dir holds %d entries, want acme.yaml and .acme.yaml.tmp", symlink, len(entries))
+		}
 	}
 }
 
 func TestOpenRefusesSymlinkAndGroupWritable(t *testing.T) {
 	dir := newDir(t)
-	real := writeNS(t, dir, "real", template)
+	real := writeNS(t, dir, "real", Template)
 	link := filepath.Join(dir, "link.yaml")
 	if err := os.Symlink(real, link); err != nil {
 		t.Fatal(err)
@@ -409,6 +404,172 @@ func must(t *testing.T, err error) {
 	}
 }
 
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func TestSaveRequiresCheck(t *testing.T) {
+	f, dir := open(t, Template)
+	must(t, f.SetSecret("k", []string{"echo", "x"}))
+	if err := f.Save(nil); err == nil || err.Error() != "nsfile: Save needs a check" {
+		t.Fatalf("err = %v", err)
+	}
+	if got := readFile(t, filepath.Join(dir, "acme.yaml")); got != Template {
+		t.Errorf("file changed: %q", got)
+	}
+	assertOnlyFile(t, dir, "acme.yaml")
+}
+
+// A file removed, or swapped for a symlink, after Open is a changed file: the
+// TUI reads it again. A save never writes through the symlink.
+func TestSaveFileGoneOrSymlinkedIsErrChanged(t *testing.T) {
+	for _, symlink := range []bool{false, true} {
+		f, dir := open(t, Template)
+		p := filepath.Join(dir, "acme.yaml")
+		must(t, os.Remove(p))
+		target := filepath.Join(newDir(t), "target.yaml")
+		if symlink {
+			must(t, os.WriteFile(target, []byte("keep me"), 0o600))
+			must(t, os.Symlink(target, p))
+		}
+		must(t, f.SetSecret("k", []string{"echo", "x"}))
+		if err := f.Save(func([]byte) error { return nil }); !errors.Is(err, ErrChanged) {
+			t.Errorf("symlink=%v: err = %v", symlink, err)
+		}
+		if symlink {
+			if got := readFile(t, target); got != "keep me" {
+				t.Errorf("symlink target = %q", got)
+			}
+		}
+	}
+}
+
+func TestSaveRefusesGroupWritableDir(t *testing.T) {
+	f, dir := open(t, Template)
+	must(t, os.Chmod(dir, 0o770))
+	must(t, f.SetSecret("k", []string{"echo", "x"}))
+	err := f.Save(func([]byte) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "is writable by group or others") {
+		t.Fatalf("err = %v", err)
+	}
+	if got := readFile(t, filepath.Join(dir, "acme.yaml")); got != Template {
+		t.Errorf("file changed: %q", got)
+	}
+	assertOnlyFile(t, dir, "acme.yaml")
+}
+
+// Two saves of one file at the same time: each writes its own temp file, so
+// the file is one complete output, never a mix, and no temp file stays.
+func TestConcurrentSavesLeaveOneCompleteFile(t *testing.T) {
+	_, dir := open(t, Template)
+	p := filepath.Join(dir, "acme.yaml")
+	var files [2]*File
+	var outs [2]string
+	for i := range files {
+		f, err := Open(p)
+		must(t, err)
+		must(t, f.SetSecret(fmt.Sprintf("k%d", i), []string{"echo", "x"}))
+		files[i], outs[i] = f, bytesOf(t, f)
+	}
+	inside, release := make(chan struct{}), make(chan struct{})
+	check := func([]byte) error {
+		inside <- struct{}{}
+		<-release
+		return nil
+	}
+	errs := make(chan error, len(files))
+	for _, f := range files {
+		go func() { errs <- f.Save(check) }()
+	}
+	for n := 0; n < len(files); {
+		select {
+		case <-inside:
+			n++
+		case err := <-errs:
+			t.Fatalf("a save returned before both were inside the check: %v", err)
+		}
+	}
+	close(release)
+	failed := 0
+	for range files {
+		if err := <-errs; err != nil {
+			failed++
+			if !errors.Is(err, ErrChanged) {
+				t.Errorf("err = %v", err)
+			}
+		}
+	}
+	if failed > 1 {
+		t.Errorf("both saves failed")
+	}
+	if got := readFile(t, p); got != outs[0] && got != outs[1] {
+		t.Errorf("file is neither output:\n%s", got)
+	}
+	assertOnlyFile(t, dir, "acme.yaml")
+}
+
+// The temp file of earlier versions (.acme.yaml.tmp) is not a namespace file
+// and does not block a save.
+func TestOldFixedTmpIsIgnored(t *testing.T) {
+	f, dir := open(t, Template)
+	must(t, os.WriteFile(filepath.Join(dir, ".acme.yaml.tmp"), []byte("junk: [\n"), 0o600))
+	ok, bad, err := config.LoadDir(dir)
+	if err != nil || len(bad) != 0 || len(ok) != 1 || ok["acme"] == nil {
+		t.Fatalf("LoadDir: %v %v %v", ok, bad, err)
+	}
+	must(t, f.SetSecret("k", []string{"echo", "x"}))
+	if err := f.Save(func([]byte) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+}
+
+const tailComment = `secrets:
+  a:
+    command: ["x"]
+  b:
+    command: ["y"]
+  # tail
+
+http:
+  - name: web
+    listen: 9080
+    upstream: https://api.example.com
+`
+
+// A comment under the last key of a section belongs to the key yaml.v3 hangs
+// it on; removing that key or its section keeps the comment.
+func TestRemoveLastKeepsFootComment(t *testing.T) {
+	f, _ := open(t, tailComment)
+	must(t, f.RemoveSecret("a"))
+	if out := bytesOf(t, f); !strings.Contains(out, "# tail") {
+		t.Errorf("tail lost after removing a\n%s", out)
+	}
+	must(t, f.RemoveSecret("b"))
+	out := bytesOf(t, f)
+	if !strings.Contains(out, "# tail") {
+		t.Errorf("tail lost after removing the section\n%s", out)
+	}
+	load(t, out)
+
+	g, _ := open(t, tailComment)
+	must(t, g.RemoveSecret("b"))
+	out = bytesOf(t, g)
+	assertLinesInOrder(t, out, "  a:\n    command: [\"x\"]\n  # tail\n")
+	load(t, out)
+
+	// The foot comment of a first key moves to the key after it.
+	h, _ := open(t, "secrets:\n  a:\n    command: [\"x\"]\n  # under a\n\n  b:\n    command: [\"y\"]\n")
+	must(t, h.RemoveSecret("a"))
+	out = bytesOf(t, h)
+	assertLinesInOrder(t, out, "secrets:\n  # under a\n  b:\n")
+	load(t, out)
+}
+
 func TestHas(t *testing.T) {
 	f, _ := open(t, commented)
 	for _, tc := range []struct {
@@ -429,7 +590,7 @@ func TestHas(t *testing.T) {
 	if f.Has(KindRoute, "api") {
 		t.Error("a removed route is still there")
 	}
-	empty, _ := open(t, template)
+	empty, _ := open(t, Template)
 	if empty.Has(KindSecret, "api-key") || empty.Has(KindRoute, "api") || empty.Has(KindDatabase, "app") {
 		t.Error("a file of comments has entries")
 	}
@@ -472,7 +633,7 @@ func TestGetters(t *testing.T) {
 			t.Errorf("a missing entry: %v", err)
 		}
 	}
-	empty, _ := open(t, template)
+	empty, _ := open(t, Template)
 	if _, err := empty.Secret("api-key"); !errors.Is(err, ErrNotFound) || empty.PostgresListen() != "" {
 		t.Errorf("a file of comments: %v, listen %q", err, empty.PostgresListen())
 	}

@@ -10,25 +10,10 @@ import (
 	"syscall"
 
 	"github.com/abrose/sbx-broker/internal/eventlog"
+	"github.com/abrose/sbx-broker/internal/nsfile"
 	"github.com/abrose/sbx-broker/internal/placeholder"
 	"github.com/abrose/sbx-broker/internal/tui"
 )
-
-// namespaceTemplate is the file that init creates: comments only, so the
-// broker loads it as an empty namespace until the owner fills it.
-const namespaceTemplate = `# An sbx-broker namespace: the secrets and services of one project.
-# The broker reads this file again within about 2 s of a change.
-# Reference: https://github.com/abrose/sbx-broker/blob/main/docs/configuration.md
-#
-# secrets:
-#   api-key:                  # the placeholder is sbxb_<namespace>_api_key (each - as _)
-#     command: ["op", "read", "op://<vault>/<item>/credential"]
-#
-# http:
-#   - name: api
-#     listen: 29610           # the broker's port for this route, 1024 to 65535
-#     upstream: https://<host>
-`
 
 // edit opens the namespace file of args[0] or of the project marker.
 func (c *command) edit(args []string) int {
@@ -101,7 +86,7 @@ func (c *command) initProject(ns string) int {
 		return c.fail(err)
 	}
 	path := filepath.Join(cfg, ns+".yaml")
-	switch err := writeNew(path, namespaceTemplate, 0o600); {
+	switch err := writeNew(path, nsfile.Template, 0o600); {
 	case err == nil:
 		fmt.Fprintf(c.stdout, "created %s\n", path)
 	case errors.Is(err, fs.ErrExist):

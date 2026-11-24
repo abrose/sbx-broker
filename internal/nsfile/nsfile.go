@@ -19,6 +19,22 @@ import (
 	"github.com/abrose/sbx-broker/internal/config"
 )
 
+// Template is the file that `sbx-broker init` creates: comments only, so the
+// broker loads it as an empty namespace until the owner fills it.
+const Template = `# An sbx-broker namespace: the secrets and services of one project.
+# The broker reads this file again within about 2 s of a change.
+# Reference: https://github.com/abrose/sbx-broker/blob/main/docs/configuration.md
+#
+# secrets:
+#   api-key:                  # the placeholder is sbxb_<namespace>_api_key (each - as _)
+#     command: ["op", "read", "op://<vault>/<item>/credential"]
+#
+# http:
+#   - name: api
+#     listen: 29610           # the broker's port for this route, 1024 to 65535
+#     upstream: https://<host>
+`
+
 var (
 	// ErrChanged: the file on disk differs from the bytes the edit started from.
 	ErrChanged = errors.New("the namespace file changed on disk; the TUI read it again, make the change again")
@@ -47,12 +63,10 @@ type File struct {
 }
 
 // Open reads path under the rules of config.LoadDir: no symlink, a regular
-// file, owned by the user, not writable by group or others.
+// file, owned by the user, not writable by group or others. It checks the
+// file it opened, so a swap between the check and the read cannot slip by.
 func Open(path string) (*File, error) {
-	if err := config.CheckOwnerOnlyFile(path); err != nil {
-		return nil, err
-	}
-	data, err := readNoFollow(path)
+	data, err := readChecked(path)
 	if err != nil {
 		return nil, err
 	}
@@ -76,13 +90,45 @@ func Open(path string) (*File, error) {
 	return f, nil
 }
 
+// readChecked opens path once, checks the handle with
+// config.CheckOwnerOnlyInfo and reads from it.
+func readChecked(path string) ([]byte, error) {
+	fh, err := openNoFollow(path)
+	if errors.Is(err, syscall.ELOOP) {
+		// O_NOFOLLOW refused a symlink: say so in the words of config.
+		if fi, lerr := os.Lstat(path); lerr == nil {
+			if cerr := config.CheckOwnerOnlyInfo(path, fi, false); cerr != nil {
+				return nil, cerr
+			}
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer fh.Close()
+	fi, err := fh.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if err := config.CheckOwnerOnlyInfo(path, fi, false); err != nil {
+		return nil, err
+	}
+	return io.ReadAll(fh)
+}
+
 func readNoFollow(path string) ([]byte, error) {
-	fh, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	fh, err := openNoFollow(path)
 	if err != nil {
 		return nil, err
 	}
 	defer fh.Close()
 	return io.ReadAll(fh)
+}
+
+// openNoFollow opens path for reading. It refuses a symlink, and does not
+// block on a FIFO.
+func openNoFollow(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 }
 
 // Bytes encodes the file with a two-space indent.
@@ -120,12 +166,23 @@ func (f *File) Bytes() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// Save writes the edited file: it refuses when the file on disk is not the one
-// Open read, runs check on the new bytes, writes .<ns>.yaml.tmp (0600,
-// exclusive, no symlink), syncs it and renames it over the file. The reload is
-// the caller's.
+// Save writes the edited file: it checks the folder under the rules of
+// config.LoadDir, refuses when the file on disk is not the one Open read (a
+// file gone or turned into a symlink is ErrChanged too), runs check on the new
+// bytes, writes a temp file of its own (.<ns>.yaml.tmp<random>, 0600), syncs it
+// and renames it over the file. check is required. The reload is the caller's.
 func (f *File) Save(check func(data []byte) error) error {
+	if check == nil {
+		return errors.New("nsfile: Save needs a check")
+	}
+	dir := filepath.Dir(f.path)
+	if err := config.CheckOwnerOnlyDir(dir); err != nil {
+		return err
+	}
 	disk, err := readNoFollow(f.path)
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ELOOP) {
+		return ErrChanged
+	}
 	if err != nil {
 		return err
 	}
@@ -136,26 +193,14 @@ func (f *File) Save(check func(data []byte) error) error {
 	if err != nil {
 		return err
 	}
-	if check != nil {
-		if err := check(data); err != nil {
-			return err
-		}
-	}
-	tmp := filepath.Join(filepath.Dir(f.path), "."+filepath.Base(f.path)+".tmp")
-	// A crash can leave a stale tmp. Remove it (a symlink itself, never its
-	// target) so it cannot block every later save.
-	if err := os.Remove(tmp); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := check(data); err != nil {
 		return err
 	}
-	if err := writeTmp(tmp, data); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, f.path); err != nil {
-		_ = os.Remove(tmp)
+	if err := replace(f.path, data); err != nil {
 		return err
 	}
 	f.orig = data
-	return syncDir(filepath.Dir(f.path))
+	return syncDir(dir)
 }
 
 func syncDir(dir string) error {
@@ -170,24 +215,32 @@ func syncDir(dir string) error {
 	return err
 }
 
-func writeTmp(tmp string, data []byte) (err error) {
-	fh, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+// replace writes data to a new temp file beside path, unique to this call
+// (created exclusive, so it never follows a symlink), and renames it over
+// path. On an error it removes its own temp file and no other.
+func replace(path string, data []byte) (err error) {
+	fh, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp*")
 	if err != nil {
 		return err
 	}
+	tmp := fh.Name()
 	defer func() {
 		if err != nil {
 			_ = os.Remove(tmp)
 		}
 	}()
-	if _, err = fh.Write(data); err == nil {
-		err = fh.Chmod(0o600)
+	err = fh.Chmod(0o600)
+	if err == nil {
+		_, err = fh.Write(data)
 	}
 	if err == nil {
 		err = fh.Sync()
 	}
 	if cerr := fh.Close(); err == nil {
 		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp, path)
 	}
 	return err
 }
@@ -335,7 +388,7 @@ func (f *File) RemoveRoute(name string) error {
 		if v := get(it, "name"); v != nil && v.Value == name {
 			list.Content = append(list.Content[:i], list.Content[i+1:]...)
 			if len(list.Content) == 0 {
-				f.dropSection("http")
+				f.dropSection("http", "")
 			}
 			return nil
 		}
@@ -381,9 +434,8 @@ func (f *File) RemoveDatabase(alias string) error {
 	if dbs == nil || dbs.Kind != yaml.MappingNode || get(dbs, alias) == nil {
 		return fmt.Errorf("database %q: %w", alias, ErrNotFound)
 	}
-	deleteKey(dbs, alias)
-	if len(dbs.Content) == 0 {
-		f.dropSection("postgres")
+	if orphan := deleteKey(dbs, alias); len(dbs.Content) == 0 {
+		f.dropSection("postgres", orphan)
 	}
 	return nil
 }
@@ -393,9 +445,8 @@ func (f *File) removeFromMap(section, name string) error {
 	if m == nil || m.Kind != yaml.MappingNode || get(m, name) == nil {
 		return fmt.Errorf("%s %q: %w", strings.TrimSuffix(section, "s"), name, ErrNotFound)
 	}
-	deleteKey(m, name)
-	if len(m.Content) == 0 {
-		f.dropSection(section)
+	if orphan := deleteKey(m, name); len(m.Content) == 0 {
+		f.dropSection(section, orphan)
 	}
 	return nil
 }
@@ -479,24 +530,57 @@ func setTyped(m *yaml.Node, key, tag, value string) {
 
 // dropSection removes a top-level key. When it is the first key, its head
 // comment may be the file header (yaml.v3 attaches a header without a blank
-// line to the first key), so it moves to the document.
-func (f *File) dropSection(key string) {
-	if f.doc != nil && len(f.root.Content) > 0 && f.root.Content[0].Value == key {
-		if hc := f.root.Content[0].HeadComment; hc != "" {
-			if f.doc.HeadComment != "" {
-				hc = f.doc.HeadComment + "\n\n" + hc
-			}
-			f.doc.HeadComment = hc
+// line to the first key), so it moves to the document. orphan is the foot
+// comment of the section's last entry, which deleteKey returned: it goes with
+// the section's own foot comment, and lands on the document when the file
+// empties.
+func (f *File) dropSection(key, orphan string) {
+	for i := 0; i+1 < len(f.root.Content); i += 2 {
+		k := f.root.Content[i]
+		if k.Value != key {
+			continue
 		}
+		k.FootComment = joinComments("\n", orphan, k.FootComment)
+		if i == 0 && f.doc != nil {
+			f.doc.HeadComment = joinComments("\n\n", f.doc.HeadComment, k.HeadComment)
+		}
+		break
 	}
-	deleteKey(f.root, key)
+	if foot := deleteKey(f.root, key); f.doc != nil {
+		f.doc.FootComment = joinComments("\n", f.doc.FootComment, foot)
+	}
 }
 
-func deleteKey(m *yaml.Node, key string) {
+// deleteKey removes key from m. yaml.v3 hangs a comment under the last line
+// of an entry (before a blank line) on its key as a foot comment; it moves to
+// the key before, else to the head of the key after. When m empties,
+// deleteKey returns it for the caller to place.
+func deleteKey(m *yaml.Node, key string) (orphan string) {
 	for i := 0; i+1 < len(m.Content); i += 2 {
-		if m.Content[i].Value == key {
-			m.Content = append(m.Content[:i], m.Content[i+2:]...)
-			return
+		if m.Content[i].Value != key {
+			continue
 		}
+		foot := m.Content[i].FootComment
+		m.Content = append(m.Content[:i], m.Content[i+2:]...)
+		switch {
+		case foot == "":
+		case i > 0:
+			prev := m.Content[i-2]
+			prev.FootComment = joinComments("\n", prev.FootComment, foot)
+		case len(m.Content) > 0:
+			m.Content[0].HeadComment = joinComments("\n", foot, m.Content[0].HeadComment)
+		default:
+			return foot
+		}
+		return ""
 	}
+	return ""
+}
+
+// joinComments joins the non-empty comments a and b with sep.
+func joinComments(sep, a, b string) string {
+	if a == "" || b == "" {
+		return a + b
+	}
+	return a + sep + b
 }
