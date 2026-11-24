@@ -21,15 +21,9 @@ type editRun struct {
 }
 
 func cliEdit(dir string, env map[string]string, args ...string) editRun {
-	var out, errOut bytes.Buffer
 	var r editRun
-	c := &command{
-		getenv:    func(k string) string { return env[k] },
-		getwd:     func() (string, error) { return dir, nil },
-		runEditor: func(dir string, argv []string) error { r.dir, r.argv = dir, argv; return nil },
-		stdout:    &out,
-		stderr:    &errOut,
-	}
+	c, out, errOut := testCommand(dir, env)
+	c.runEditor = func(dir string, argv []string) error { r.dir, r.argv = dir, argv; return nil }
 	r.code = c.run(args)
 	r.out, r.errOut = out.String(), errOut.String()
 	return r

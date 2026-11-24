@@ -1382,9 +1382,12 @@ func TestStatusCarriesCommandRoutesAndSwaps(t *testing.T) {
 	}
 	waitFor(t, 3*time.Second, "one swap counted", func() bool {
 		n, ok := status(t, state, "t1")
-		return ok && n.Secrets[0].Swaps == 1
+		return ok && len(n.Secrets) > 0 && n.Secrets[0].Swaps == 1
 	})
 	n, _ := status(t, state, "t1")
+	if len(n.Secrets) == 0 {
+		t.Fatalf("t1 has no secrets: %+v", n)
+	}
 	if want := []string{"printf", "%s", apiKey}; !slices.Equal(n.Secrets[0].Command, want) {
 		t.Errorf("command %v, want %v", n.Secrets[0].Command, want)
 	}
@@ -1401,6 +1404,9 @@ func TestStatusCarriesCommandRoutesAndSwaps(t *testing.T) {
 	wantDB := admin.DatabaseInfo{Alias: "app", Upstream: fmt.Sprintf("127.0.0.1:%d", pgUp), DBName: "appdb", User: "app", Password: "db-pass"}
 	if n2.Postgres == nil || n2.Postgres.Listen != pgPort || len(n2.Postgres.Databases) != 1 || n2.Postgres.Databases[0] != wantDB {
 		t.Errorf("postgres %+v, want %+v", n2.Postgres, wantDB)
+	}
+	if len(n2.Secrets) == 0 {
+		t.Fatalf("t2 has no secrets: %+v", n2)
 	}
 	if n2.Secrets[0].Swaps != 0 {
 		t.Errorf("t2 swaps %d", n2.Secrets[0].Swaps)

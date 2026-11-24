@@ -96,11 +96,13 @@ type NamespaceStatus struct {
 // Response is one response line. Value is set by "reveal" only: it is the
 // one place a secret value crosses the socket.
 type Response struct {
+	// revealOp writes the reveal line by hand; keep the JSON names of OK and
+	// Value in step.
 	OK         bool              `json:"ok"`
 	Error      string            `json:"error,omitempty"`
 	Namespaces []NamespaceStatus `json:"namespaces,omitempty"`
 	Event      *eventlog.Event   `json:"event,omitempty"`
-	Value      []byte            `json:"value,omitempty"`
+	Value      []byte            `json:"value,omitempty"` // see OK
 }
 
 // Backend is what the socket asks of the broker.
@@ -328,6 +330,10 @@ func (s *Server) do(ctx context.Context, req Request, enc *json.Encoder, w io.Wr
 	case "log":
 		s.logOp(ctx, req, enc)
 	case "reveal":
+		if req.Namespace == "" || req.Secret == "" {
+			reply(nil, errors.New("reveal needs a namespace and a secret"))
+			return
+		}
 		s.revealOp(req, enc, w)
 	default:
 		reply(nil, fmt.Errorf("unknown op %s", req.Op))

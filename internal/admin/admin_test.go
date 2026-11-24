@@ -1,7 +1,10 @@
 package admin
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -20,6 +23,7 @@ type fakeBackend struct {
 	mu        sync.Mutex
 	refreshed []string // "ns/secret"
 	reloads   int
+	revealed  [][]byte // every slice Reveal returned, kept to check it is wiped
 }
 
 func (f *fakeBackend) Status(ns string) ([]NamespaceStatus, error) {
@@ -44,7 +48,11 @@ func (f *fakeBackend) Reveal(ns, secret string) ([]byte, error) {
 	if secret == "broken" {
 		return nil, fmt.Errorf("secret not loaded: broken (failed)")
 	}
-	return []byte("real-api-key-1"), nil
+	v := []byte("real-api-key-1")
+	f.mu.Lock()
+	f.revealed = append(f.revealed, v)
+	f.mu.Unlock()
+	return v, nil
 }
 
 func (f *fakeBackend) Reload(context.Context) error {
@@ -162,10 +170,72 @@ func TestRevealErrorHasNoValue(t *testing.T) {
 	if _, err := conn.Write([]byte(`{"op":"reveal","ns":"acme","secret":"broken"}` + "\n")); err != nil {
 		t.Fatal(err)
 	}
-	buf := make([]byte, 4096)
-	n, _ := conn.Read(buf)
-	if string(buf[:n]) != `{"ok":false,"error":"secret not loaded: broken (failed)"}`+"\n" {
-		t.Fatalf("line %q", buf[:n])
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if line != `{"ok":false,"error":"secret not loaded: broken (failed)"}`+"\n" {
+		t.Fatalf("line %q", line)
+	}
+}
+
+func TestRevealNeedsNamespaceAndSecret(t *testing.T) {
+	state, b, log, _ := serve(t)
+	for _, req := range []Request{{Op: "reveal"}, {Op: "reveal", Namespace: "t1"}} {
+		resps, err := do(t, state, req)
+		if err == nil || err.Error() != "reveal needs a namespace and a secret" || len(resps) != 0 {
+			t.Fatalf("%+v: err %v, responses %+v", req, err, resps)
+		}
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.revealed) != 0 {
+		t.Fatalf("Reveal was called %d times", len(b.revealed))
+	}
+	for _, e := range log.Recent(1 << 30) {
+		if e.Kind == eventlog.KindReveal {
+			t.Fatalf("reveal event logged: %+v", e)
+		}
+	}
+}
+
+func TestRevealWipesBackendCopy(t *testing.T) {
+	state, b, _, _ := serve(t)
+	if _, err := do(t, state, Request{Op: "reveal", Namespace: "acme", Secret: "api-key"}); err != nil {
+		t.Fatal(err)
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.revealed) != 1 {
+		t.Fatalf("Reveal was called %d times", len(b.revealed))
+	}
+	for _, v := range b.revealed {
+		if !bytes.Equal(v, make([]byte, len(v))) {
+			t.Fatalf("backend copy not wiped: %q", v)
+		}
+	}
+}
+
+func TestRevealLineMatchesResponseEncoding(t *testing.T) {
+	state, _, _, _ := serve(t)
+	conn, err := net.Dial("unix", SocketPath(state))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte(`{"op":"reveal","ns":"acme","secret":"api-key"}` + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want bytes.Buffer
+	if err := json.NewEncoder(&want).Encode(Response{OK: true, Value: []byte("real-api-key-1")}); err != nil {
+		t.Fatal(err)
+	}
+	if line != want.String() {
+		t.Fatalf("line %q, want %q", line, want.String())
 	}
 }
 

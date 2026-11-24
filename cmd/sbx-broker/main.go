@@ -489,7 +489,8 @@ func (c *command) agent() (launchd.Agent, error) {
 
 // probe asks the broker on the socket in state for its status and waits at
 // most wait for the answer. nil: it answers; admin.ErrNoBroker: none runs;
-// admin.ErrNoAnswer: one accepts but does not answer.
+// admin.ErrNoAnswer: one accepts but does not answer. wait <= 0 means
+// admin.AnswerWait (5 s).
 func probe(state string, wait time.Duration) error {
 	cl, err := admin.DialWaits(state, admin.Waits{Answer: wait})
 	if err != nil {
