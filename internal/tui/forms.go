@@ -1,21 +1,15 @@
 package tui
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"io"
-	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/abrose/sbx-broker/internal/admin"
-	"github.com/abrose/sbx-broker/internal/config"
 	"github.com/abrose/sbx-broker/internal/nsfile"
 )
 
@@ -24,37 +18,6 @@ import (
 // that changed on disk, runs config.Check and writes atomically. Then the TUI
 // sends reload. A name or alias is fixed after creation, and transforms are
 // not in a form: o opens the file in the owner's editor for them (C3).
-
-// Terminal is the terminal Bubble Tea hands over while the editor runs.
-type Terminal struct {
-	In       io.Reader
-	Out, Err io.Writer
-}
-
-// EditorArgv is the editor command for file: $VISUAL, else $EDITOR, else vi,
-// split on spaces and run with no shell.
-func EditorArgv(getenv func(string) string, file string) []string {
-	for _, key := range []string{"VISUAL", "EDITOR"} {
-		if fields := strings.Fields(getenv(key)); len(fields) > 0 {
-			return append(fields, file)
-		}
-	}
-	return []string{"vi", file}
-}
-
-// editorExec is the tea.ExecCommand of the editor key: Bubble Tea sets the
-// terminal on it, and Run hands that terminal to Options.Editor.
-type editorExec struct {
-	run  func(dir string, argv []string, term Terminal) error
-	dir  string
-	argv []string
-	term Terminal
-}
-
-func (e *editorExec) SetStdin(r io.Reader)  { e.term.In = r }
-func (e *editorExec) SetStdout(w io.Writer) { e.term.Out = w }
-func (e *editorExec) SetStderr(w io.Writer) { e.term.Err = w }
-func (e *editorExec) Run() error            { return e.run(e.dir, e.argv, e.term) }
 
 type formKind int
 
@@ -92,29 +55,13 @@ type form struct {
 	saving bool
 }
 
-// removal is a remove that waits for its y.
-type removal struct {
-	kind     formKind
-	ns, name string
+// formBaseMsg is the message of the form's read of the file.
+type formBaseMsg struct {
+	id     int
+	data   []byte   // the file as nsfile read it
+	values []string // the fields from the file; nil: none
+	err    error    // the read failed, or the entry of an edit is gone
 }
-
-// Messages of the forms and the editor key.
-type (
-	formBaseMsg struct {
-		id     int
-		data   []byte   // the file as nsfile read it
-		values []string // the fields from the file; nil: none
-		err    error    // the read failed, or the entry of an edit is gone
-	}
-	savedMsg struct {
-		id        int    // the form or removal that saved
-		done      string // what the save did, for the note: "saved secret x"
-		err       error  // the save failed: nothing was written
-		reloadErr error  // the save worked; the reload did not
-	}
-	editedMsg   struct{ err error } // the editor ended
-	reloadedMsg struct{ err error } // the reload after the editor failed
-)
 
 func (m *Model) nsPath(ns string) string { return filepath.Join(m.opt.ConfigDir, ns+".yaml") }
 
@@ -253,224 +200,6 @@ func (m *Model) formInput(msg tea.Msg) tea.Cmd {
 	return cmd
 }
 
-func (m *Model) saveForm() tea.Cmd {
-	f := m.form
-	if f.saving || f.base == nil {
-		return nil // a save needs the read of the file: the form shows that it reads, or why the read failed
-	}
-	v := make([]string, len(f.inputs))
-	for i, in := range f.inputs {
-		v[i] = strings.TrimSpace(in.Value())
-	}
-	apply, err := formEdit(f, v)
-	if err != nil {
-		f.err = p(err.Error())
-		return nil
-	}
-	f.err, f.saving = "", true
-	return m.saveCmd(f.id, f.ns, f.base, "saved "+formSpecs[f.kind].noun+" "+v[0], apply)
-}
-
-// formEdit turns the values of f into the edit of the file. The nsfile Set
-// methods add or replace, so the edit asks the opened file first: an add
-// refuses a name the file holds, and an edit refuses an entry that left it.
-// The broker's status can lag the file, so it does not decide.
-func formEdit(f *form, v []string) (func(*nsfile.File) error, error) {
-	set, err := formSet(f.kind, v)
-	if err != nil {
-		return nil, err
-	}
-	spec, edit, name := formSpecs[f.kind], f.edit, v[0]
-	return func(nf *nsfile.File) error {
-		switch have := nf.Has(spec.file, name); {
-		case have && !edit:
-			return fmt.Errorf("%s %q exists (e edits it)", spec.noun, name)
-		case !have && edit:
-			return fmt.Errorf("%s %s is no longer in the file", spec.word, name)
-		}
-		return set(nf)
-	}, nil
-}
-
-// formSet parses the values of a form of kind into the Set call it makes.
-func formSet(kind formKind, v []string) (func(*nsfile.File) error, error) {
-	switch kind {
-	case secretForm:
-		var argv []string // none: config.Check says the command is empty
-		if v[1] != "" {
-			var err error
-			if argv, err = SplitArgs(v[1]); err != nil {
-				return nil, fmt.Errorf("command: %w", err)
-			}
-		}
-		return func(nf *nsfile.File) error { return nf.SetSecret(v[0], argv) }, nil
-	case routeForm:
-		listen, err := port("listen port", v[1])
-		if err != nil {
-			return nil, err
-		}
-		r := nsfile.Route{Name: v[0], Listen: listen, Upstream: v[2]}
-		return func(nf *nsfile.File) error { return nf.SetRoute(r) }, nil
-	default:
-		listen, err := port("postgres listen port", v[6])
-		if err != nil {
-			return nil, err
-		}
-		d := nsfile.Database{Alias: v[0], Upstream: v[1], DBName: v[2], User: v[3], Password: v[4], RequireAuth: v[5]}
-		return func(nf *nsfile.File) error { return nf.SetDatabase(listen, d) }, nil
-	}
-}
-
-func port(label, s string) (int, error) {
-	n, err := strconv.Atoi(s)
-	if err != nil {
-		return 0, fmt.Errorf("%s %q is not a port number", label, s)
-	}
-	return n, nil
-}
-
-// askRemove asks for the y that removes name.
-func (m *Model) askRemove(kind formKind, ns, name string) {
-	m.hide()
-	m.removal = &removal{kind: kind, ns: ns, name: name}
-}
-
-// removalKey removes on y; any other key cancels.
-func (m *Model) removalKey(k tea.KeyPressMsg) tea.Cmd {
-	r := m.removal
-	m.removal = nil
-	if !key.Matches(k, m.keys.confirm) {
-		return nil
-	}
-	apply := func(nf *nsfile.File) error {
-		switch r.kind {
-		case secretForm:
-			return nf.RemoveSecret(r.name)
-		case routeForm:
-			return nf.RemoveRoute(r.name)
-		default:
-			return nf.RemoveDatabase(r.name)
-		}
-	}
-	m.edits++
-	return m.saveCmd(m.edits, r.ns, nil, "removed "+formSpecs[r.kind].noun+" "+r.name, apply)
-}
-
-// saveCmd edits the namespace file of ns and, when that worked, sends
-// reload. base is the file the edit started from; nil starts from the file
-// as it is now.
-func (m *Model) saveCmd(id int, ns string, base []byte, done string, apply func(*nsfile.File) error) tea.Cmd {
-	dir, cl := m.opt.ConfigDir, m.cl
-	return func() tea.Msg {
-		msg := savedMsg{id: id, done: done, err: saveFile(dir, ns, base, apply)}
-		if msg.err == nil {
-			msg.reloadErr = cl.Reload()
-		}
-		return msg
-	}
-}
-
-func saveFile(dir, ns string, base []byte, apply func(*nsfile.File) error) error {
-	file := ns + ".yaml"
-	path := filepath.Join(dir, file)
-	nf, err := nsfile.Open(path)
-	if err != nil {
-		return err
-	}
-	if base != nil {
-		// Read after Open: Save refuses a file that is no longer the one
-		// Open read, so a match here means the save starts from base.
-		now, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		if !bytes.Equal(now, base) {
-			return nsfile.ErrChanged
-		}
-	}
-	if err := apply(nf); err != nil {
-		return err
-	}
-	return nf.Save(func(data []byte) error { return config.Check(dir, file, data) })
-}
-
-// gotSaved closes the form of a save that worked or found the file changed,
-// and keeps it open with the error otherwise.
-func (m *Model) gotSaved(msg savedMsg) tea.Cmd {
-	f := m.form
-	mine := f != nil && f.id == msg.id
-	switch {
-	case msg.err == nil:
-		if mine {
-			m.form = nil
-		}
-		m.note = p(msg.done)
-		if msg.reloadErr != nil {
-			m.note += "; reload: " + p(msg.reloadErr.Error())
-		}
-		return m.statusOnce()
-	case mine && !errors.Is(msg.err, nsfile.ErrChanged):
-		f.saving, f.err = false, p(msg.err.Error())
-		return nil
-	default:
-		// The file changed (the TUI shows what the broker loaded: the next
-		// status brings it), or a remove failed.
-		if mine {
-			m.form = nil
-		}
-		m.note = p(msg.err.Error())
-		return m.statusOnce()
-	}
-}
-
-// statusOnce asks for a status now, outside the 2 s poll chain.
-func (m *Model) statusOnce() tea.Cmd {
-	cl := m.cl
-	return func() tea.Msg {
-		nss, err := cl.Status("")
-		return statusMsg{nss: nss, err: err, once: true}
-	}
-}
-
-// editorCmd gives the terminal to the owner's editor on the file of ns. The
-// editor runs in the config dir, never in a project folder, as
-// `sbx-broker edit` does.
-func (m *Model) editorCmd(ns string) tea.Cmd {
-	if m.opt.Editor == nil {
-		m.note = "no editor"
-		return nil
-	}
-	getenv := m.opt.Getenv
-	if getenv == nil {
-		getenv = os.Getenv
-	}
-	e := &editorExec{run: m.opt.Editor, dir: m.opt.ConfigDir, argv: EditorArgv(getenv, m.nsPath(ns))}
-	return m.exec(e, func(err error) tea.Msg { return editedMsg{err: err} })
-}
-
-// gotEdited reloads after the editor, which may have changed the file.
-func (m *Model) gotEdited(msg editedMsg) tea.Cmd {
-	if msg.err != nil {
-		m.note = "editor: " + p(msg.err.Error())
-	}
-	cl := m.cl
-	return func() tea.Msg {
-		if err := cl.Reload(); err != nil {
-			return reloadedMsg{err: err}
-		}
-		nss, err := cl.Status("")
-		return statusMsg{nss: nss, err: err, once: true}
-	}
-}
-
-func (m *Model) gotReloaded(msg reloadedMsg) {
-	if errors.Is(msg.err, admin.ErrNoBroker) {
-		m.down = NoBroker
-		return
-	}
-	m.note = "reload: " + p(msg.err.Error())
-}
-
 // secretsEditKey handles the edit keys of the Secrets view.
 func (m *Model) secretsEditKey(k tea.KeyPressMsg, ns *admin.NamespaceStatus) tea.Cmd {
 	at := m.secCursor < len(ns.Secrets)
@@ -481,45 +210,6 @@ func (m *Model) secretsEditKey(k tea.KeyPressMsg, ns *admin.NamespaceStatus) tea
 		return m.openForm(secretForm, ns.Name, ns.Secrets[m.secCursor].Name)
 	case key.Matches(k, m.keys.remove) && at:
 		m.askRemove(secretForm, ns.Name, ns.Secrets[m.secCursor].Name)
-	case key.Matches(k, m.keys.editor):
-		return m.editorCmd(ns.Name)
-	}
-	return nil
-}
-
-// routesKey handles the keys of the Routes view. Its rows are the HTTP
-// routes, then the databases.
-func (m *Model) routesKey(k tea.KeyPressMsg) tea.Cmd {
-	ns := m.current()
-	if ns == nil {
-		return nil
-	}
-	var pg admin.PostgresInfo
-	if ns.Postgres != nil {
-		pg = *ns.Postgres
-	}
-	n := len(ns.HTTP) + len(pg.Databases)
-	at := m.routeCursor < n
-	switch {
-	case key.Matches(k, m.keys.up):
-		m.routeCursor = max(m.routeCursor-1, 0)
-	case key.Matches(k, m.keys.down):
-		m.routeCursor = min(m.routeCursor+1, max(n-1, 0))
-	case key.Matches(k, m.keys.addRoute):
-		return m.openForm(routeForm, ns.Name, "")
-	case key.Matches(k, m.keys.addDatabase):
-		return m.openForm(databaseForm, ns.Name, "")
-	case key.Matches(k, m.keys.edit) && at:
-		if i := m.routeCursor; i < len(ns.HTTP) {
-			return m.openForm(routeForm, ns.Name, ns.HTTP[i].Name)
-		}
-		return m.openForm(databaseForm, ns.Name, pg.Databases[m.routeCursor-len(ns.HTTP)].Alias)
-	case key.Matches(k, m.keys.remove) && at:
-		if i := m.routeCursor; i < len(ns.HTTP) {
-			m.askRemove(routeForm, ns.Name, ns.HTTP[i].Name)
-		} else {
-			m.askRemove(databaseForm, ns.Name, pg.Databases[i-len(ns.HTTP)].Alias)
-		}
 	case key.Matches(k, m.keys.editor):
 		return m.editorCmd(ns.Name)
 	}
