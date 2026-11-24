@@ -200,8 +200,13 @@ func TestRevealNeedsNamespaceAndSecret(t *testing.T) {
 }
 
 func TestRevealWipesBackendCopy(t *testing.T) {
-	state, b, _, _ := serve(t)
-	if _, err := do(t, state, Request{Op: "reveal", Namespace: "acme", Secret: "api-key"}); err != nil {
+	state, b, _, s := serve(t)
+	if _, err := do(t, state, Request{Op: "reveal", Namespace: "t1", Secret: "api-key"}); err != nil {
+		t.Fatal(err)
+	}
+	// The handler wipes after it writes the line: Close waits for it to
+	// return, which orders the wipe before the reads below.
+	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
 	b.mu.Lock()
@@ -223,7 +228,7 @@ func TestRevealLineMatchesResponseEncoding(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	if _, err := conn.Write([]byte(`{"op":"reveal","ns":"acme","secret":"api-key"}` + "\n")); err != nil {
+	if _, err := conn.Write([]byte(`{"op":"reveal","ns":"t1","secret":"api-key"}` + "\n")); err != nil {
 		t.Fatal(err)
 	}
 	line, err := bufio.NewReader(conn).ReadString('\n')
