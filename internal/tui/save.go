@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -160,13 +159,9 @@ func saveFile(dir, ns string, base []byte, apply func(*nsfile.File) error) error
 		return err
 	}
 	if base != nil {
-		// Read after Open: Save refuses a file that is no longer the one
+		// The bytes Open read: Save refuses a file that is no longer the one
 		// Open read, so a match here means the save starts from base.
-		now, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		if !bytes.Equal(now, base) {
+		if !bytes.Equal(nf.Source(), base) {
 			return nsfile.ErrChanged
 		}
 	}

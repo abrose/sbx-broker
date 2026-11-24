@@ -482,10 +482,13 @@ func TestLoadedOnlyExit113MeansNotLoaded(t *testing.T) {
 func TestPrintErrorReachesCallers(t *testing.T) {
 	broken := printFails(&ExitError{Code: 5})
 	a := agent(t)
-	if err := Install(a, broken); err == nil || !strings.Contains(err.Error(), "launchctl print") {
+	stays := "; the plist stays at " + a.PlistPath
+	if err := Install(a, broken); err == nil || !strings.Contains(err.Error(), "launchctl print") ||
+		!strings.HasSuffix(err.Error(), stays+", sbx-broker uninstall removes it") {
 		t.Fatalf("install: %v", err)
 	}
-	if _, err := Uninstall(a, broken); err == nil || !strings.Contains(err.Error(), "launchctl print") {
+	if _, err := Uninstall(a, broken); err == nil || !strings.Contains(err.Error(), "launchctl print") ||
+		!strings.HasSuffix(err.Error(), stays+", remove it by hand") {
 		t.Fatalf("uninstall: %v", err)
 	}
 	// print works first, then fails while the install waits for the unload
@@ -498,7 +501,8 @@ func TestPrintErrorReachesCallers(t *testing.T) {
 		}
 		return nil, nil
 	}
-	if err := install(a, lc, func(time.Duration) {}); err == nil || !strings.Contains(err.Error(), "launchctl print") {
+	if err := install(a, lc, func(time.Duration) {}); err == nil || !strings.Contains(err.Error(), "launchctl print") ||
+		!strings.HasSuffix(err.Error(), stays+", sbx-broker uninstall removes it") {
 		t.Fatalf("wait: %v", err)
 	}
 }

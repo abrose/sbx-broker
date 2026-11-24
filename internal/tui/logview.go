@@ -153,7 +153,7 @@ func (m *Model) logTick() tea.Cmd {
 	for _, e := range events {
 		m.addEvent(e)
 	}
-	if len(events) > 0 && m.height > 0 {
+	if len(events) > 0 && m.height > 0 && l.scroll > 0 {
 		l.scroll = min(l.scroll, m.logMaxScroll()) // the events trimmed from the top leave less to scroll
 	}
 	if ended {

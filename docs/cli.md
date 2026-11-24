@@ -212,8 +212,10 @@ After the first answer, `install` checks that the agent's process stays the same
 sbx-broker: a broker answers, but it is not the launchd agent (the agent has no running process): stop the other broker, then run sbx-broker install again
 ```
 
-A failed bootstrap ends with `; the plist stays at <path>, sbx-broker uninstall removes it`. A `launchctl print` failure
-other than "not loaded" (exit 113) stops both `install` and `uninstall` with the launchctl error.
+A failed bootstrap, or a `launchctl print` failure after the plist is written, ends with
+`; the plist stays at <path>, sbx-broker uninstall removes it`. A `launchctl print` failure other than "not loaded"
+(exit 113) stops both `install` and `uninstall` with the launchctl error. For `uninstall`, it ends with
+`; the plist stays at <path>, remove it by hand`.
 
 `uninstall` stops the agent and removes the plist. It prints `removed <plist>`, or `not installed` when there was
 neither.

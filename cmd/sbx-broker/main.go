@@ -456,9 +456,8 @@ func (c *command) agentRuns(label string) error {
 		var pid int
 		if pid, running, err = launchd.PID(c.launchctl, label); err == nil && running && pid == last {
 			return nil
-		} else {
-			last = pid
 		}
+		last = pid
 	}
 	if err != nil {
 		return err

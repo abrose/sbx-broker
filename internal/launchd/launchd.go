@@ -165,20 +165,26 @@ func install(a Agent, lc Launchctl, sleep func(time.Duration)) error {
 	}
 	loaded, err := Loaded(lc, a.Label)
 	if err != nil {
-		return err
+		return plistStays(err, a.PlistPath)
 	}
 	if loaded {
 		if err := run(lc, "bootout", target(a.Label)); err != nil {
 			return err
 		}
 		if err := waitUnloaded(lc, a.Label, sleep); err != nil {
-			return err
+			return plistStays(err, a.PlistPath)
 		}
 	}
 	if err := run(lc, "bootstrap", domain(), a.PlistPath); err != nil {
-		return fmt.Errorf("%w; the plist stays at %s, sbx-broker uninstall removes it", err, a.PlistPath)
+		return plistStays(err, a.PlistPath)
 	}
 	return nil
+}
+
+// plistStays tells the owner that the plist written by install is still on
+// disk after err, and what removes it.
+func plistStays(err error, plist string) error {
+	return fmt.Errorf("%w; the plist stays at %s, sbx-broker uninstall removes it", err, plist)
 }
 
 const (
@@ -205,7 +211,7 @@ func waitUnloaded(lc Launchctl, label string, sleep func(time.Duration)) error {
 func Uninstall(a Agent, lc Launchctl) (removed bool, err error) {
 	loaded, err := Loaded(lc, a.Label)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("%w; the plist stays at %s, remove it by hand", err, a.PlistPath)
 	}
 	if loaded {
 		if err := run(lc, "bootout", target(a.Label)); err != nil {

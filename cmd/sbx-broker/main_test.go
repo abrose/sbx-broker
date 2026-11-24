@@ -352,7 +352,7 @@ func TestInstallReportsPrintError(t *testing.T) {
 	env, _ := broker(t)
 	f := &fakeLaunchctl{printErr: &launchd.ExitError{Code: 5}}
 	code, _, errOut, _ := agentCLI(t, noProject, t.TempDir(), env, f, "install")
-	if code != 1 || !strings.Contains(errOut, "launchctl print") || slices.Contains(f.calls, "bootstrap") {
+	if code != 1 || !strings.Contains(errOut, "launchctl print") || !slices.Equal(f.calls, []string{"print"}) {
 		t.Fatalf("pre-check: code %d, err %q, calls %q", code, errOut, f.calls)
 	}
 }

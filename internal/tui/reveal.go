@@ -63,8 +63,9 @@ func (m *Model) valueLine(name string) string {
 		return "Reveal the value of " + p(name) + "? The broker logs it. (y/n)"
 	case m.value != nil:
 		v := string(m.value)
-		line := "value: " + p(v)
-		if p(v) != v {
+		shown := p(v)
+		line := "value: " + shown
+		if shown != v {
 			line += "   (escaped)" // the screen does not show the value as it is
 		}
 		return line + "   (any key hides it)"
