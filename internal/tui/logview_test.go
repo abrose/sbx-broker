@@ -3,11 +3,13 @@ package tui
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/abrose/sbx-broker/internal/admin"
 	"github.com/abrose/sbx-broker/internal/eventlog"
@@ -60,18 +62,160 @@ func TestLogShowsFollowedEvents(t *testing.T) {
 	}
 }
 
-func TestLogKeepsNewest1000(t *testing.T) {
+// wake runs the last command that waits for the follow, as the runtime would
+// in its own goroutine, and sends its message.
+func (h *harness) wake() {
+	h.t.Helper()
+	if len(h.waits) == 0 {
+		h.t.Fatal("no command waits for the follow")
+	}
+	got := make(chan tea.Msg, 1)
+	go func(c tea.Cmd) { got <- c() }(h.waits[len(h.waits)-1])
+	select {
+	case msg := <-got:
+		h.send(msg)
+	case <-time.After(3 * time.Second):
+		h.t.Fatal("the follow never woke the model")
+	}
+}
+
+// noLogTimer fails when a timer other than the status poll is armed.
+func (h *harness) noLogTimer() {
+	h.t.Helper()
+	for _, tm := range h.timers {
+		if tm.d != pollEvery {
+			h.t.Fatalf("a timer other than the status poll: %v", h.timers)
+		}
+	}
+}
+
+// waitFor fails unless cond holds within 3 s; it sends nothing.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(3 * time.Second); !cond(); time.Sleep(2 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never happened", what)
+		}
+	}
+}
+
+func eventsFrom(first, last int) []eventlog.Event {
 	var events []eventlog.Event
-	for i := 1; i <= 1005; i++ {
+	for i := first; i <= last; i++ {
 		events = append(events, ev(eventlog.KindSwap, "acme", i))
 	}
-	h := startLog(t, followStep{events: events})
-	h.logScreen("/e1005")
-	if n := len(h.m.log.events); n != 1000 {
-		t.Fatalf("kept %d events", n)
+	return events
+}
+
+func paths(events []eventlog.Event) []string {
+	var ps []string
+	for _, e := range events {
+		ps = append(ps, e.Path)
 	}
-	h.has("/e0006", "/e1005")
-	h.hasNot("/e0005", "/e0001")
+	return ps
+}
+
+func TestLogKeepsNewest1000(t *testing.T) {
+	h := startLog(t, followStep{events: eventsFrom(1, 1500)})
+	h.logScreen("/e1500")
+	if got, want := paths(h.m.log.kept()), paths(eventsFrom(501, 1500)); !slices.Equal(got, want) {
+		t.Fatalf("kept %d events from %v to %v, want 501 to 1500", len(got), got[0], got[len(got)-1])
+	}
+	if n := len(h.m.log.events); n > 2*logKeep {
+		t.Fatalf("holds %d events, more than %d", n, 2*logKeep)
+	}
+	h.has("/e0501", "/e1500")
+	h.hasNot("/e0500", "/e0001")
+	// Past 2*logKeep the view drops the older half in one copy.
+	for _, e := range eventsFrom(1501, 2500) {
+		h.m.log.feed.add(e)
+	}
+	h.logScreen("/e2500")
+	if got, want := paths(h.m.log.kept()), paths(eventsFrom(1501, 2500)); !slices.Equal(got, want) {
+		t.Fatalf("kept %d events from %v to %v, want 1501 to 2500", len(got), got[0], got[len(got)-1])
+	}
+	if n := len(h.m.log.events); n > 2*logKeep {
+		t.Fatalf("holds %d events, more than %d", n, 2*logKeep)
+	}
+}
+
+// The screen never holds more lines than the terminal has rows, nor a line
+// wider than the terminal; a follow error takes a row from the events.
+func TestLogFitsScreen(t *testing.T) {
+	const width = 40
+	for _, height := range []int{6, 12, 40} {
+		for _, followErr := range []error{nil, errors.New(strings.Repeat("x", 80))} {
+			t.Run(fmt.Sprintf("height %d error %v", height, followErr != nil), func(t *testing.T) {
+				h := startLog(t, followStep{events: eventsFrom(1, 100), err: followErr})
+				h.send(tea.WindowSizeMsg{Width: width, Height: height})
+				h.until(func() bool { return len(h.m.log.kept()) == 100 && (followErr == nil || !h.m.log.following) })
+				if followErr != nil {
+					h.has("follow: xxx")
+				}
+				s := h.screen()
+				lines := strings.Split(s, "\n")
+				if len(lines) > height {
+					t.Fatalf("%d lines on %d rows:\n%s", len(lines), height, s)
+				}
+				if height == 40 && len(lines) != height {
+					t.Fatalf("%d lines on %d rows, want every row used:\n%s", len(lines), height, s)
+				}
+				for _, l := range lines {
+					if lipgloss.Width(l) > width {
+						t.Fatalf("a line of %d cells on %d columns: %q", lipgloss.Width(l), width, l)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestLogErrorClearsOnNewFollow(t *testing.T) {
+	h := startLog(t, followStep{err: errors.New("bad request")})
+	h.logScreen("follow: bad request")
+	h.send(h.lastTimer(pollEvery).msg) // the next status starts a follow that has no event yet
+	if !h.m.log.following {
+		t.Fatal("no new follow started")
+	}
+	h.hasNot("follow:")
+}
+
+// An idle follow arms no timer: the model hears of new events from the follow.
+func TestLogDoesNotPollWhenIdle(t *testing.T) {
+	h := startLog(t)
+	waitFor(t, "the follow", func() bool { return h.fake.followCount() == 1 })
+	h.noLogTimer()
+	if len(h.timers) == 0 {
+		t.Fatal("no status poll armed")
+	}
+}
+
+func TestLogShowsEventsWithoutTimer(t *testing.T) {
+	h := startLog(t, followStep{events: []eventlog.Event{ev(eventlog.KindSwap, "acme", 1)}})
+	h.wake()
+	h.has("/e0001")
+	h.noLogTimer()
+	if len(h.waits) != 2 {
+		t.Fatalf("%d waits, want the first and the one armed again while the follow lives", len(h.waits))
+	}
+}
+
+// Old events that the view drops do not leave the scroll past its end: the
+// next down moves the view.
+func TestLogScrollStaysWithinMax(t *testing.T) {
+	h := startLog(t, followStep{events: eventsFrom(1, 50)})
+	h.send(tea.WindowSizeMsg{Width: 100, Height: 20})
+	h.logScreen("/e0050")
+	h.keys("up", "up", "up")
+	for _, e := range eventsFrom(51, 1050) {
+		h.m.log.feed.add(e)
+	}
+	h.until(func() bool { k := h.m.log.kept(); return k[len(k)-1].Path == "/e1050" })
+	before := h.screen()
+	h.keys("down")
+	if h.screen() == before {
+		t.Fatalf("down did not move the view:\n%s", before)
+	}
 }
 
 func TestLogFilters(t *testing.T) {
@@ -168,11 +312,12 @@ func TestLogOnlyOneFollowAndQuitCancels(t *testing.T) {
 	if h.fake.followCount() != 1 {
 		t.Fatalf("follows %d, want 1", h.fake.followCount())
 	}
-	ctx := h.m.log.ctx
-	h.keys("q")
-	if ctx.Err() == nil {
-		t.Fatal("quit left the follow running")
+	if h.m.followCmd() != nil {
+		t.Fatal("a second follow while one runs")
 	}
+	h.keys("q")
+	waitFor(t, "the end of the follow at quit", func() bool { return h.fake.followEnded() == 1 })
+	h.wake() // the command that waits for the follow ends too
 }
 
 func TestLogEscapesEventText(t *testing.T) {

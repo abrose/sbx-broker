@@ -3,8 +3,13 @@ package eventlog
 import (
 	"bufio"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -345,5 +350,42 @@ func TestEventUserField(t *testing.T) {
 	}
 	if data, _ := json.Marshal(Event{Kind: KindInfo}); strings.Contains(string(data), `"user"`) {
 		t.Fatalf("empty user in %s", data)
+	}
+}
+
+// TestKindsCoverEveryKindConstant reads the constants of type Kind from the
+// source, so a new Kind that Kinds misses fails here (the TUI's kind filter
+// walks Kinds).
+func TestKindsCoverEveryKindConstant(t *testing.T) {
+	f, err := parser.ParseFile(token.NewFileSet(), "eventlog.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	var want []Kind
+	for _, d := range f.Decls {
+		g, ok := d.(*ast.GenDecl)
+		if !ok || g.Tok != token.CONST {
+			continue
+		}
+		for _, s := range g.Specs {
+			v := s.(*ast.ValueSpec)
+			if typ, ok := v.Type.(*ast.Ident); !ok || typ.Name != "Kind" {
+				continue
+			}
+			for i, name := range v.Names {
+				value, err := strconv.Unquote(v.Values[i].(*ast.BasicLit).Value)
+				if err != nil {
+					t.Fatalf("%s: %v", name.Name, err)
+				}
+				names, want = append(names, name.Name), append(want, Kind(value))
+			}
+		}
+	}
+	if len(want) == 0 {
+		t.Fatal("no constant of type Kind in eventlog.go")
+	}
+	if !slices.Equal(Kinds, want) {
+		t.Fatalf("Kinds is %v; the constants of type Kind are %v = %v", Kinds, names, want)
 	}
 }

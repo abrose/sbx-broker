@@ -16,36 +16,53 @@ import (
 )
 
 const (
-	logKeep  = 1000                   // the newest events the Log view keeps
-	logEvery = 250 * time.Millisecond // how often the model takes the events the follow collected
+	logKeep = 1000 // the newest events the Log view keeps; it holds up to twice as many between two trims
+	logGap  = 1    // the blank line between the Log view's head and its events
 )
 
 // Messages of the Log view.
 type (
-	followMsg  struct{} // a follow was started; the tick chain begins
-	logTickMsg struct{} // take the events the follow collected
+	followMsg  struct{} // a follow was started: wait for its first wake
+	logTickMsg struct{} // the follow woke the model: take what it collected
 )
 
 // logFeed hands events from the follow goroutine to the model: the goroutine
-// adds, the model takes at each tick. No client call runs in Update, and the
-// goroutine needs no reference to the Bubble Tea program.
+// adds and wakes the model, the model takes when woken. No client call runs
+// in Update, and the goroutine needs no reference to the Bubble Tea program.
 type logFeed struct {
+	// wake holds one wake at most: it stands for everything added or ended
+	// since the last take, as the model takes it all at once.
+	wake chan struct{}
+
 	mu     sync.Mutex
 	events []eventlog.Event
 	ended  bool // Follow returned: the connection dropped or the context ended
 	err    error
 }
 
+func newLogFeed() *logFeed { return &logFeed{wake: make(chan struct{}, 1)} }
+
 func (f *logFeed) add(e eventlog.Event) {
 	f.mu.Lock()
 	f.events = append(f.events, e)
 	f.mu.Unlock()
+	f.signal()
 }
 
 func (f *logFeed) end(err error) {
 	f.mu.Lock()
 	f.ended, f.err = true, err
 	f.mu.Unlock()
+	f.signal()
+}
+
+// signal wakes the model without blocking: a wake that waits already covers
+// what came since, because the model takes after the wake.
+func (f *logFeed) signal() {
+	select {
+	case f.wake <- struct{}{}:
+	default:
+	}
 }
 
 func (f *logFeed) take() (events []eventlog.Event, ended bool, err error) {
@@ -55,9 +72,18 @@ func (f *logFeed) take() (events []eventlog.Event, ended bool, err error) {
 	return events, f.ended, f.err
 }
 
+// woken is the command that blocks until the follow adds an event or ends.
+// The end of the follow wakes it, so it ends with the follow, at quit too.
+func (f *logFeed) woken() tea.Cmd {
+	return func() tea.Msg {
+		<-f.wake
+		return logTickMsg{}
+	}
+}
+
 // logView is the state of the Log view.
 type logView struct {
-	events   []eventlog.Event // the newest logKeep, oldest first
+	events   []eventlog.Event // oldest first; kept() is what the view shows
 	nsFilter string           // "" shows all
 	kind     eventlog.Kind    // "" shows all
 	scroll   int              // lines above the newest; 0 follows the newest
@@ -66,25 +92,29 @@ type logView struct {
 
 	following bool // one follow runs at a time
 	feed      *logFeed
-	ctx       context.Context
 	cancel    context.CancelFunc
 }
 
+// kept returns the newest logKeep events, oldest first.
+func (l *logView) kept() []eventlog.Event {
+	return l.events[max(len(l.events)-logKeep, 0):]
+}
+
 // followCmd starts the one follow, unless one runs. The goroutine ends when
-// the connection drops or stopFollow cancels its context; the tick finds out.
+// the connection drops or stopFollow cancels its context; its end wakes the
+// model.
 func (m *Model) followCmd() tea.Cmd {
-	if m.log.following {
+	l := &m.log
+	if l.following {
 		return nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	feed := &logFeed{}
-	m.log.following, m.log.feed, m.log.ctx, m.log.cancel = true, feed, ctx, cancel
-	m.log.mark = time.Time{}
-	if n := len(m.log.events); n > 0 {
-		for _, e := range m.log.events {
-			if e.Time.After(m.log.mark) {
-				m.log.mark = e.Time
-			}
+	feed := newLogFeed()
+	l.following, l.feed, l.cancel, l.err = true, feed, cancel, ""
+	l.mark = time.Time{}
+	for _, e := range l.kept() {
+		if e.Time.After(l.mark) {
+			l.mark = e.Time
 		}
 	}
 	cl := m.cl
@@ -104,8 +134,16 @@ func (m *Model) stopFollow() {
 	}
 }
 
-// logTick takes the collected events and, while the follow lives, asks for
-// the next tick.
+// waitLog waits for the next wake of the follow, while one runs.
+func (m *Model) waitLog() tea.Cmd {
+	if m.log.feed == nil {
+		return nil
+	}
+	return m.wait(m.log.feed.woken())
+}
+
+// logTick takes the collected events and, while the follow lives, waits for
+// the next wake.
 func (m *Model) logTick() tea.Cmd {
 	l := &m.log
 	if l.feed == nil {
@@ -115,8 +153,8 @@ func (m *Model) logTick() tea.Cmd {
 	for _, e := range events {
 		m.addEvent(e)
 	}
-	if len(events) > 0 {
-		l.err = "" // a follow that delivers is working
+	if len(events) > 0 && m.height > 0 {
+		l.scroll = min(l.scroll, m.logMaxScroll()) // the events trimmed from the top leave less to scroll
 	}
 	if ended {
 		// No broker and a cancel are expected; anything else the owner should see.
@@ -127,7 +165,7 @@ func (m *Model) logTick() tea.Cmd {
 		l.following, l.feed = false, nil
 		return nil
 	}
-	return m.after(logEvery, logTickMsg{})
+	return m.waitLog()
 }
 
 // addEvent appends e unless it is a replay: a follow that starts again gets
@@ -139,15 +177,16 @@ func (m *Model) addEvent(e eventlog.Event) {
 	l := &m.log
 	if !e.Time.After(l.mark) {
 		line := eventlog.Line(e)
-		for i := len(l.events) - 1; i >= 0; i-- {
-			if l.events[i].Time.Equal(e.Time) && eventlog.Line(l.events[i]) == line {
+		kept := l.kept()
+		for i := len(kept) - 1; i >= 0; i-- {
+			if kept[i].Time.Equal(e.Time) && eventlog.Line(kept[i]) == line {
 				return
 			}
 		}
 	}
 	l.events = append(l.events, e)
-	if len(l.events) > logKeep {
-		l.events = append(l.events[:0], l.events[len(l.events)-logKeep:]...)
+	if len(l.events) > 2*logKeep {
+		l.events = l.events[:copy(l.events, l.kept())] // trim: one copy for every logKeep events added
 	}
 	if l.scroll > 0 && m.logMatches(e) {
 		l.scroll++ // the view stays where the owner scrolled it
@@ -192,18 +231,44 @@ func nextOf[T comparable](items []T, cur T) T {
 	return items[0]
 }
 
-// logRows is how many lines the view shows: the screen less the header, the
-// view's own head and the footer. 0 means all of them (the size is unknown).
-func (m *Model) logRows() int {
-	if m.height == 0 {
-		return 0
+// logHead is the head of the Log view: its filter line and, after a failed
+// follow, the error line, each cut to the width. n is its line count.
+func (m *Model) logHead() (head string, n int) {
+	l := m.log
+	all := func(s string) string {
+		if s == "" {
+			return "all"
+		}
+		return s
 	}
-	return max(m.height-strings.Count(m.header(), "\n")-1-5, 3)
+	lines := []string{fmt.Sprintf("log · ns %s · kind %s", p(all(l.nsFilter)), all(string(l.kind)))}
+	if l.err != "" {
+		lines = append(lines, "follow: "+l.err)
+	}
+	if m.width > 0 {
+		for i := range lines {
+			lines[i] = cut(lines[i], m.width)
+		}
+	}
+	return strings.Join(lines, "\n"), len(lines)
+}
+
+// logRows is how many event lines the view shows: the screen less the
+// header, render's blank lines and footer, the view's head and the gap under
+// it; 0 when they leave no room. ok is false while the size is unknown: then
+// all of them show.
+func (m *Model) logRows() (rows int, ok bool) {
+	if m.height == 0 {
+		return 0, false
+	}
+	header := strings.Count(m.header(), "\n") + 1
+	_, head := m.logHead()
+	return max(m.height-header-renderBlanks-footerLines-head-logGap, 0), true
 }
 
 func (m *Model) logLines() []string {
 	var lines []string
-	for _, e := range m.log.events {
+	for _, e := range m.log.kept() {
 		if m.logMatches(e) {
 			line := eventlog.Line(e)
 			if m.width > 0 {
@@ -216,33 +281,25 @@ func (m *Model) logLines() []string {
 }
 
 func (m *Model) logMaxScroll() int {
-	rows := m.logRows()
-	if rows == 0 {
+	rows, ok := m.logRows()
+	if !ok {
 		return 0
 	}
 	return max(len(m.logLines())-rows, 0)
 }
 
 func (m *Model) logBody() string {
-	l := m.log
-	all := func(s string) string {
-		if s == "" {
-			return "all"
-		}
-		return s
-	}
-	head := fmt.Sprintf("log · ns %s · kind %s", p(all(l.nsFilter)), all(string(l.kind)))
-	if l.err != "" {
-		head += "\nfollow: " + l.err
-	}
+	head, _ := m.logHead()
 	lines := m.logLines()
-	if len(lines) == 0 {
+	rows, ok := m.logRows()
+	switch {
+	case ok && rows == 0:
+		return head // no room for an event line
+	case len(lines) == 0:
 		return head + "\n\nno events"
-	}
-	rows := m.logRows()
-	if rows == 0 {
+	case !ok:
 		rows = len(lines)
 	}
-	end := len(lines) - min(l.scroll, max(len(lines)-rows, 0))
+	end := len(lines) - min(m.log.scroll, max(len(lines)-rows, 0))
 	return head + "\n\n" + strings.Join(lines[max(end-rows, 0):end], "\n")
 }

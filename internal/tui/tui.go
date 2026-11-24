@@ -96,6 +96,9 @@ type Model struct {
 	log    logView
 	// after returns a command that sends msg after d; tests replace it.
 	after func(d time.Duration, msg tea.Msg) tea.Cmd
+	// wait hands the runtime c, a command that blocks until the log follow
+	// wakes it; tests replace it.
+	wait func(c tea.Cmd) tea.Cmd
 	// exec gives the terminal to c (tea.Exec); tests replace it.
 	exec func(c tea.ExecCommand, fn tea.ExecCallback) tea.Cmd
 
@@ -135,6 +138,7 @@ func New(cl Client, opt Options) *Model {
 		keys:     newKeyMap(),
 		help:     help.New(),
 		after:    func(d time.Duration, msg tea.Msg) tea.Cmd { return tea.Tick(d, func(time.Time) tea.Msg { return msg }) },
+		wait:     func(c tea.Cmd) tea.Cmd { return c },
 		exec:     tea.Exec,
 		fetching: map[string]int{},
 		note:     opt.Note,
@@ -219,7 +223,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(cmds...)
 	case followMsg:
-		return m, m.after(logEvery, logTickMsg{})
+		return m, m.waitLog()
 	case logTickMsg:
 		return m, m.logTick()
 	case refreshMsg:

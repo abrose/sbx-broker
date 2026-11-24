@@ -24,6 +24,13 @@ var (
 // tool or a command may hold a control sequence.
 var p = eventlog.Printable
 
+// The lines render adds around the body of a view: a blank line under the
+// header and one above the footer, and the footer (the help, one line).
+const (
+	renderBlanks = 2
+	footerLines  = 1
+)
+
 // render is the whole screen: header, the current view, footer.
 func (m *Model) render() string {
 	body := "asking the broker…"
@@ -72,6 +79,16 @@ func (m *Model) header() string {
 	}
 	if m.note != "" {
 		h += "\n" + m.note
+	}
+	if m.width > 0 {
+		// Clip each line at the width, as the renderer clips a longer line:
+		// the header reads the same, and the screen text is what shows.
+		clip := lipgloss.NewStyle().MaxWidth(m.width)
+		lines := strings.Split(h, "\n")
+		for i, l := range lines {
+			lines[i] = clip.Render(l)
+		}
+		h = strings.Join(lines, "\n")
 	}
 	return h
 }

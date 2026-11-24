@@ -26,19 +26,20 @@ const fakeValue = "real-api-key-1"
 
 // fakeClient answers from memory and records the calls.
 type fakeClient struct {
-	mu        sync.Mutex
-	nss       []admin.NamespaceStatus
-	statusErr error
-	revealErr error
-	reloadErr error
-	value     string   // what Reveal answers; "": fakeValue
-	refreshes []string // "ns/secret"
-	reveals   []string // "ns/secret"
-	values    [][]byte // every slice Reveal returned, to check the wipe
-	statuses  int
-	script    []followStep // one per Follow call; later calls just wait
-	follows   int
-	reloads   int
+	mu         sync.Mutex
+	nss        []admin.NamespaceStatus
+	statusErr  error
+	revealErr  error
+	reloadErr  error
+	value      string   // what Reveal answers; "": fakeValue
+	refreshes  []string // "ns/secret"
+	reveals    []string // "ns/secret"
+	values     [][]byte // every slice Reveal returned, to check the wipe
+	statuses   int
+	script     []followStep // one per Follow call; later calls just wait
+	follows    int
+	followEnds int // the Follow calls that returned
+	reloads    int
 }
 
 func (f *fakeClient) Status(ns string) ([]admin.NamespaceStatus, error) {
@@ -95,6 +96,11 @@ type followStep struct {
 func (f *fakeClient) Follow(ctx context.Context, each func(eventlog.Event)) error {
 	f.mu.Lock()
 	f.follows++
+	defer func() {
+		f.mu.Lock()
+		f.followEnds++
+		f.mu.Unlock()
+	}()
 	var step followStep
 	if len(f.script) > 0 {
 		step, f.script = f.script[0], f.script[1:]
@@ -114,6 +120,12 @@ func (f *fakeClient) followCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.follows
+}
+
+func (f *fakeClient) followEnded() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.followEnds
 }
 
 var fetched = time.Date(2026, 11, 23, 15, 4, 5, 0, time.Local)
@@ -141,12 +153,14 @@ func fixture() []admin.NamespaceStatus {
 }
 
 // harness drives a Model as the Bubble Tea runtime would, but runs every
-// command at once in the test goroutine. Timers are recorded, not run.
+// command at once in the test goroutine. Timers and the commands that wait
+// for the log follow are recorded, not run.
 type harness struct {
 	t      *testing.T
 	m      *Model
 	fake   *fakeClient
 	timers []timer
+	waits  []tea.Cmd // what Model.wait got, last one last
 	quit   bool
 }
 
@@ -163,6 +177,10 @@ func newHarness(t *testing.T, cl Client, opt Options) *harness {
 	}
 	h.m.after = func(d time.Duration, msg tea.Msg) tea.Cmd {
 		h.timers = append(h.timers, timer{d, msg})
+		return nil
+	}
+	h.m.wait = func(c tea.Cmd) tea.Cmd {
+		h.waits = append(h.waits, c)
 		return nil
 	}
 	// The editor runs at once, as Bubble Tea would run it between two frames.
