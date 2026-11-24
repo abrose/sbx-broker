@@ -72,8 +72,8 @@ var formSpecs = [...]struct {
 	file          nsfile.Kind
 }{
 	secretForm:   {"secret", "a secret", "secret", []string{"name", "command"}, nsfile.KindSecret},
-	routeForm:    {"HTTP route", "an HTTP route", "route", []string{"name", "listen", "upstream"}, nsfile.KindRoute},
-	databaseForm: {"database", "a database", "database", []string{"alias", "upstream", "dbname", "user", "password secret", "require-auth", "postgres listen"}, nsfile.KindDatabase},
+	routeForm:    {"HTTP route", "an HTTP route", "route", []string{"name", "listen port", "upstream"}, nsfile.KindRoute},
+	databaseForm: {"database", "a database", "database", []string{"alias", "upstream", "dbname", "user", "password secret", "require-auth", "postgres listen port"}, nsfile.KindDatabase},
 }
 
 // form is an open add or edit form.
@@ -305,14 +305,14 @@ func formSet(kind formKind, v []string) (func(*nsfile.File) error, error) {
 		}
 		return func(nf *nsfile.File) error { return nf.SetSecret(v[0], argv) }, nil
 	case routeForm:
-		listen, err := port("listen", v[1])
+		listen, err := port("listen port", v[1])
 		if err != nil {
 			return nil, err
 		}
 		r := nsfile.Route{Name: v[0], Listen: listen, Upstream: v[2]}
 		return func(nf *nsfile.File) error { return nf.SetRoute(r) }, nil
 	default:
-		listen, err := port("postgres listen", v[6])
+		listen, err := port("postgres listen port", v[6])
 		if err != nil {
 			return nil, err
 		}
@@ -324,7 +324,7 @@ func formSet(kind formKind, v []string) (func(*nsfile.File) error, error) {
 func port(label, s string) (int, error) {
 	n, err := strconv.Atoi(s)
 	if err != nil {
-		return 0, fmt.Errorf("%s %q is not a number", label, s)
+		return 0, fmt.Errorf("%s %q is not a port number", label, s)
 	}
 	return n, nil
 }

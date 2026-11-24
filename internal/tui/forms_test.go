@@ -179,6 +179,25 @@ func TestFormErrorKeepsInput(t *testing.T) {
 	h.has("command: unclosed quote")
 }
 
+func TestListenTakesAPortNumber(t *testing.T) {
+	h, _, path := startForms(t)
+	h.keys("3", "a")
+	h.has("listen port")
+	h.typeText("web")
+	h.keys("tab")
+	h.typeText("127.0.0.1:19080")
+	h.keys("tab")
+	h.typeText("https://api.example.com")
+	h.keys("enter")
+	h.has(`listen port "127.0.0.1:19080" is not a port number`)
+	if h.m.form == nil {
+		t.Fatal("the form closed")
+	}
+	if read(t, path) != acmeFile {
+		t.Fatal("the file changed")
+	}
+}
+
 func TestPortClashShownInForm(t *testing.T) {
 	h, dir, path := startForms(t)
 	writeNamespace(t, dir, "other", "http:\n  - name: web\n    listen: 29700\n    upstream: https://api.example.com\n")
@@ -258,7 +277,7 @@ func TestAddDatabaseCreatesPostgresBlock(t *testing.T) {
 	nss[0].Postgres = nil
 	h := newHarness(t, &fakeClient{nss: nss}, Options{ConfigDir: dir, Namespace: "acme"})
 	h.keys("3", "p")
-	h.has("Add a database to acme", "alias", "upstream", "dbname", "user", "password secret", "require-auth", "postgres listen")
+	h.has("Add a database to acme", "alias", "upstream", "dbname", "user", "password secret", "require-auth", "postgres listen port")
 	for i, v := range []string{"main", "127.0.0.1:5432", "appdb", "appuser", "db-pass", "scram-sha-256"} {
 		if i > 0 {
 			h.keys("tab")

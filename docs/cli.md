@@ -101,8 +101,8 @@ The forms change the namespace file of the namespace on screen. The fields, in o
 | Form | Fields |
 |---|---|
 | secret | `name`, `command` (shell words: spaces split, quotes group, a backslash escapes; no expansion, no shell) |
-| HTTP route | `name`, `listen`, `upstream` |
-| database | `alias`, `upstream`, `dbname`, `user`, `password secret`, `require-auth` (`scram-sha-256` or empty), `postgres listen` (an add form fills it from the file) |
+| HTTP route | `name`, `listen port` (a port number such as `9080`; the broker listens on loopback), `upstream` |
+| database | `alias`, `upstream`, `dbname`, `user`, `password secret`, `require-auth` (`scram-sha-256` or empty), `postgres listen port` (a port number; an add form fills it from the file) |
 
 A form reads the namespace file when it opens, and an edit form fills its fields from that read, as the file writes
 them, not from what the broker loaded (which lags a save in an editor by about 2 s). Until the read arrives the form
