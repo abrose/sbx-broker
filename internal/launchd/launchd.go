@@ -11,7 +11,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -34,9 +36,26 @@ type Agent struct {
 // Launchctl runs launchctl with args and returns its combined output.
 type Launchctl func(args ...string) (out []byte, err error)
 
-// Real runs /bin/launchctl.
+// ExitError is a launchctl that ran and exited with a non-zero code.
+type ExitError struct {
+	Code   int
+	Output string // the combined output of launchctl
+}
+
+func (e *ExitError) Error() string { return fmt.Sprintf("exit status %d", e.Code) }
+
+// notFound is the exit code of launchctl print for a service launchd does
+// not know.
+const notFound = 113
+
+// Real runs /bin/launchctl. A non-zero exit comes back as an *ExitError.
 func Real(args ...string) ([]byte, error) {
-	return exec.Command("/bin/launchctl", args...).CombinedOutput()
+	out, err := exec.Command("/bin/launchctl", args...).CombinedOutput()
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return out, &ExitError{Code: ee.ExitCode(), Output: string(out)}
+	}
+	return out, err
 }
 
 // Plist returns the agent's plist. Its keys and the keys of Env are sorted,
@@ -93,10 +112,44 @@ func domain() string { return fmt.Sprintf("gui/%d", os.Getuid()) }
 
 func target(label string) string { return domain() + "/" + label }
 
+// printAgent runs launchctl print for the agent label and returns its output.
+// A failure names the command and the output, as run does.
+func printAgent(lc Launchctl, label string) ([]byte, error) {
+	out, err := lc("print", target(label))
+	return out, describe(out, err, "print", target(label))
+}
+
 // Loaded reports whether launchd knows the agent label in the user's domain.
-func Loaded(lc Launchctl, label string) bool {
-	_, err := lc("print", target(label))
-	return err == nil
+// Only exit 113 (the service is not found) means not loaded; any other
+// failure of launchctl is an error.
+func Loaded(lc Launchctl, label string) (bool, error) {
+	_, err := printAgent(lc, label)
+	var ee *ExitError
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.As(err, &ee) && ee.Code == notFound:
+		return false, nil
+	}
+	return false, err
+}
+
+var pidLine = regexp.MustCompile(`(?m)^\s*pid = (\d+)\s*$`)
+
+// PID returns the pid of the agent's process. ok is false when the agent is
+// loaded and has no running process. A failing launchctl print, a not loaded
+// agent included, is an error.
+func PID(lc Launchctl, label string) (pid int, ok bool, err error) {
+	out, err := printAgent(lc, label)
+	if err != nil {
+		return 0, false, err
+	}
+	m := pidLine.FindSubmatch(out)
+	if m == nil {
+		return 0, false, nil
+	}
+	pid, err = strconv.Atoi(string(m[1]))
+	return pid, err == nil, err
 }
 
 // Install writes the plist, creates the log dir, boots a loaded agent of the
@@ -110,7 +163,11 @@ func install(a Agent, lc Launchctl, sleep func(time.Duration)) error {
 	if err := os.MkdirAll(filepath.Dir(a.LogPath), logDirMode); err != nil {
 		return err
 	}
-	if Loaded(lc, a.Label) {
+	loaded, err := Loaded(lc, a.Label)
+	if err != nil {
+		return err
+	}
+	if loaded {
 		if err := run(lc, "bootout", target(a.Label)); err != nil {
 			return err
 		}
@@ -118,7 +175,10 @@ func install(a Agent, lc Launchctl, sleep func(time.Duration)) error {
 			return err
 		}
 	}
-	return run(lc, "bootstrap", domain(), a.PlistPath)
+	if err := run(lc, "bootstrap", domain(), a.PlistPath); err != nil {
+		return fmt.Errorf("%w; the plist stays at %s, sbx-broker uninstall removes it", err, a.PlistPath)
+	}
+	return nil
 }
 
 const (
@@ -131,8 +191,9 @@ const (
 // service down, and the old broker could still answer the new one's poll.
 func waitUnloaded(lc Launchctl, label string, sleep func(time.Duration)) error {
 	for range unloadPolls {
-		if !Loaded(lc, label) {
-			return nil
+		loaded, err := Loaded(lc, label)
+		if err != nil || !loaded {
+			return err
 		}
 		sleep(unloadPoll)
 	}
@@ -142,7 +203,10 @@ func waitUnloaded(lc Launchctl, label string, sleep func(time.Duration)) error {
 // Uninstall boots the agent out when it is loaded and removes its plist.
 // removed is false when neither the agent nor the plist existed.
 func Uninstall(a Agent, lc Launchctl) (removed bool, err error) {
-	loaded := Loaded(lc, a.Label)
+	loaded, err := Loaded(lc, a.Label)
+	if err != nil {
+		return false, err
+	}
 	if loaded {
 		if err := run(lc, "bootout", target(a.Label)); err != nil {
 			return false, err
@@ -158,6 +222,11 @@ func Uninstall(a Agent, lc Launchctl) (removed bool, err error) {
 // run runs launchctl and names the command and its output in an error.
 func run(lc Launchctl, args ...string) error {
 	out, err := lc(args...)
+	return describe(out, err, args...)
+}
+
+// describe is nil for a nil err; else it names the command and its output.
+func describe(out []byte, err error, args ...string) error {
 	if err == nil {
 		return nil
 	}

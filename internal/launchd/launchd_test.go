@@ -1,9 +1,11 @@
 package launchd
 
 import (
-	"encoding/json"
+	"bytes"
+	"encoding/xml"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,7 +28,7 @@ func (f *fake) run(args ...string) ([]byte, error) {
 	switch args[0] {
 	case "print":
 		if !f.loaded {
-			return []byte("Could not find service"), errors.New("exit status 113")
+			return []byte("Could not find service"), &ExitError{Code: 113, Output: "Could not find service"}
 		}
 	case "bootstrap":
 		f.loaded = true
@@ -48,7 +50,7 @@ func agent(t *testing.T) Agent {
 	}
 }
 
-// parsed is the plist as plutil converts it to JSON.
+// parsed is the plist as parsePlist reads it.
 type parsed struct {
 	Label                string
 	ProgramArguments     []string
@@ -59,12 +61,11 @@ type parsed struct {
 	StandardErrorPath    string
 }
 
-// plutil lints the plist and converts it to JSON; it skips the test where
-// plutil does not exist.
-func plutil(t *testing.T, plist []byte) parsed {
+// lintPlist runs plutil -lint on macOS, as an extra check beside parsePlist.
+func lintPlist(t *testing.T, plist []byte) {
 	t.Helper()
 	if runtime.GOOS != "darwin" {
-		t.Skip("plutil runs on macOS only")
+		return
 	}
 	path := filepath.Join(t.TempDir(), "a.plist")
 	if err := os.WriteFile(path, plist, 0o600); err != nil {
@@ -73,15 +74,135 @@ func plutil(t *testing.T, plist []byte) parsed {
 	if out, err := exec.Command("plutil", "-lint", path).CombinedOutput(); err != nil {
 		t.Fatalf("plutil -lint: %v: %s\n%s", err, out, plist)
 	}
-	out, err := exec.Command("plutil", "-convert", "json", "-o", "-", path).Output()
-	if err != nil {
-		t.Fatalf("plutil -convert: %v", err)
+}
+
+// parsePlist reads the plist with encoding/xml, on every OS. It knows the
+// elements the agent's plist uses: dict, array, string, true and false.
+func parsePlist(t *testing.T, plist []byte) parsed {
+	t.Helper()
+	dec := xml.NewDecoder(bytes.NewReader(plist))
+	root := nextStart(t, dec)
+	if root.Name.Local != "plist" {
+		t.Fatalf("the root is %s, not plist", root.Name.Local)
 	}
-	var p parsed
-	if err := json.Unmarshal(out, &p); err != nil {
-		t.Fatalf("%v: %s", err, out)
+	top, ok := plistValue(t, dec, nextStart(t, dec)).(map[string]any)
+	if !ok {
+		t.Fatal("the plist holds no dict")
+	}
+	p := parsed{
+		Label:             plistGet[string](t, top, "Label"),
+		RunAtLoad:         plistGet[bool](t, top, "RunAtLoad"),
+		StandardOutPath:   plistGet[string](t, top, "StandardOutPath"),
+		StandardErrorPath: plistGet[string](t, top, "StandardErrorPath"),
+		KeepAlive:         map[string]bool{},
+	}
+	for _, v := range plistGet[[]any](t, top, "ProgramArguments") {
+		p.ProgramArguments = append(p.ProgramArguments, v.(string))
+	}
+	p.EnvironmentVariables = map[string]string{}
+	for k, v := range plistGet[map[string]any](t, top, "EnvironmentVariables") {
+		p.EnvironmentVariables[k] = v.(string)
+	}
+	for k, v := range plistGet[map[string]any](t, top, "KeepAlive") {
+		p.KeepAlive[k] = v.(bool)
 	}
 	return p
+}
+
+func plistGet[T any](t *testing.T, m map[string]any, k string) T {
+	t.Helper()
+	v, ok := m[k].(T)
+	if !ok {
+		t.Fatalf("key %s is %T, not %T", k, m[k], v)
+	}
+	return v
+}
+
+// nextStart returns the next start element, skipping text and directives.
+func nextStart(t *testing.T, dec *xml.Decoder) xml.StartElement {
+	t.Helper()
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			t.Fatalf("xml: %v", err)
+		}
+		if s, ok := tok.(xml.StartElement); ok {
+			return s
+		}
+	}
+}
+
+// plistValue reads the value that starts at start: a map, a slice, a string
+// or a bool.
+func plistValue(t *testing.T, dec *xml.Decoder, start xml.StartElement) any {
+	t.Helper()
+	switch start.Name.Local {
+	case "true", "false":
+		if err := dec.Skip(); err != nil {
+			t.Fatalf("xml: %v", err)
+		}
+		return start.Name.Local == "true"
+	case "string", "key":
+		var s string
+		if err := dec.DecodeElement(&s, &start); err != nil {
+			t.Fatalf("xml: %v", err)
+		}
+		return s
+	case "array":
+		arr := []any{}
+		for {
+			tok, err := dec.Token()
+			if err != nil {
+				t.Fatalf("xml: %v", err)
+			}
+			switch e := tok.(type) {
+			case xml.StartElement:
+				arr = append(arr, plistValue(t, dec, e))
+			case xml.EndElement:
+				return arr
+			}
+		}
+	case "dict":
+		m := map[string]any{}
+		for {
+			tok, err := dec.Token()
+			if err != nil {
+				t.Fatalf("xml: %v", err)
+			}
+			switch e := tok.(type) {
+			case xml.StartElement:
+				if e.Name.Local != "key" {
+					t.Fatalf("a dict has %s where a key belongs", e.Name.Local)
+				}
+				k := plistValue(t, dec, e).(string)
+				m[k] = plistValue(t, dec, nextStart(t, dec))
+			case xml.EndElement:
+				return m
+			}
+		}
+	}
+	t.Fatalf("the plist has an unknown element %s", start.Name.Local)
+	return nil
+}
+
+// The plist parses on every OS and holds the label, the program, the env,
+// the keep-alive rule and the log paths.
+func TestPlistStructure(t *testing.T) {
+	a := agent(t)
+	lintPlist(t, a.Plist())
+	p := parsePlist(t, a.Plist())
+	if p.Label != a.Label || !slices.Equal(p.ProgramArguments, []string{a.Program, "serve"}) {
+		t.Fatalf("label %q, program arguments %q", p.Label, p.ProgramArguments)
+	}
+	if !maps.Equal(p.EnvironmentVariables, a.Env) {
+		t.Fatalf("env %q", p.EnvironmentVariables)
+	}
+	if exit, ok := p.KeepAlive["SuccessfulExit"]; !p.RunAtLoad || len(p.KeepAlive) != 1 || !ok || exit {
+		t.Fatalf("run at load %v, keep alive %v", p.RunAtLoad, p.KeepAlive)
+	}
+	if p.StandardOutPath != a.LogPath || p.StandardErrorPath != a.LogPath {
+		t.Fatalf("out %q, err %q", p.StandardOutPath, p.StandardErrorPath)
+	}
 }
 
 func TestPlistCarriesPathAndDirs(t *testing.T) {
@@ -92,19 +213,9 @@ func TestPlistCarriesPathAndDirs(t *testing.T) {
 			t.Fatalf("the plist has no %s:\n%s", want, plist)
 		}
 	}
-	p := plutil(t, plist)
-	if p.Label != a.Label || !slices.Equal(p.ProgramArguments, []string{a.Program, "serve"}) {
-		t.Fatalf("label %q, program arguments %q", p.Label, p.ProgramArguments)
-	}
-	if len(p.EnvironmentVariables) != 2 || p.EnvironmentVariables["PATH"] != a.Env["PATH"] ||
-		p.EnvironmentVariables["SBX_BROKER_STATE_DIR"] != "/tmp/x" {
+	p := parsePlist(t, plist)
+	if p.EnvironmentVariables["PATH"] != a.Env["PATH"] || p.EnvironmentVariables["SBX_BROKER_STATE_DIR"] != "/tmp/x" {
 		t.Fatalf("env %q", p.EnvironmentVariables)
-	}
-	if exit, ok := p.KeepAlive["SuccessfulExit"]; !p.RunAtLoad || len(p.KeepAlive) != 1 || !ok || exit {
-		t.Fatalf("run at load %v, keep alive %v", p.RunAtLoad, p.KeepAlive)
-	}
-	if p.StandardOutPath != a.LogPath || p.StandardErrorPath != a.LogPath {
-		t.Fatalf("out %q, err %q", p.StandardOutPath, p.StandardErrorPath)
 	}
 }
 
@@ -136,7 +247,8 @@ func TestPlistEscapesXML(t *testing.T) {
 	if strings.Contains(plist, "a&b") || strings.Contains(plist, "<c>") {
 		t.Fatalf("not escaped:\n%s", plist)
 	}
-	if p := plutil(t, a.Plist()); p.EnvironmentVariables["PATH"] != a.Env["PATH"] {
+	lintPlist(t, a.Plist())
+	if p := parsePlist(t, a.Plist()); p.EnvironmentVariables["PATH"] != a.Env["PATH"] {
 		t.Fatalf("PATH %q", p.EnvironmentVariables["PATH"])
 	}
 }
@@ -267,15 +379,18 @@ func TestInstallBootstrapFails(t *testing.T) {
 	lc := func(args ...string) ([]byte, error) {
 		switch args[0] {
 		case "print":
-			return nil, errors.New("exit status 113")
+			return nil, &ExitError{Code: 113}
 		case "bootstrap":
-			return []byte("Bootstrap failed: 5: Input/output error\n"), errors.New("exit status 5")
+			return []byte("Bootstrap failed: 5: Input/output error\n"), &ExitError{Code: 5}
 		}
 		return nil, nil
 	}
 	err := Install(a, lc)
 	if err == nil || !strings.Contains(err.Error(), "Bootstrap failed: 5: Input/output error") || !strings.Contains(err.Error(), "launchctl bootstrap") {
 		t.Fatalf("err %v", err)
+	}
+	if want := "the plist stays at " + a.PlistPath + ", sbx-broker uninstall removes it"; !strings.Contains(err.Error(), want) {
+		t.Fatalf("err %v lacks %q", err, want)
 	}
 }
 
@@ -330,7 +445,77 @@ func TestUninstallHalfInstalled(t *testing.T) {
 }
 
 func TestLoaded(t *testing.T) {
-	if Loaded((&fake{}).run, "x") || !Loaded((&fake{loaded: true}).run, "x") {
-		t.Fatal("Loaded does not follow print")
+	for _, loaded := range []bool{false, true} {
+		got, err := Loaded((&fake{loaded: loaded}).run, "x")
+		if err != nil || got != loaded {
+			t.Fatalf("loaded %v: got %v, err %v", loaded, got, err)
+		}
+	}
+}
+
+// printFails is a launchctl whose print fails with err.
+func printFails(err error) Launchctl {
+	return func(args ...string) ([]byte, error) {
+		if args[0] == "print" {
+			return []byte("launchctl said no"), err
+		}
+		return nil, nil
+	}
+}
+
+// Only exit 113 (service not found) means not loaded; any other failure is
+// an error, not a silent "not loaded".
+func TestLoadedOnlyExit113MeansNotLoaded(t *testing.T) {
+	got, err := Loaded(printFails(&ExitError{Code: 113}), "x")
+	if got || err != nil {
+		t.Fatalf("exit 113: got %v, err %v", got, err)
+	}
+	for _, e := range []error{&ExitError{Code: 5}, errors.New("fork/exec /bin/launchctl: no such file")} {
+		got, err := Loaded(printFails(e), "x")
+		if got || err == nil || !errors.Is(err, e) {
+			t.Fatalf("%v: got %v, err %v", e, got, err)
+		}
+	}
+}
+
+// Install, Uninstall and the wait for the unload return a print failure.
+func TestPrintErrorReachesCallers(t *testing.T) {
+	broken := printFails(&ExitError{Code: 5})
+	a := agent(t)
+	if err := Install(a, broken); err == nil || !strings.Contains(err.Error(), "launchctl print") {
+		t.Fatalf("install: %v", err)
+	}
+	if _, err := Uninstall(a, broken); err == nil || !strings.Contains(err.Error(), "launchctl print") {
+		t.Fatalf("uninstall: %v", err)
+	}
+	// print works first, then fails while the install waits for the unload
+	n := 0
+	lc := func(args ...string) ([]byte, error) {
+		if args[0] == "print" {
+			if n++; n > 1 {
+				return nil, &ExitError{Code: 5}
+			}
+		}
+		return nil, nil
+	}
+	if err := install(a, lc, func(time.Duration) {}); err == nil || !strings.Contains(err.Error(), "launchctl print") {
+		t.Fatalf("wait: %v", err)
+	}
+}
+
+func TestPID(t *testing.T) {
+	print := func(out string, err error) Launchctl {
+		return func(args ...string) ([]byte, error) { return []byte(out), err }
+	}
+	pid, ok, err := PID(print("x = {\n\tstate = running\n\tpid = 4711\n}\n", nil), "x")
+	if pid != 4711 || !ok || err != nil {
+		t.Fatalf("running: %d %v %v", pid, ok, err)
+	}
+	pid, ok, err = PID(print("x = {\n\tstate = not running\n}\n", nil), "x")
+	if pid != 0 || ok || err != nil {
+		t.Fatalf("loaded, no process: %d %v %v", pid, ok, err)
+	}
+	if _, ok, err = PID(print("", &ExitError{Code: 113}), "x"); ok || err == nil {
+		t.Fatalf("not loaded: %v %v", ok, err)
 	}
 }

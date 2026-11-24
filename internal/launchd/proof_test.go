@@ -7,8 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -82,8 +80,8 @@ func TestLaunchdAgentFetchesWithCapturedPath(t *testing.T) {
 	if err != nil || !removed {
 		t.Fatalf("uninstall: removed %v, err %v", removed, err)
 	}
-	if Loaded(Real, testLabel) {
-		t.Fatalf("launchctl print %s still succeeds", target(testLabel))
+	if loaded, err := Loaded(Real, testLabel); err != nil || loaded {
+		t.Fatalf("launchctl print %s: loaded %v, err %v", target(testLabel), loaded, err)
 	}
 	if _, err := os.Stat(a.PlistPath); !os.IsNotExist(err) {
 		t.Fatalf("the plist is still there: %v", err)
@@ -118,19 +116,32 @@ func waitOK(t *testing.T, a Agent, state string) {
 	}
 }
 
-// agentPID is the pid that launchctl print shows for the test agent.
+// agentPID is the pid of the test agent once it is stable: two reads 200 ms
+// apart give the same pid, within 10 s. A single read could catch the process
+// of the old agent while it exits, or a process that KeepAlive restarts.
+// The case of an old agent that lingers after bootout is proven only by the
+// unit test TestInstallWaitsForBootout, which fakes the slow teardown.
 func agentPID(t *testing.T) int {
 	t.Helper()
-	out, err := Real("print", target(testLabel))
-	if err != nil {
-		t.Fatalf("launchctl print: %v\n%s", err, out)
+	deadline := time.Now().Add(10 * time.Second)
+	last := 0
+	for {
+		pid, ok, err := PID(Real, testLabel)
+		if err != nil {
+			t.Fatalf("launchctl print: %v", err)
+		}
+		if ok && pid == last {
+			return pid
+		}
+		if !ok {
+			pid = 0
+		}
+		last = pid
+		if time.Now().After(deadline) {
+			t.Fatalf("the agent has no stable pid after 10 s (last read %d)", pid)
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
-	m := regexp.MustCompile(`(?m)^\s*pid = (\d+)$`).FindSubmatch(out)
-	if m == nil {
-		t.Fatalf("launchctl print shows no pid:\n%s", out)
-	}
-	pid, _ := strconv.Atoi(string(m[1]))
-	return pid
 }
 
 // secretState asks the broker in state for the state of one secret.

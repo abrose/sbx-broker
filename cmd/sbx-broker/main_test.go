@@ -84,6 +84,8 @@ func testCommand(dir string, env map[string]string) (c *command, out, errOut *by
 // bootstrap loads it (and calls onBootstrap, when set) and bootout unloads it.
 type fakeLaunchctl struct {
 	loaded      bool
+	pid         int   // the pid that print shows for a loaded agent; 0: none
+	printErr    error // when set, print fails with it
 	calls       []string
 	onBootstrap func()
 }
@@ -92,8 +94,14 @@ func (f *fakeLaunchctl) run(args ...string) ([]byte, error) {
 	f.calls = append(f.calls, args[0])
 	switch args[0] {
 	case "print":
+		if f.printErr != nil {
+			return []byte("print failed"), f.printErr
+		}
 		if !f.loaded {
-			return nil, errors.New("exit status 113")
+			return nil, &launchd.ExitError{Code: 113}
+		}
+		if f.pid > 0 {
+			return []byte(fmt.Sprintf("service = {\n\tstate = running\n\tpid = %d\n}\n", f.pid)), nil
 		}
 	case "bootstrap":
 		f.loaded = true
@@ -285,14 +293,49 @@ func TestInstallDefaultDirs(t *testing.T) {
 // A loaded agent that answers is replaced: booted out and bootstrapped again.
 func TestInstallReplacesLoadedAgent(t *testing.T) {
 	env, _ := broker(t)
-	f := &fakeLaunchctl{loaded: true}
+	f := &fakeLaunchctl{loaded: true, pid: 4711}
 	code, out, errOut, plist := agentCLI(t, noProject, t.TempDir(), env, f, "install")
 	sock := filepath.Join(env["SBX_BROKER_STATE_DIR"], "admin.sock")
 	if want := "installed " + plist + "\nthe broker answers on " + sock + "\n"; code != 0 || out != want || errOut != "" {
 		t.Fatalf("code %d, out %q, err %q", code, out, errOut)
 	}
-	if want := []string{"print", "print", "bootout", "print", "bootstrap"}; !slices.Equal(f.calls, want) {
+	if want := []string{"print", "print", "bootout", "print", "bootstrap", "print"}; !slices.Equal(f.calls, want) {
 		t.Fatalf("calls %q, want %q", f.calls, want)
+	}
+}
+
+// An answering broker is not the agent when the agent has no running
+// process: install does not count it as the agent's broker (#35).
+func TestInstallDoesNotCountOtherBroker(t *testing.T) {
+	env, _ := broker(t)
+	f := &fakeLaunchctl{loaded: true} // loaded after bootstrap, no pid
+	code, out, errOut, _ := agentCLI(t, noProject, t.TempDir(), env, f, "install")
+	want := "sbx-broker: a broker answers, but it is not the launchd agent (the agent has no running process): stop the other broker, then run sbx-broker install again\n"
+	if code != 1 || out != "" || errOut != want {
+		t.Fatalf("code %d, out %q, err %q", code, out, errOut)
+	}
+}
+
+// A print that fails for any reason but "not found" is an error: install and
+// uninstall exit 1, name the launchctl error and never bootstrap.
+func TestInstallReportsPrintError(t *testing.T) {
+	for _, cmd := range []string{"install", "uninstall"} {
+		f := &fakeLaunchctl{printErr: &launchd.ExitError{Code: 5}}
+		env := map[string]string{"SBX_BROKER_STATE_DIR": stateDir(t)}
+		code, out, errOut, _ := agentCLI(t, noProject, t.TempDir(), env, f, cmd)
+		if code != 1 || out != "" || !strings.Contains(errOut, "launchctl print") || !strings.Contains(errOut, "print failed") {
+			t.Fatalf("%s: code %d, out %q, err %q", cmd, code, out, errOut)
+		}
+		if slices.Contains(f.calls, "bootstrap") || slices.Contains(f.calls, "bootout") {
+			t.Fatalf("%s: calls %q", cmd, f.calls)
+		}
+	}
+	// with a broker that answers, the pre-check reports it too
+	env, _ := broker(t)
+	f := &fakeLaunchctl{printErr: &launchd.ExitError{Code: 5}}
+	code, _, errOut, _ := agentCLI(t, noProject, t.TempDir(), env, f, "install")
+	if code != 1 || !strings.Contains(errOut, "launchctl print") || slices.Contains(f.calls, "bootstrap") {
+		t.Fatalf("pre-check: code %d, err %q, calls %q", code, errOut, f.calls)
 	}
 }
 
@@ -315,12 +358,15 @@ func TestInstallLaunchctlFails(t *testing.T) {
 		if args[0] == "bootstrap" {
 			return []byte("Bootstrap failed: 5: Input/output error\n"), errors.New("exit status 5")
 		}
-		return nil, errors.New("exit status 113")
+		return nil, &launchd.ExitError{Code: 113}
 	}
+	home := t.TempDir()
 	c, out, errOut := testCommand(noProject, map[string]string{"SBX_BROKER_STATE_DIR": stateDir(t)})
-	c.home = func() (string, error) { return t.TempDir(), nil }
+	c.home = func() (string, error) { return home, nil }
 	c.launchctl = f
-	if code := c.run([]string{"install"}); code != 1 || out.String() != "" || !strings.Contains(errOut.String(), "Bootstrap failed: 5") {
+	plist := filepath.Join(home, "Library", "LaunchAgents", "io.github.abrose.sbx-broker.plist")
+	if code := c.run([]string{"install"}); code != 1 || out.String() != "" || !strings.Contains(errOut.String(), "Bootstrap failed: 5") ||
+		!strings.Contains(errOut.String(), "the plist stays at "+plist+", sbx-broker uninstall removes it") {
 		t.Fatalf("code %d, out %q, err %q", code, out, errOut)
 	}
 }

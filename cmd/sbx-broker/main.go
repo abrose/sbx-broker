@@ -404,9 +404,15 @@ func (c *command) install() int {
 	case errors.Is(err, admin.ErrNoAnswer):
 		return c.fail(fmt.Errorf("a broker holds %s but does not answer: stop it, then run sbx-broker install again",
 			admin.SocketPath(state)))
-	case err == nil && !launchd.Loaded(c.launchctl, a.Label):
-		return c.fail(fmt.Errorf("a broker already runs on %s, not as the launchd agent: stop it, then run sbx-broker install again",
-			admin.SocketPath(state)))
+	case err == nil:
+		loaded, err := launchd.Loaded(c.launchctl, a.Label)
+		if err != nil {
+			return c.fail(err)
+		}
+		if !loaded {
+			return c.fail(fmt.Errorf("a broker already runs on %s, not as the launchd agent: stop it, then run sbx-broker install again",
+				admin.SocketPath(state)))
+		}
 	}
 	if err := launchd.Install(a, c.launchctl); err != nil {
 		return c.fail(err)
@@ -420,6 +426,13 @@ func (c *command) install() int {
 		if probe(state, min(c.answerWait, left)) == nil {
 			break
 		}
+	}
+	// An answer may come from another broker that was not stopped (a loaded
+	// agent is not a running one): the agent must have a process of its own.
+	if _, running, err := launchd.PID(c.launchctl, a.Label); err != nil {
+		return c.fail(err)
+	} else if !running {
+		return c.fail(errors.New("a broker answers, but it is not the launchd agent (the agent has no running process): stop the other broker, then run sbx-broker install again"))
 	}
 	fmt.Fprintf(c.stdout, "installed %s\nthe broker answers on %s\n", a.PlistPath, admin.SocketPath(state))
 	return exitOK
