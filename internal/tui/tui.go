@@ -263,6 +263,9 @@ func (m *Model) key(k tea.KeyPressMsg) tea.Cmd {
 	case key.Matches(k, m.keys.next):
 		m.view = tabs[(int(m.view.tab())+1)%len(tabs)].v
 		return nil
+	case key.Matches(k, m.keys.prev):
+		m.view = tabs[(int(m.view.tab())+len(tabs)-1)%len(tabs)].v
+		return nil
 	}
 	for i, b := range m.keys.views {
 		if key.Matches(k, b) {
@@ -467,7 +470,7 @@ func (m *Model) hide() {
 
 type keyMap struct {
 	views               []key.Binding // 1 to 4, in the order of tabs
-	next, quit          key.Binding
+	next, prev, quit    key.Binding
 	forceQuit           key.Binding
 	up, down            key.Binding
 	open, inspect       key.Binding
@@ -495,6 +498,7 @@ func newKeyMap() keyMap {
 			b([]string{"3"}, "3", "routes"), b([]string{"4"}, "4", "log"),
 		},
 		next: b([]string{"tab"}, "tab", "next view"),
+		prev: b([]string{"shift+tab"}, "shift+tab", "previous view"),
 		// q is not a quit while a text field has focus (the edit forms).
 		quit:       b([]string{"q"}, "q", "quit"),
 		forceQuit:  b([]string{"ctrl+c"}, "ctrl+c", "quit"),
@@ -511,7 +515,7 @@ func newKeyMap() keyMap {
 		kindFilter: b([]string{"t"}, "t", "kind filter"),
 		clear:      b([]string{"c"}, "c", "clear filters"),
 		newest:     b([]string{"G"}, "G", "newest"),
-		viewsHelp:  b([]string{"1", "2", "3", "4", "tab"}, "1-4/tab", "views"), // for the footer only
+		viewsHelp:  b([]string{"1", "2", "3", "4", "tab", "shift+tab"}, "1-4/tab/shift+tab", "views"), // for the footer only
 
 		add:         b([]string{"a"}, "a", "add"),
 		addRoute:    b([]string{"a"}, "a", "add route"),

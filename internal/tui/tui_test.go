@@ -534,6 +534,22 @@ func TestTabCyclesViews(t *testing.T) {
 	}
 }
 
+func TestShiftTabCyclesViewsBack(t *testing.T) {
+	h := start(t, Options{})
+	h.has("1-4/tab/shift+tab")
+	var seen []view
+	for range 4 {
+		h.keys("shift+tab")
+		seen = append(seen, h.m.view)
+	}
+	want := []view{viewLog, viewRoutes, viewSecrets, viewNamespaces}
+	for i := range want {
+		if seen[i] != want[i] {
+			t.Fatalf("shift+tab gave %v, want %v", seen, want)
+		}
+	}
+}
+
 func TestFooterShowsKeysOfView(t *testing.T) {
 	h := start(t, Options{Namespace: "acme"})
 	h.has("refresh")

@@ -73,7 +73,7 @@ argument with a character other than `A-Za-z0-9_@%+=:,./-` is in single quotes.
 
 | Where | Key | Action |
 |---|---|---|
-| all | `1` `2` `3` `4`, `tab` | Namespaces, Secrets, Routes, Log; next view |
+| all | `1` `2` `3` `4`, `tab`, `shift+tab` | Namespaces, Secrets, Routes, Log; next view; previous view |
 | all | `q`, `ctrl+c` | quit |
 | lists | `up`/`k`, `down`/`j` | move |
 | Namespaces | `enter` | select the namespace, open Secrets |
