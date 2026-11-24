@@ -205,6 +205,16 @@ holds the lock:
 sbx-broker: a broker holds <state>/admin.sock but does not answer: stop it, then run sbx-broker install again
 ```
 
+After the first answer, `install` checks that the agent's process stays the same for 1 s, so `install` takes at least
+1 s longer. If the agent has no running process, the answer came from another broker, and it refuses:
+
+```text
+sbx-broker: a broker answers, but it is not the launchd agent (the agent has no running process): stop the other broker, then run sbx-broker install again
+```
+
+A failed bootstrap ends with `; the plist stays at <path>, sbx-broker uninstall removes it`. A `launchctl print` failure
+other than "not loaded" (exit 113) stops both `install` and `uninstall` with the launchctl error.
+
 `uninstall` stops the agent and removes the plist. It prints `removed <plist>`, or `not installed` when there was
 neither.
 
