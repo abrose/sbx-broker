@@ -355,7 +355,8 @@ func TestEditorAndReloadErrorsBothShown(t *testing.T) {
 }
 
 // o opens the file of the marker's namespace also when the broker has not
-// loaded it (its file has an error, or is not there yet).
+// loaded it (its file has an error). As edit, it refuses a namespace with no
+// file: the marker may name one the owner never made.
 func TestEditorKeyForUnloadedNamespace(t *testing.T) {
 	dir := t.TempDir()
 	var files []string
@@ -365,11 +366,21 @@ func TestEditorKeyForUnloadedNamespace(t *testing.T) {
 			files = append(files, argv[len(argv)-1])
 			return nil
 		}}
+	want := filepath.Join(dir, "ghost.yaml")
+
 	h := start(t, opt)
 	h.has("the broker has no namespace ghost")
 	h.keys("o")
+	h.has("no namespace file " + want + " (create it with: sbx-broker init ghost)")
 	h.keys("3", "o")
-	want := filepath.Join(dir, "ghost.yaml")
+	h.has("no namespace file " + want + " (create it with: sbx-broker init ghost)")
+	if len(files) != 0 {
+		t.Fatalf("the editor opened %q for a namespace with no file", files)
+	}
+
+	writeNamespace(t, dir, "ghost", "secrets:\n  api-key: {}\n") // a config error: no command
+	h.keys("2", "o")
+	h.keys("3", "o")
 	if len(files) != 2 || files[0] != want || files[1] != want {
 		t.Fatalf("the editor opened %q, want %q twice", files, want)
 	}

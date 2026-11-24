@@ -3,6 +3,7 @@ package tui
 import (
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"strings"
 
@@ -49,12 +50,22 @@ type (
 
 // editorCmd gives the terminal to the owner's editor on the file of ns. The
 // editor runs in the config dir, never in a project folder, as
-// `sbx-broker edit` does. With no namespace (ns "") it does nothing.
+// `sbx-broker edit` does. With no namespace (ns "") it does nothing. As edit,
+// it refuses a namespace with no file: the marker, which the sandbox writes,
+// may name one the owner never made with init.
 func (m *Model) editorCmd(ns string) tea.Cmd {
-	switch {
-	case ns == "":
+	if ns == "" {
 		return nil
-	case m.opt.Editor == nil:
+	}
+	path := m.nsPath(ns)
+	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
+		m.note = "no namespace file " + p(path) + " (create it with: sbx-broker init " + p(ns) + ")"
+		return nil
+	} else if err != nil {
+		m.note = p(err.Error())
+		return nil
+	}
+	if m.opt.Editor == nil {
 		m.note = "no editor"
 		return nil
 	}

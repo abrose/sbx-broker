@@ -83,7 +83,7 @@ argument with a character other than `A-Za-z0-9_@%+=:,./-` is in single quotes.
 | Secrets | `a`, `e` | add a secret, edit the command of the secret |
 | Routes | `a`, `p`, `e` | add an HTTP route, add a database, edit the route or database |
 | Secrets, Routes | `d`, then `y` | remove the secret, route or database; any other key after `d` cancels |
-| Secrets, Routes | `o` | open the namespace file in `$VISUAL`, else `$EDITOR`, else `vi` (in the config folder, as `edit` does), also of a namespace the broker has not loaded |
+| Secrets, Routes | `o` | open the namespace file in `$VISUAL`, else `$EDITOR`, else `vi` (in the config folder, as `edit` does), also of a namespace the broker has not loaded; like `edit`, it refuses a namespace with no file |
 | a form | `tab`, `shift+tab` | next field, previous field |
 | a form | `enter` on the last field, `ctrl+s` | save |
 | a form | `esc` | cancel |
