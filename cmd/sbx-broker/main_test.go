@@ -73,6 +73,8 @@ func testCommand(dir string, env map[string]string) (c *command, out, errOut *by
 		tui:        func(tui.Client, tui.Options) error { return errors.New("no TUI in tests") },
 		launchctl:  func(...string) ([]byte, error) { return nil, errors.New("no launchctl in tests") },
 		agentWait:  time.Second,
+		pidPoll:    10 * time.Millisecond,
+		pidWait:    200 * time.Millisecond,
 		answerWait: time.Second,
 		stdout:     out,
 		stderr:     errOut,
@@ -83,11 +85,13 @@ func testCommand(dir string, env map[string]string) (c *command, out, errOut *by
 // fakeLaunchctl knows one agent: print succeeds while it is loaded,
 // bootstrap loads it (and calls onBootstrap, when set) and bootout unloads it.
 type fakeLaunchctl struct {
-	loaded      bool
-	pid         int   // the pid that print shows for a loaded agent; 0: none
-	printErr    error // when set, print fails with it
-	calls       []string
-	onBootstrap func()
+	loaded       bool
+	pid          int   // the pid that print shows for a loaded agent; 0: none
+	pidSeq       []int // after bootstrap, each print takes the next pid from here first
+	printErr     error // when set, print fails with it
+	bootstrapped bool
+	calls        []string
+	onBootstrap  func()
 }
 
 func (f *fakeLaunchctl) run(args ...string) ([]byte, error) {
@@ -100,11 +104,15 @@ func (f *fakeLaunchctl) run(args ...string) ([]byte, error) {
 		if !f.loaded {
 			return nil, &launchd.ExitError{Code: 113}
 		}
-		if f.pid > 0 {
-			return []byte(fmt.Sprintf("service = {\n\tstate = running\n\tpid = %d\n}\n", f.pid)), nil
+		pid := f.pid
+		if f.bootstrapped && len(f.pidSeq) > 0 {
+			pid, f.pidSeq = f.pidSeq[0], f.pidSeq[1:]
+		}
+		if pid > 0 {
+			return []byte(fmt.Sprintf("service = {\n\tstate = running\n\tpid = %d\n}\n", pid)), nil
 		}
 	case "bootstrap":
-		f.loaded = true
+		f.loaded, f.bootstrapped = true, true
 		if f.onBootstrap != nil {
 			f.onBootstrap()
 		}
@@ -299,7 +307,7 @@ func TestInstallReplacesLoadedAgent(t *testing.T) {
 	if want := "installed " + plist + "\nthe broker answers on " + sock + "\n"; code != 0 || out != want || errOut != "" {
 		t.Fatalf("code %d, out %q, err %q", code, out, errOut)
 	}
-	if want := []string{"print", "print", "bootout", "print", "bootstrap", "print"}; !slices.Equal(f.calls, want) {
+	if want := []string{"print", "print", "bootout", "print", "bootstrap", "print", "print"}; !slices.Equal(f.calls, want) {
 		t.Fatalf("calls %q, want %q", f.calls, want)
 	}
 }
@@ -307,12 +315,22 @@ func TestInstallReplacesLoadedAgent(t *testing.T) {
 // An answering broker is not the agent when the agent has no running
 // process: install does not count it as the agent's broker (#35).
 func TestInstallDoesNotCountOtherBroker(t *testing.T) {
-	env, _ := broker(t)
-	f := &fakeLaunchctl{loaded: true} // loaded after bootstrap, no pid
-	code, out, errOut, _ := agentCLI(t, noProject, t.TempDir(), env, f, "install")
-	want := "sbx-broker: a broker answers, but it is not the launchd agent (the agent has no running process): stop the other broker, then run sbx-broker install again\n"
-	if code != 1 || out != "" || errOut != want {
-		t.Fatalf("code %d, out %q, err %q", code, out, errOut)
+	var crashLoop []int
+	for pid := 100; pid < 200; pid++ {
+		crashLoop = append(crashLoop, pid)
+	}
+	cases := map[string]*fakeLaunchctl{
+		"no pid":                       {loaded: true},
+		"a pid at first, then none":    {loaded: true, pidSeq: []int{4711}}, // the new agent process exits on the lock
+		"a pid that changes each read": {loaded: true, pidSeq: crashLoop},
+	}
+	for name, f := range cases {
+		env, _ := broker(t)
+		code, out, errOut, _ := agentCLI(t, noProject, t.TempDir(), env, f, "install")
+		want := "sbx-broker: a broker answers, but it is not the launchd agent (the agent has no running process): stop the other broker, then run sbx-broker install again\n"
+		if code != 1 || out != "" || errOut != want {
+			t.Fatalf("%s: code %d, out %q, err %q", name, code, out, errOut)
+		}
 	}
 }
 

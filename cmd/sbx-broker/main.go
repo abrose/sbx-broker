@@ -67,7 +67,8 @@ func main() {
 // run runs one command and returns the exit code.
 func run(args []string, getenv func(string) string, stdout, stderr io.Writer) int {
 	c := &command{getenv: getenv, getwd: os.Getwd, home: os.UserHomeDir, runEditor: runTerminal, tui: tui.Run,
-		launchctl: launchd.Real, agentWait: agentWait, answerWait: admin.AnswerWait, stdout: stdout, stderr: stderr}
+		launchctl: launchd.Real, agentWait: agentWait, answerWait: admin.AnswerWait,
+		pidPoll: pidPoll, pidWait: pidWait, stdout: stdout, stderr: stderr}
 	return c.run(args)
 }
 
@@ -135,6 +136,8 @@ type command struct {
 	launchctl      launchd.Launchctl
 	agentWait      time.Duration // how long install waits for the agent's broker to answer
 	answerWait     time.Duration // how long a request waits for an answer (admin.Waits.Answer)
+	pidPoll        time.Duration // the gap between two reads of the agent's pid
+	pidWait        time.Duration // how long install waits for the pid to hold still
 	stdout, stderr io.Writer
 }
 
@@ -386,6 +389,10 @@ const (
 	// agentWait is the 60 s default fetch timeout plus a margin.
 	agentWait = 75 * time.Second
 	agentPoll = 250 * time.Millisecond
+	// install reads the agent's pid until two reads pidPoll apart agree,
+	// for at most pidWait.
+	pidPoll = time.Second
+	pidWait = 5 * time.Second
 )
 
 // install runs serve as the launchd agent and waits for its broker to
@@ -427,15 +434,36 @@ func (c *command) install() int {
 			break
 		}
 	}
-	// An answer may come from another broker that was not stopped (a loaded
-	// agent is not a running one): the agent must have a process of its own.
-	if _, running, err := launchd.PID(c.launchctl, a.Label); err != nil {
+	if err := c.agentRuns(a.Label); err != nil {
 		return c.fail(err)
-	} else if !running {
-		return c.fail(errors.New("a broker answers, but it is not the launchd agent (the agent has no running process): stop the other broker, then run sbx-broker install again"))
 	}
 	fmt.Fprintf(c.stdout, "installed %s\nthe broker answers on %s\n", a.PlistPath, admin.SocketPath(state))
 	return exitOK
+}
+
+// errOtherBroker is the refusal when an answer does not come from the agent.
+var errOtherBroker = errors.New("a broker answers, but it is not the launchd agent (the agent has no running process): stop the other broker, then run sbx-broker install again")
+
+// agentRuns checks that the agent has a process of its own, as the answer may
+// come from another broker that was not stopped. The agent's process must
+// hold one pid for c.pidPoll: a process that fails on the other broker's lock
+// is alive for a moment after bootstrap, then launchd throttles its restart.
+// No running process, or no stable pid within c.pidWait, gives errOtherBroker.
+func (c *command) agentRuns(label string) error {
+	last, running, err := launchd.PID(c.launchctl, label)
+	for deadline := time.Now().Add(c.pidWait); err == nil && running && time.Now().Before(deadline); {
+		time.Sleep(c.pidPoll)
+		var pid int
+		if pid, running, err = launchd.PID(c.launchctl, label); err == nil && running && pid == last {
+			return nil
+		} else {
+			last = pid
+		}
+	}
+	if err != nil {
+		return err
+	}
+	return errOtherBroker
 }
 
 func (c *command) uninstall() int {
