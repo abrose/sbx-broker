@@ -22,6 +22,12 @@ type removal struct {
 	ns, name string
 }
 
+// removalLine asks for the y of a remove.
+func (m *Model) removalLine() string {
+	r := m.removal
+	return "Remove " + formSpecs[r.kind].noun + " " + p(r.name) + " from " + p(r.ns) + "? (y/n)"
+}
+
 type savedMsg struct {
 	id        int    // the form or removal that saved
 	done      string // what the save did, for the note: "saved secret x"
@@ -196,14 +202,5 @@ func (m *Model) gotSaved(msg savedMsg) tea.Cmd {
 		}
 		m.note = p(msg.err.Error())
 		return m.statusOnce()
-	}
-}
-
-// statusOnce asks for a status now, outside the 2 s poll chain.
-func (m *Model) statusOnce() tea.Cmd {
-	cl, refreshes := m.cl, m.refreshes
-	return func() tea.Msg {
-		nss, err := cl.Status("")
-		return statusMsg{nss: nss, err: err, once: true, refreshes: refreshes}
 	}
 }

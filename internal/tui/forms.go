@@ -280,9 +280,3 @@ func (m *Model) formView() string {
 	}
 	return out
 }
-
-// removalLine asks for the y of a remove.
-func (m *Model) removalLine() string {
-	r := m.removal
-	return "Remove " + formSpecs[r.kind].noun + " " + p(r.name) + " from " + p(r.ns) + "? (y/n)"
-}
